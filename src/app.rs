@@ -1,7 +1,7 @@
 //! App state and key handling. Fetches run on background threads and come back as `Msg`.
 
 use crate::aws::{Aws, AwsError, Ctx};
-use crate::logic::{short, sort_key, to_yaml};
+use crate::logic::{short, sort_key, to_yaml, Health};
 use crate::views::*;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use regex::Regex;
@@ -142,6 +142,7 @@ pub const QUICK: &[(char, &str)] = &[
 pub const KEYS: &[(&str, &str)] = &[
     (":", "command mode (Tab completes, Up/Down pick a suggestion)"),
     ("ctrl-a", "every command and its aliases"),
+    ("ctrl-z", "faults: only rows that are not healthy (red or yellow), on or off"),
     ("/", "filter rows live: regex, case-insensitive, !re inverts, -f fuzzy; in describe it searches (n N next/prev)"),
     ("Esc", "clear filter, else back one level"),
     ("q", "back one level; quits at the root"),
@@ -203,6 +204,8 @@ pub struct Frame {
     pub show_time: bool,
     /// Logs: k9s fullscreen (`f`), header and breadcrumbs hidden.
     pub full: bool,
+    /// k9s ctrl-z: only rows that are not healthy (red or yellow).
+    pub faults: bool,
     /// Set while live tail polls; clearing it stops the poller.
     pub tail: Option<Arc<AtomicBool>>,
 }
@@ -211,7 +214,7 @@ impl Frame {
     fn new(view: View) -> Self {
         Frame {
             id: NEXT_SCREEN.fetch_add(1, Ordering::Relaxed), view, table: Table::default(), sel: 0, offset: 0, filter: String::new(), sort: None, loading: false, load_started: Instant::now(),
-            loaded: false, error: None, seq: 0, wrap: true, show_time: true, full: false, tail: None,
+            loaded: false, error: None, seq: 0, wrap: true, show_time: true, full: false, faults: false, tail: None,
         }
     }
 
@@ -221,6 +224,7 @@ impl Frame {
         // Describe keeps every line and highlights matches (k9s details search); the rest filter.
         let re = filter_re(&self.filter).filter(|_| !matches!(self.view, View::Detail { .. }));
         let mut idx: Vec<usize> = (0..rows.len())
+            .filter(|&i| !self.faults || matches!(rows[i].health, Health::Bad | Health::Warn))
             .filter(|&i| re.as_ref().is_none_or(|(r, inv)| r.is_match(&rows[i].cells.join(" ")) != *inv))
             .collect();
         if let Some((c, desc)) = self.sort {
@@ -697,6 +701,11 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Char('k') if ctrl => self.flash("s9s is read-only: nothing to delete or kill", true),
             KeyCode::Char('a') if ctrl => self.push(View::Aliases),
+            KeyCode::Char('z') if ctrl && !self.top().view.is_text() => {
+                let f = self.top_mut();
+                f.faults = !f.faults;
+                f.sel = 0;
+            }
             KeyCode::Char('u') if ctrl => self.move_sel(-page),
             KeyCode::Char('f') if ctrl => self.move_sel(page),
             KeyCode::Char('b') if ctrl => self.move_sel(-page),
@@ -1342,5 +1351,17 @@ mod tests {
         assert_eq!(f.sel, 3);
         f.filter = "zzz".into();
         assert!(!f.jump_match(0, true));
+    }
+
+    #[test]
+    fn faults_keep_only_unhealthy_rows() {
+        let mut f = Frame::new(View::Clusters);
+        for (id, h) in [("a", Health::Ok), ("b", Health::Bad), ("c", Health::Dim), ("d", Health::Warn)] {
+            f.table.rows.push(Row { id: id.into(), cells: vec![id.into()], health: h, json: Value::Null });
+        }
+        f.faults = true;
+        assert_eq!(f.visible().iter().map(|&i| f.table.rows[i].id.as_str()).collect::<Vec<_>>(), ["b", "d"]);
+        f.filter = "d".into();
+        assert_eq!(f.visible().len(), 1, "faults and the filter combine");
     }
 }

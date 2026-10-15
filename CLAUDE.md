@@ -7,7 +7,7 @@ The README is the user guide; this file is for whoever changes the code.
 
 ```sh
 make run ARGS="-p <profile>"  # build and launch
-make test                     # 17 tests, no AWS access needed
+make test                     # 19 tests, no AWS access needed
 make install                  # ./install.sh: a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes
 s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```

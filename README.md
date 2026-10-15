@@ -75,6 +75,7 @@ If the SSO session has expired, the header says so and names the command (`aws s
 |---|---|
 | `:` | Command mode. Suggestions list under the prompt as you type; `↑` `↓` pick one, Tab completes |
 | `ctrl-a` | Every command and its aliases; Enter opens one |
+| `ctrl-z` | Faults, as in k9s: only rows that are not healthy (red or yellow), such as failed tasks, unhealthy targets or a service mid-rollout. Press again for every row |
 | `/` | Filter rows live: regex, case-insensitive. `!re` inverts, `-f abc` is fuzzy (the letters in order). Enter keeps it, Esc clears it. In logs, matches are highlighted and the view stays at the newest line. In describe and YAML it searches instead: every line stays, matches are highlighted, `n` `N` jump to the next / previous |
 | `Esc` | Clear the filter, else go back one level |
 | `q` | Back one level; quits at the root |

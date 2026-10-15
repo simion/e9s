@@ -285,6 +285,9 @@ fn title(app: &App) -> Line<'static> {
     if top.tail.is_some() {
         spans.push(Span::styled(" (live)", Style::new().fg(Color::Indexed(83)).bold()));
     }
+    if top.faults {
+        spans.push(Span::styled(" (faults)", Style::new().fg(Color::Indexed(202)).bold()));
+    }
     spans.push(Span::raw("   "));
     Line::from(spans)
 }
@@ -470,6 +473,8 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             let msg = if top.error.is_some() {
                 "failed: see the error above".to_string()
+            } else if top.faults && !top.table.rows.is_empty() {
+                "no faults: every row is healthy (ctrl-z shows them all)".to_string()
             } else {
                 top.table.empty.clone().unwrap_or_else(|| format!("no {} in {}", top.view.title(), app.aws.ctx.region))
             };

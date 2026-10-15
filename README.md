@@ -89,7 +89,7 @@ If the SSO session has expired, the header says so and names the command (`aws s
 | `y` | YAML of the selection, as AWS returned it |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
 | `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says s9s is read-only |
-| `f` | Logs: fullscreen, hiding the header and breadcrumbs |
+| `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs |
 | `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected |
 | `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
 | `w` | Wrap long lines in logs and describe on or off (on by default) |
@@ -102,7 +102,7 @@ If the SSO session has expired, the header says so and names the command (`aws s
 | `e` | Events of the selected service, newest first, untruncated |
 | `m` | CloudWatch metrics for the selected service, load balancer or target group |
 | `r` / `ctrl-r` | Refresh now (also re-checks identity after an SSO login) |
-| `c` | Copy the command line that reopens this view (pbcopy, wl-copy or xclip). In logs, `c` copies the lines instead, as in k9s |
+| `c` | Copy the command line that reopens this view (pbcopy, wl-copy or xclip). In logs `c` copies the lines instead, and in describe and YAML the page, as in k9s |
 | `+` `-` | Auto-refresh interval: off, 5, 10, 15, 30, 60 seconds. The header shows the countdown |
 | `<` `>` | Sort by the previous / next column |
 | `o` | Reverse the sort |

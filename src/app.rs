@@ -155,7 +155,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("y", "YAML of the selection, as AWS returned it"),
     ("l", "logs for the selection"),
     ("s", "logs: autoscroll (follow new lines) on / off; on by default"),
-    ("f", "logs: fullscreen"),
+    ("f", "logs, describe: fullscreen"),
     ("t", "logs: show or hide timestamps"),
     ("0-6", "logs: start from the tail, the head, or 1m 5m 15m 30m 1h back (elsewhere 0-9 are quick views)"),
     ("a", "service logs: all containers of each task, not just the main one"),
@@ -168,7 +168,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("e", "events of the selected service"),
     ("m", "metrics (services, load balancers, target groups)"),
     ("r ctrl-r", "refresh now"),
-    ("c", "copy the command that reopens this view"),
+    ("c", "copy the command that reopens this view (logs: the lines shown; describe: the page)"),
     ("+ -", "auto-refresh interval up / down (off, 5s .. 60s)"),
     ("< >", "sort by previous / next column"),
     ("o", "reverse sort order"),
@@ -733,11 +733,20 @@ impl App {
             }
             KeyCode::Char('y') => self.describe(true),
             KeyCode::Char('l') => self.open_logs(),
-            KeyCode::Char('f') if matches!(self.top().view, View::Logs { .. }) => {
+            KeyCode::Char('f') if self.top().view.is_text() => {
                 let f = self.top_mut();
                 f.full = !f.full;
             }
             KeyCode::Char('s') if !ctrl && matches!(self.top().view, View::Logs { .. }) => self.toggle_tail(),
+            // k9s details view: c copies the page.
+            KeyCode::Char('c') if matches!(self.top().view, View::Detail { .. }) => {
+                let rows = &self.top().table.rows;
+                let text: String = rows.iter().map(|r| format!("{}\n", r.cells[0])).collect();
+                match copy_to_clipboard(&text) {
+                    Ok(()) => self.flash(format!("copied {} lines", rows.len()), false),
+                    Err(e) => self.flash(e, true),
+                }
+            }
             KeyCode::Char('c') => self.copy_launch_command(),
             KeyCode::Char('t') if matches!(self.top().view, View::Logs { .. }) => {
                 let f = self.top_mut();

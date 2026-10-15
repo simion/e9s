@@ -55,7 +55,6 @@ macOS has no `timeout`; run long checks in the background and kill them.
 - The tail follows the tasks running when the view opened; tasks started mid-rollout do not appear until the view is reopened.
 - The services view lists STOPPED tasks for its `FAILED 1H` column, which costs a second or two per refresh.
 - The `H` command log shows the short display form of each command; long ones are cut at the window edge.
-- `c` (copy) in logs has not been exercised live.
 
 ## Open decisions
 

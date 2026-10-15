@@ -159,7 +159,7 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
             v.extend([("<m>", "Mark"), ("<C>", "Clear"), ("<c>", "Copy"), ("<w>", "Wrap"), ("<t>", "Time"), ("<ctrl-s>", "Save")]);
             v
         }
-        View::Detail { .. } => vec![("</>", "Search"), ("<n N>", "Next/Prev"), ("<w>", "Wrap"), ("<ctrl-s>", "Save")],
+        View::Detail { .. } => vec![("</>", "Search"), ("<n N>", "Next/Prev"), ("<c>", "Copy"), ("<f>", "Fullscreen"), ("<w>", "Wrap"), ("<ctrl-s>", "Save")],
         View::TaskDefFamilies => vec![("<enter>", "Revisions")],
         View::TaskDefRevisions { .. } => vec![("<enter>", "Containers")],
         View::LogGroups => vec![("<enter>", "Streams"), ("<l>", "Logs")],

@@ -14,7 +14,7 @@ s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 
 `--script` drives the real app on an in-memory screen and prints it.
 Tokens are separated by spaces: `:svc <Enter> @wait H @snap`, not `:svc<Enter>`.
-`@shot=<path>` writes the screen as HTML, which headless Chrome can turn into a PNG.
+`@shot=shots/<name>` writes the screen as HTML with exact colours; `make shots` renders every `shots/*.html` to PNG with headless Chrome (`shots/` is gitignored).
 This is how every UI change gets checked without a terminal.
 
 The Makefile finds cargo even when it is not on PATH (rustup under Homebrew); plain `cargo` calls need `export PATH=/opt/homebrew/opt/rustup/bin:$PATH` there.

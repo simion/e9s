@@ -106,7 +106,8 @@ If the SSO session has expired, the header says so and names the command (`aws s
 | `+` `-` | Auto-refresh interval: off, 5, 10, 15, 30, 60 seconds. The header shows the countdown |
 | `<` `>` | Sort by the previous / next column |
 | `o` | Reverse the sort |
-| `N` `A` | Sort by name / by the AGE column (press again to reverse) |
+| `N` `A` `S` | Sort by name / by the AGE column / by the status column (STATUS, LAST or STATE); press again to reverse |
+| `ctrl-e` `ctrl-g` | Hide or show the header / the breadcrumbs, as in k9s (`--headless` and `--crumbsless` start with them hidden) |
 | `0`-`9` | Quick views: 1 clusters, 2 services, 3 tasks, 4 log groups, 5 load balancers, 6 target groups, 7 scaling, 8 ECR, 9 SQS, 0 RDS |
 | `?` | Help overlay: what the current screen is in AWS terms and its Kubernetes equivalent, then every key and command. Scroll with `↑` `↓` / `j` `k`, page with `PgUp` `PgDn` / `space`, close with `Esc`, `q` or `?` |
 | `H` | Command log for this screen: every AWS CLI call it made, running first, then newest first, with how long ago it started, how long it took, and a tick or a cross for its result. While a screen loads, finished calls stay listed under the running ones |

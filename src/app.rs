@@ -172,7 +172,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("+ -", "auto-refresh interval up / down (off, 5s .. 60s)"),
     ("< >", "sort by previous / next column"),
     ("o", "reverse sort order"),
-    ("N A", "sort by name / age"),
+    ("N A S", "sort by name / age / status"),
+    ("ctrl-e ctrl-g", "hide or show the header / the breadcrumbs"),
     ("0-9", "quick views (header shows the map)"),
     ("H", "AWS CLI calls this screen made: running, then finished, with time and result"),
     ("?", "this help"),
@@ -701,6 +702,8 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Char('k') if ctrl => self.flash("s9s is read-only: nothing to delete or kill", true),
             KeyCode::Char('a') if ctrl => self.push(View::Aliases),
+            KeyCode::Char('e') if ctrl => self.chrome.headless = !self.chrome.headless,
+            KeyCode::Char('g') if ctrl => self.chrome.crumbsless = !self.chrome.crumbsless,
             KeyCode::Char('z') if ctrl && !self.top().view.is_text() => {
                 let f = self.top_mut();
                 f.faults = !f.faults;
@@ -797,6 +800,10 @@ impl App {
                 f.sort = Some(f.sort.map_or((0, true), |(c, d)| (c, !d)));
             }
             KeyCode::Char('N') => self.sort_by(0),
+            KeyCode::Char('S') => match self.top().table.headers.iter().position(|h| ["STATUS", "LAST", "STATE"].contains(&h.as_str())) {
+                Some(c) => self.sort_by(c),
+                None => self.flash("no status column here", true),
+            },
             KeyCode::Char('A') => match self.top().table.headers.iter().position(|h| h.contains("AGE")) {
                 Some(c) => self.sort_by(c),
                 None => self.flash("no AGE column here", true),

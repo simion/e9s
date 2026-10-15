@@ -382,16 +382,16 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
     let detail = top.table.detail.filter(|&d| d < ncol);
     let cols: Vec<usize> = (0..ncol).filter(|&c| Some(c) != detail).collect();
     let cell = |i: usize, c: usize| rows[i].cells.get(c).map(String::as_str).unwrap_or("");
+    let avail = inner.width as usize;
     let mut widths: Vec<usize> = cols.iter().map(|&c| top.table.headers[c].chars().count() + 2).collect();
     for &i in &vis {
         for (k, &c) in cols.iter().enumerate() {
-            widths[k] = widths[k].max(cell(i, c).chars().count().min(60));
+            widths[k] = widths[k].max(cell(i, c).chars().count().min(avail));
         }
     }
     // The last grid column takes what is left. Without a detail line it is the explanation column,
     // so it keeps about a quarter of the width. Narrow the widest columns to fit; cells wrap, never cut.
     let n = cols.len();
-    let avail = inner.width as usize;
     let last_min = match widths.last() {
         Some(&w) if detail.is_none() && n > 3 => (avail / 4).max(20).min(w.max(20)),
         Some(&w) => w.min(20),

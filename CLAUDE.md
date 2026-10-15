@@ -75,14 +75,12 @@ Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an exp
 - The tail follows the tasks running when the view opened; tasks started mid-rollout do not appear until the view is reopened.
 - The services view lists STOPPED tasks for its `FAILED 1H` column, which costs a second or two per refresh.
 - The `H` command log shows the short display form of each command; long ones are cut at the window edge.
-- Below about 120 columns the services and tasks tables wrap names; k9s would drop the rightmost columns instead.
+- When a table does not fit, wide columns narrow to 24 and wrap, then columns drop from the right (k9s drops without narrowing). The dropped ones are only in `d` and `y`.
 
 ## Open decisions
 
-- **Scale write path.** `Aws::scale` and `App::open_scale` exist but no key opens them, and `sdk::run` implements no writes, so the tool cannot write. Either remove them before publishing, or put them behind an explicit `--write` flag (writes off by default).
 - **Region scan.** It counts ECS clusters, services and tasks per region; EC2, Lambda and RDS are not counted.
 - **Copy in `H`.** Copying the full, runnable command of a selected call is not built.
-- **k9s history keys.** k9s binds `[` `]` to command history and `-` to the last view (`internal/view/app.go`); e9s spends `+` `-` on the refresh interval, which k9s only takes as a flag. Following k9s means moving the interval keys.
 - **k9s keys left out.** `ctrl-w` (wide columns: e9s has no narrow/wide column sets) and `Space` marks (nothing acts on several rows in a read-only tool).
 - **Publishing.** Public at github.com/simion/e9s; CI is `.github/workflows/ci.yml`. README images come from `E9S_DEMO=1` only, never from a real account.
 

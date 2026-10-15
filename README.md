@@ -123,7 +123,8 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `m` | CloudWatch metrics for the selected service, load balancer or target group |
 | `r` / `ctrl-r` | Refresh now (also re-checks identity after an SSO login) |
 | `c` | Copy the command line that reopens this view (pbcopy, wl-copy or xclip). In logs `c` copies the lines instead, and in describe and YAML the page, as in k9s |
-| `+` `-` | Auto-refresh interval: off, 5, 10, 15, 30, 60 seconds. The header shows the countdown |
+| `+` | Auto-refresh interval: off, 5, 10, 15, 30, 60 seconds, then off again. The header shows the countdown |
+| `[` `]` `-` | As in k9s: back and forward through the commands typed after `:`, and back to the one before |
 | `<` `>` | Sort by the previous / next column |
 | `o` | Reverse the sort |
 | `N` `A` `S` | Sort by name / by the AGE column / by the status column (STATUS, LAST or STATE); press again to reverse |

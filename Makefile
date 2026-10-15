@@ -30,7 +30,7 @@ test:
 # Render every shots/*.html (from --script @shot=shots/<name>) to a PNG with headless Chrome.
 CHROME ?= /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 shots:
-	cd shots && for h in *.html; do "$(CHROME)" --headless=new --disable-gpu --hide-scrollbars \
+	cd shots && for h in *.html; do "$(CHROME)" --headless=new --use-mock-keychain --disable-gpu --hide-scrollbars \
 	  --window-size=1660,1010 --screenshot="$${h%.html}.png" "file://$$PWD/$$h" >/dev/null 2>&1; done; ls *.png | wc -l
 
 demo:

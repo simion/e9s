@@ -441,7 +441,7 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = &top.table.rows;
     let ncol = top.table.headers.len();
     let detail = top.table.detail.filter(|&d| d < ncol);
-    let cols: Vec<usize> = (0..ncol).filter(|&c| Some(c) != detail).collect();
+    let mut cols: Vec<usize> = (0..ncol).filter(|&c| Some(c) != detail).collect();
     let cell = |i: usize, c: usize| rows[i].cells.get(c).map(String::as_str).unwrap_or("");
     let avail = inner.width as usize;
     let mut widths: Vec<usize> = cols.iter().map(|&c| top.table.headers[c].chars().count()).collect();
@@ -449,6 +449,13 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
         for (k, &c) in cols.iter().enumerate() {
             widths[k] = widths[k].max(cell(i, c).chars().count().min(avail));
         }
+    }
+    // k9s: columns that do not fit are dropped from the right; the first two always stay.
+    // ponytail: a column counts as at most 24 wide here (it narrows and wraps to that), so one long name cannot drop the rest.
+    let fits = |ws: &[usize]| ws.iter().rev().skip(1).map(|w| w.min(&24) + 1).sum::<usize>() + ws.last().map_or(0, |w| *w.min(&20)) <= avail;
+    while cols.len() > 2 && !fits(&widths) {
+        cols.pop();
+        widths.pop();
     }
     // The last grid column takes what is left, keeping at least 20 columns. Narrow the widest
     // columns to fit; cells wrap, never cut.
@@ -639,7 +646,8 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
         out
     };
     // Split into screen lines (wrap, embedded newlines), then merge runs of one style into spans.
-    let split = |chars: Vec<(char, Style)>| -> Vec<Line<'static>> {
+    // The cursor's bar runs the full width, as in k9s, not just under the text.
+    let split = |chars: Vec<(char, Style)>, selected: bool| -> Vec<Line<'static>> {
         let mut rows: Vec<Vec<(char, Style)>> = vec![vec![]];
         for (ch, st) in chars {
             match ch {
@@ -655,6 +663,7 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
         };
         rows.into_iter()
             .map(|r| {
+                let width = r.len();
                 let mut spans: Vec<Span> = vec![];
                 let mut cur = String::new();
                 let mut st = r.first().map(|x| x.1).unwrap_or_default();
@@ -666,6 +675,9 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
                     cur.push(ch);
                 }
                 spans.push(Span::styled(cur, st));
+                if selected && width < w {
+                    spans.push(Span::styled(" ".repeat(w - width), Style::new().bg(Color::Indexed(238))));
+                }
                 Line::from(spans)
             })
             .collect()
@@ -682,7 +694,7 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
     let sel = frame.sel.min(vis.len() - 1);
     // Keep the previous offset unless the cursor's line no longer fits below it: then the
     // lowest offset whose lines up to the cursor fit, counted back from the cursor once.
-    let height = |i: usize| split(styled(vis[i], false)).len();
+    let height = |i: usize| split(styled(vis[i], false), false).len();
     let mut offset = frame.offset.min(sel);
     let (mut lowest, mut used) = (sel, height(sel));
     while lowest > offset && used + height(lowest - 1) <= h {
@@ -705,7 +717,7 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
             break;
         }
         // Describe pages have no cursor (as in k9s); logs keep a bar to show where you are.
-        lines.extend(split(styled(i, pos == sel && is_logs)));
+        lines.extend(split(styled(i, pos == sel && is_logs), pos == sel && is_logs));
     }
     lines.truncate(h);
     frame.offset = offset;

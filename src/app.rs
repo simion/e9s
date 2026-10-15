@@ -16,86 +16,6 @@ pub enum Msg {
     Identity { ctx: Ctx, result: Result<Value, AwsError> },
     Tail { seq: u64, rows: Vec<Row>, skipped: bool },
     TailEnded { seq: u64, err: String },
-    /// Current desired count and scalable target of the service being scaled.
-    #[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
-    ScaleInfo { desired: Result<Option<i64>, AwsError>, capacity: Result<Option<Capacity>, AwsError> },
-    Scaled(Result<String, String>),
-}
-
-/// An Application Auto Scaling target: namespace, resource id, dimension, min, max.
-pub type Capacity = (String, String, String, i64, i64);
-
-pub struct Field {
-    pub label: &'static str,
-    pub current: i64,
-    pub input: String,
-}
-
-/// The k9s scale dialog: edit, then confirm the exact change, then apply.
-#[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
-pub struct ScaleForm {
-    pub title: String,
-    pub service: Option<(String, String)>,
-    pub capacity: Option<Capacity>,
-    pub fields: Vec<Field>,
-    pub focus: usize,
-    pub loading: bool,
-    pub confirm: bool,
-    pub applying: bool,
-    pub error: Option<String>,
-}
-
-impl ScaleForm {
-    fn value(&self, label: &str) -> Option<Result<i64, String>> {
-        self.fields.iter().find(|f| f.label == label).map(|f| f.input.trim().parse::<i64>().map_err(|_| format!("{label} must be a whole number")))
-    }
-
-    /// The writes this form would make, capacity first so a raised max is in place before desired moves.
-    pub fn changes(&self) -> Result<Vec<crate::aws::Scale>, String> {
-        use crate::aws::Scale;
-        let desired = self.value("Desired").transpose()?;
-        let (min, max) = (self.value("Min").transpose()?, self.value("Max").transpose()?);
-        for (label, v) in [("Desired", desired), ("Min", min), ("Max", max)] {
-            if v.is_some_and(|v| v < 0) {
-                return Err(format!("{label} cannot be negative"));
-            }
-        }
-        let mut out = vec![];
-        if let (Some((ns, res, dim, cmin, cmax)), Some(min), Some(max)) = (&self.capacity, min, max) {
-            if min > max {
-                return Err(format!("Min {min} is above Max {max}"));
-            }
-            if let Some(d) = desired {
-                if d < min || d > max {
-                    return Err(format!("Desired {d} is outside Min {min}..Max {max}: autoscaling would move it back"));
-                }
-            }
-            if (min, max) != (*cmin, *cmax) {
-                out.push(Scale::Capacity { ns: ns.clone(), resource: res.clone(), dimension: dim.clone(), min, max });
-            }
-        }
-        if let (Some((cluster, service)), Some(d)) = (&self.service, desired) {
-            if self.fields.iter().any(|f| f.label == "Desired" && f.current != d) {
-                out.push(Scale::Desired { cluster: cluster.clone(), service: service.clone(), count: d });
-            }
-        }
-        if out.is_empty() {
-            return Err("nothing changed".into());
-        }
-        Ok(out)
-    }
-}
-
-#[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
-pub fn describe_change(c: &crate::aws::Scale, form: &ScaleForm) -> String {
-    use crate::aws::Scale;
-    let cur = |l: &str| form.fields.iter().find(|f| f.label == l).map(|f| f.current).unwrap_or(0);
-    match c {
-        Scale::Desired { cluster, service, count } => format!("ecs update-service {cluster}/{service}: desiredCount {} -> {count}", cur("Desired")),
-        Scale::Capacity { resource, min, max, .. } => {
-            format!("register-scalable-target {resource}: min {} -> {min}, max {} -> {max}", cur("Min"), cur("Max"))
-        }
-    }
 }
 
 pub enum Mode {
@@ -107,7 +27,6 @@ pub enum Mode {
     Help(u16),
     /// This screen's AWS calls, scrolled by this many lines.
     Calls(u16),
-    Scale(ScaleForm),
     /// The login expired: offer to run the login command for this profile.
     OfferLogin(Login),
 }
@@ -179,7 +98,9 @@ pub const KEYS: &[(&str, &str)] = &[
     ("r ctrl-r", "refresh now"),
     ("L", "log in (aws sso login or aws login): the selected profile in :profile, else the current one; a role logs in its source profile"),
     ("c", "copy the command that reopens this view (logs: the lines shown; describe: the page)"),
-    ("+ -", "auto-refresh interval up / down (off, 5s .. 60s)"),
+    ("+", "auto-refresh interval: off, 5s, 10s, 15s, 30s, 60s, then off again"),
+    ("[ ]", "back / forward through the commands typed after :"),
+    ("-", "the command before this one (again: back)"),
     ("< >", "sort by previous / next column"),
     ("o", "reverse sort order"),
     ("N A S", "sort by name / age / status"),
@@ -309,6 +230,10 @@ pub struct App {
     pub chrome: crate::ui::Chrome,
     /// Command mode: the typed prefix and which suggestion Up/Down picked.
     pub pick: Option<(String, usize)>,
+    /// k9s command history: commands typed after `:`, where `[` `]` are, and where `-` returns to.
+    pub history: Vec<String>,
+    hist_at: usize,
+    hist_last: usize,
     pub aws: Arc<Aws>,
     pub arn: Option<String>,
     pub account: Option<String>,
@@ -347,7 +272,7 @@ impl App {
         let home = region.clone().unwrap_or_else(|| default_region(&profile));
         let mut app = App {
             chrome: Default::default(), aws: Arc::new(Aws::new(Ctx { profile, region: home })), arn: None, account: None, ident_err: None, sso_expired: false,
-            stack: vec![], mode: Mode::Normal, pick: None, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
+            stack: vec![], mode: Mode::Normal, pick: None, history: vec![], hist_at: 0, hist_last: 0, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
             quit: false, login: None, offered: false, expired_login: None, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
         };
         if pick_profile {
@@ -554,35 +479,6 @@ impl App {
                     f.sel = f.visible().len().saturating_sub(1);
                 }
             }
-            Msg::ScaleInfo { desired, capacity } => {
-                let Mode::Scale(form) = &mut self.mode else { return };
-                form.loading = false;
-                match (desired, capacity) {
-                    (Err(e), _) | (_, Err(e)) => form.error = Some(e.to_string()),
-                    (Ok(d), Ok(c)) => {
-                        if let Some(d) = d {
-                            form.fields.push(Field { label: "Desired", current: d, input: d.to_string() });
-                        }
-                        if let Some((_, _, _, min, max)) = &c {
-                            form.fields.push(Field { label: "Min", current: *min, input: min.to_string() });
-                            form.fields.push(Field { label: "Max", current: *max, input: max.to_string() });
-                        } else {
-                            form.error = Some("no autoscaling target: only the desired count can change".into());
-                        }
-                        form.capacity = c;
-                    }
-                }
-            }
-            Msg::Scaled(r) => {
-                if matches!(self.mode, Mode::Scale(_)) {
-                    self.mode = Mode::Normal;
-                }
-                match r {
-                    Ok(m) => self.flash(m, false),
-                    Err(m) => self.flash(m, true),
-                }
-                self.load();
-            }
             Msg::TailEnded { seq, err } => {
                 if let Some(f) = self.stack.iter_mut().find(|f| f.seq == seq) {
                     if f.tail.take().is_some() {
@@ -641,7 +537,6 @@ impl App {
                 _ => self.mode = Mode::OfferLogin(l),
             },
             Mode::Calls(off) => self.mode = self.scroll(k, off).map_or(Mode::Normal, Mode::Calls),
-            Mode::Scale(form) => self.scale_key(form, k),
             Mode::Normal => self.normal_key(k),
             Mode::Command(s) if matches!(k.code, KeyCode::Up | KeyCode::Down) => {
                 // k9s: Up/Down walk the suggestions for what was typed.
@@ -662,7 +557,7 @@ impl App {
             }
             Mode::Command(s) => {
                 self.pick = None;
-                self.mode = self.edit(s, k, Mode::Command, |app, s| app.exec(&s))
+                self.mode = self.edit(s, k, Mode::Command, |app, s| app.run_typed(&s))
             }
             Mode::Filter(s) => {
                 self.mode = self.edit(s, k, Mode::Filter, |app, s| app.top_mut().filter = s);
@@ -837,8 +732,10 @@ impl App {
                 }
                 None => self.flash("R works on a service, or a task or failure of one", true),
             },
-            KeyCode::Char('+') | KeyCode::Char('=') => self.step_interval(1),
-            KeyCode::Char('-') => self.step_interval(-1),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.step_interval(),
+            KeyCode::Char('[') => self.history_go(self.hist_at.checked_sub(1)),
+            KeyCode::Char(']') => self.history_go(Some(self.hist_at + 1)),
+            KeyCode::Char('-') => self.history_go(Some(self.hist_last)),
             KeyCode::Char('<') => self.sort_step(-1),
             KeyCode::Char('>') => self.sort_step(1),
             KeyCode::Char('o') => {
@@ -928,120 +825,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
-    fn open_scale(&mut self) {
-        let mut form = ScaleForm {
-            title: String::new(), service: None, capacity: None, fields: vec![], focus: 0,
-            loading: false, confirm: false, applying: false, error: None,
-        };
-        if let (View::ScalableTargets { ns }, Some(r)) = (&self.top().view, self.top().selected()) {
-            let j = &r.json;
-            let (min, max) = (crate::logic::n(j, "/MinCapacity"), crate::logic::n(j, "/MaxCapacity"));
-            form.title = format!("{ns} {}", r.id);
-            form.fields = vec![Field { label: "Min", current: min, input: min.to_string() }, Field { label: "Max", current: max, input: max.to_string() }];
-            form.capacity = Some((ns.clone(), r.id.clone(), crate::logic::s(j, "/ScalableDimension"), min, max));
-            self.mode = Mode::Scale(form);
-            return;
-        }
-        let Some((cluster, service)) = self.service_of_view() else {
-            return self.flash("s scales a service, or a target in :scaling", true);
-        };
-        form.title = format!("service {cluster}/{service}");
-        form.service = Some((cluster.clone(), service.clone()));
-        form.loading = true;
-        self.mode = Mode::Scale(form);
-        let (aws, tx) = (self.aws.clone(), self.tx.clone());
-        std::thread::spawn(move || {
-            let mut t = crate::views::Table::default();
-            let desired = crate::views::describe_services(&aws, &cluster, &[service.clone()], &mut t)
-                .and_then(|v| match t.notes.first() {
-                    Some(n) => Err(AwsError::Api(n.text.clone())),
-                    None => Ok(v.first().map(|x| crate::logic::n(x, "/desiredCount"))),
-                });
-            let resource = format!("service/{cluster}/{service}");
-            let capacity = aws
-                .call("application-autoscaling", "describe-scalable-targets", &["--service-namespace".into(), "ecs".into(), "--resource-ids".into(), resource])
-                .map(|v| {
-                    crate::logic::arr(&v, "/ScalableTargets").first().map(|x| {
-                        use crate::logic::{n, s};
-                        (s(x, "/ServiceNamespace"), s(x, "/ResourceId"), s(x, "/ScalableDimension"), n(x, "/MinCapacity"), n(x, "/MaxCapacity"))
-                    })
-                });
-            let _ = tx.send(Msg::ScaleInfo { desired, capacity });
-        });
-    }
-
-    fn scale_key(&mut self, mut form: ScaleForm, k: KeyEvent) {
-        if form.applying {
-            self.mode = Mode::Scale(form);
-            return;
-        }
-        let n = form.fields.len().max(1);
-        if form.confirm {
-            match k.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let changes = form.changes();
-                    form.applying = true;
-                    let (aws, tx) = (self.aws.clone(), self.tx.clone());
-                    std::thread::spawn(move || {
-                        let mut done = vec![];
-                        let mut result = Ok(());
-                        for c in changes.unwrap_or_default() {
-                            match aws.scale(&c) {
-                                Ok(_) => done.push(format!("{:?}", c.command().1)),
-                                Err(e) => {
-                                    result = Err(e.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        let _ = tx.send(Msg::Scaled(match result {
-                            Ok(()) => Ok(format!("scaled: {}", done.join(", ").replace('"', ""))),
-                            Err(e) if done.is_empty() => Err(format!("scale failed, nothing changed: {e}")),
-                            Err(e) => Err(format!("scale PARTIALLY applied ({} done), then failed: {e}", done.join(", ").replace('"', ""))),
-                        }));
-                    });
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    form.confirm = false;
-                }
-                _ => {}
-            }
-            self.mode = Mode::Scale(form);
-            return;
-        }
-        match k.code {
-            KeyCode::Esc => return,
-            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => form.focus = (form.focus + 1) % n,
-            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => form.focus = (form.focus + n - 1) % n,
-            KeyCode::Char(c @ '0'..='9') => {
-                if let Some(f) = form.fields.get_mut(form.focus) {
-                    f.input.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(f) = form.fields.get_mut(form.focus) {
-                    f.input.pop();
-                }
-            }
-            KeyCode::Char('+') | KeyCode::Char('-') => {
-                if let Some(f) = form.fields.get_mut(form.focus) {
-                    let v = f.input.parse::<i64>().unwrap_or(f.current) + if k.code == KeyCode::Char('+') { 1 } else { -1 };
-                    f.input = v.max(0).to_string();
-                }
-            }
-            KeyCode::Enter if !form.loading => match form.changes() {
-                Ok(_) => {
-                    form.error = None;
-                    form.confirm = true;
-                }
-                Err(e) => form.error = Some(e),
-            },
-            _ => {}
-        }
-        self.mode = Mode::Scale(form);
-    }
-
     /// The command line that reopens this view, or the nearest view above it that the CLI can open.
     pub fn launch_command(&self) -> (String, bool) {
         let bin = std::env::args().next().map(|a| a.rsplit('/').next().unwrap_or(&a).to_string()).unwrap_or_else(|| "e9s".into());
@@ -1105,9 +888,9 @@ impl App {
         }
     }
 
-    fn step_interval(&mut self, d: isize) {
-        let i = INTERVALS.iter().position(|&x| x == self.interval).unwrap_or(2) as isize;
-        self.interval = INTERVALS[(i + d).clamp(0, INTERVALS.len() as isize - 1) as usize];
+    fn step_interval(&mut self) {
+        let i = INTERVALS.iter().position(|&x| x == self.interval).unwrap_or(1);
+        self.interval = INTERVALS[(i + 1) % INTERVALS.len()];
         self.next_refresh = Instant::now() + Duration::from_secs(self.interval);
         let msg = if self.interval == 0 { "auto-refresh off".into() } else { format!("auto-refresh every {}s", self.interval) };
         self.flash(msg, false);
@@ -1310,6 +1093,27 @@ impl App {
             Ok(()) => self.flash(format!("saved {what} to {path}"), false),
             Err(e) => self.flash(format!("save failed: {e}"), true),
         }
+    }
+
+    /// A command typed after `:`: run it, and remember it if it names a view.
+    fn run_typed(&mut self, line: &str) {
+        let line = line.trim();
+        if line.split_whitespace().next().and_then(canonical).is_some_and(|c| c != "quit") && self.history.last().is_none_or(|l| l != line) {
+            self.history.push(line.to_string());
+            self.hist_last = self.hist_at;
+            self.hist_at = self.history.len() - 1;
+        }
+        self.exec(line);
+    }
+
+    /// k9s `[` `]` `-`: rerun a remembered command without adding it again.
+    fn history_go(&mut self, to: Option<usize>) {
+        let Some(line) = to.filter(|&i| i != self.hist_at).and_then(|i| self.history.get(i)).cloned() else {
+            return self.flash("no more command history", true);
+        };
+        self.hist_last = self.hist_at;
+        self.hist_at = to.unwrap();
+        self.exec(&line);
     }
 
     pub fn exec(&mut self, line: &str) {

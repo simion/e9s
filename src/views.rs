@@ -377,7 +377,8 @@ impl View {
                     let via = target.as_ref().filter(|(t, _)| t != p).map(|(t, _)| format!(" (via {t})")).unwrap_or_default();
                     let (health, login) = match target.as_ref().and_then(|(_, a)| crate::aws::login_state(a, &home, now)) {
                         Some(LoginState::LoggedIn) => (Health::Ok, format!("logged in{via}")),
-                        Some(LoginState::Renewable) => (Health::Warn, format!("expired, renews on use{via}")),
+                        // The hourly access token lapsed but the refresh token renews it on the next call (verified 2026-10-15).
+                        Some(LoginState::Renewable) => (Health::Ok, format!("logged in{via}, token renews on use")),
                         Some(LoginState::LoggedOut) => (Health::Bad, format!("not logged in{via} (L)")),
                         None => (Health::None, "-".into()),
                     };

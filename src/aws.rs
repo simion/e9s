@@ -47,44 +47,15 @@ type Runner = std::sync::Arc<dyn Fn(&Ctx, &str, &str, &[String]) -> Result<Value
 pub struct Aws {
     pub ctx: Ctx,
     runner: Runner,
-    /// `--readonly`: refuse even the scale writes.
-    pub readonly: bool,
     /// The screen whose command log records these calls (0: none).
     pub screen: u64,
-}
-
-/// The only writes the tool can make: scaling. Arguments are built here from typed values,
-/// so nothing else (task definition, network, deployment config) can ride along.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Scale {
-    /// `ecs update-service --desired-count`.
-    Desired { cluster: String, service: String, count: i64 },
-    /// `application-autoscaling register-scalable-target` with min and max capacity.
-    Capacity { ns: String, resource: String, dimension: String, min: i64, max: i64 },
-}
-
-impl Scale {
-    pub fn command(&self) -> (&'static str, &'static str, Vec<String>) {
-        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        match self {
-            Scale::Desired { cluster, service, count } => {
-                ("ecs", "update-service", v(&["--cluster", cluster, "--service", service, "--desired-count", &count.to_string()]))
-            }
-            Scale::Capacity { ns, resource, dimension, min, max } => (
-                "application-autoscaling",
-                "register-scalable-target",
-                v(&["--service-namespace", ns, "--resource-id", resource, "--scalable-dimension", dimension,
-                    "--min-capacity", &min.to_string(), "--max-capacity", &max.to_string()]),
-            ),
-        }
-    }
 }
 
 impl Aws {
     pub fn new(ctx: Ctx) -> Self {
         // E9S_DEMO=1: a made-up account answers, for screenshots and recordings.
         let runner: Runner = if std::env::var_os("E9S_DEMO").is_some() { std::sync::Arc::new(crate::demo::run) } else { std::sync::Arc::new(crate::sdk::run) };
-        Aws { ctx, runner, readonly: false, screen: 0 }
+        Aws { ctx, runner, screen: 0 }
     }
 
     /// Same profile, region and transport, logging its calls to `screen`.
@@ -94,33 +65,20 @@ impl Aws {
 
     /// Same profile and transport, another region.
     pub fn in_region(&self, region: &str) -> Aws {
-        Aws { ctx: Ctx { profile: self.ctx.profile.clone(), region: region.to_string() }, runner: self.runner.clone(), readonly: self.readonly, screen: self.screen }
+        Aws { ctx: Ctx { profile: self.ctx.profile.clone(), region: region.to_string() }, runner: self.runner.clone(), screen: self.screen }
     }
 
     #[cfg(test)]
     pub fn with_runner(runner: impl Fn(&Ctx, &str, &str, &[String]) -> Result<Value, AwsError> + Send + Sync + 'static) -> Self {
-        Aws { ctx: Ctx { profile: "test".into(), region: "us-west-1".into() }, runner: std::sync::Arc::new(runner), readonly: false, screen: 0 }
+        Aws { ctx: Ctx { profile: "test".into(), region: "us-west-1".into() }, runner: std::sync::Arc::new(runner), screen: 0 }
     }
 
     pub fn call(&self, service: &str, op: &str, args: &[String]) -> Result<Value, AwsError> {
         check_read_only(service, op)?;
-        self.run(service, op, args)
-    }
-
-    fn run(&self, service: &str, op: &str, args: &[String]) -> Result<Value, AwsError> {
         let mut shown = Call::start(self.screen, display_cmd(&self.ctx.region, service, op, args));
         let r = (self.runner)(&self.ctx, service, op, args);
         shown.ok = r.is_ok();
         r
-    }
-
-    /// The single write path. Refused under `--readonly`.
-    pub fn scale(&self, change: &Scale) -> Result<Value, AwsError> {
-        if self.readonly {
-            return Err(AwsError::Api("refused: started with --readonly".into()));
-        }
-        let (service, op, args) = change.command();
-        self.run(service, op, &args)
     }
 }
 

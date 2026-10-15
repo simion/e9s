@@ -1,25 +1,33 @@
-# The README recording: `make demo` (needs vhs). E9S_DEMO=1 answers every read from a made-up account.
+# The README recording: `make demo` (needs vhs). E9S_DEMO=1 answers every read from a made-up account;
+# HOME is docs/demo/home, so the profiles and their SSO login are made up too.
 Output docs/demo.gif
 Set Shell bash
-Set FontSize 14
+Set FontSize 22
 Set Width 1400
 Set Height 820
 Set Padding 16
-Set TypingSpeed 60ms
+Set TypingSpeed 80ms
 Set Theme "Builtin Dark"
 
 Hide
-Type "export E9S_DEMO=1 AWS_CONFIG_FILE=docs/demo/aws-config AWS_SHARED_CREDENTIALS_FILE=/dev/null PATH=$PWD/target/release:$PATH; unset AWS_PROFILE; export PS1='$ '; clear"
+Type "export E9S_DEMO=1 HOME=$PWD/docs/demo/home PATH=$PWD/target/release:$PATH; unset AWS_PROFILE AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE AWS_REGION AWS_DEFAULT_REGION; export PS1='$ '; clear"
 Enter
 Sleep 500ms
 Show
 
-Type "e9s -p prod -r us-east-1"
-Sleep 400ms
+# Profiles, then the region scan, clusters and services.
+Type "e9s"
+Sleep 500ms
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
 Enter
 Sleep 2.5s
 Enter
 Sleep 3s
+
+# A rollout, live logs and metrics of the first service.
 Type "R"
 Sleep 4s
 Escape
@@ -32,17 +40,21 @@ Type "m"
 Sleep 3.5s
 Escape
 Sleep 800ms
+
+# The service that keeps running out of memory.
 Down 4
 Sleep 700ms
 Type "F"
 Sleep 4s
 Escape
 Sleep 800ms
+
+# Tasks of the rolling service, both generations.
 Up 4
 Enter
-Sleep 2.5s
-Enter
 Sleep 3s
+
+# Load balancer targets, SQS queues, and the AWS calls behind the screen.
 Type "5"
 Sleep 2s
 Enter

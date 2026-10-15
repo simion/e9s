@@ -234,7 +234,8 @@ e9s -p prod -r us-west-1 --cluster my-cluster --script "@wait @snap"
 Tokens: `@wait` (until the view has loaded; prints the load time to stderr), `@sleep` (2 s), `@snap` (print the screen), `@shot=<path>` (write the screen as HTML), `@size=WxH` (resize the screen, 200x60 by default), `@cmd` (print the launch command `c` would copy), `<Enter>` `<Esc>` `<Tab>` `<Space>` `<C-x>`; anything else is typed as keys.
 
 `E9S_DEMO=1` answers every read from a made-up account instead of AWS (`src/demo.rs`: one cluster mid-rollout, one service running out of memory, logs that keep coming).
-The recording above comes from it: `make demo` records `docs/demo.gif` again with [vhs](https://github.com/charmbracelet/vhs) from `docs/demo/demo.tape`.
+The recording and screenshots above come from it, and `make demo` makes them again in about 2 minutes: `docs/demo/screens.sh` draws `docs/screens` with `--script` and headless Chrome, then [vhs](https://github.com/charmbracelet/vhs) records `docs/demo.gif` from `docs/demo/demo.tape` (a real terminal running plain `e9s`).
+`HOME` is `docs/demo/home` during both, so the profiles and their SSO login are made up too.
 
 Layout: `src/aws.rs` is the read-only guard, `src/sdk.rs` the AWS SDK transport, `src/views.rs` every resource view (fetch, columns, health, drill-down), `src/logic.rs` pure helpers (deployment split, redaction, sorting, time), `src/app.rs` state and keys, `src/ui.rs` rendering.
 

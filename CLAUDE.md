@@ -27,7 +27,7 @@ macOS has no `timeout`; run long checks in the background and kill them.
 | File | What lives there |
 |---|---|
 | `src/aws.rs` | The read-only guard (`check_read_only`: service allowlist, `describe-`/`list-`/`get-` prefixes, `READ_EXACT`, `DENIED`), the per-screen command log (`Call`, `screen_log`, `inflight`), `display_cmd`, profiles and the SSO login state (`sso_login`) |
-| `src/demo.rs` | `E9S_DEMO=1`: a made-up account for the README recording (`make demo`, `docs/demo/demo.tape`) and `docs/screens`. A field a view starts reading needs adding here too, as in `sdk.rs` |
+| `src/demo.rs` | `E9S_DEMO=1`: a made-up account for the README recording and screenshots: `make demo` runs `docs/demo/screens.sh` and `docs/demo/demo.tape` with `HOME=docs/demo/home` (made-up profiles and SSO login). A field a view starts reading needs adding here too, as in `sdk.rs` |
 | `src/sdk.rs` | The transport: AWS SDK clients on one tokio runtime, credentials per profile shared across regions; `run` takes the CLI's service, operation and arguments and returns the CLI's JSON shape, so views never changed. Only the reads in `dispatch` exist |
 | `src/views.rs` | Every view: `View` enum, fetch, columns, health, drill-down, log resolution and live tail (`resolve`, `logs`, `filter_all`, `tail_poll`), failures |
 | `src/app.rs` | State (`App`, `Frame` stack), keys, commands, tail thread, save and copy |

@@ -3,7 +3,7 @@
 # make uninstall                           remove that launcher
 # make test                                unit tests, no AWS access needed
 # make shots                               shots/*.html to PNG (headless Chrome)
-# make demo                                record docs/demo.gif from the made-up demo account (needs vhs)
+# make demo                                docs/demo.gif and docs/screens from the made-up demo account (needs vhs, Chrome)
 
 CARGO ?= $(shell command -v cargo || ls $$HOME/.cargo/bin/cargo /opt/homebrew/opt/rustup/bin/cargo /usr/local/opt/rustup/bin/cargo 2>/dev/null | head -n 1)
 # Rustup's proxies find rustc through PATH.
@@ -35,4 +35,5 @@ shots:
 
 demo:
 	$(CARGO) build --release --locked
+	docs/demo/screens.sh
 	vhs docs/demo/demo.tape

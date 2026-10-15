@@ -32,6 +32,11 @@ fn color(h: Health) -> Style {
     }
 }
 
+/// k9s cursor: the row's own colour as the bar, so a warning row still reads as one when selected.
+fn cursor(h: Health) -> Style {
+    Style::new().fg(Color::Black).bg(color(h).fg.unwrap_or(AQUA)).bold()
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let top = app.top();
     let mut notes: Vec<(Health, String)> = top.table.notes.iter().map(|n| (n.health, n.text.clone())).collect();
@@ -508,7 +513,8 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let empty = body.is_empty();
-    let table = Table::new(body, constraints).header(header).block(block).row_highlight_style(Style::new().fg(Color::Black).bg(AQUA)).column_spacing(1);
+    let bar = vis.get(top.sel).map_or(cursor(Health::None), |&i| cursor(rows[i].health));
+    let table = Table::new(body, constraints).header(header).block(block).row_highlight_style(bar).column_spacing(1);
     let mut state = TableState::default().with_selected(Some(top.sel));
     f.render_stateful_widget(table, area, &mut state);
     // Draw the detail lines into the space each row left for them.
@@ -518,7 +524,7 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
         if y >= bottom {
             break;
         }
-        let st = if pos == top.sel { Style::new().fg(Color::Black).bg(AQUA) } else { color(rows[vis[pos]].health) };
+        let st = if pos == top.sel { bar } else { color(rows[vis[pos]].health) };
         for (j, l) in details[pos].iter().enumerate() {
             let ly = y + (mains[pos] + j) as u16;
             if ly >= bottom {

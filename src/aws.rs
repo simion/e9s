@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(login_args("sso", &auth_of("sso", &all)), ["sso", "login", "--profile", "sso"]);
 
         // The cache file names are the SDK's: sha1 of the session name (or start URL), sha256 of the login ARN.
-        let home = std::env::temp_dir().join(format!("s9s-home-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("e9s-home-{}", std::process::id()));
         for d in [".aws/sso/cache", ".aws/login/cache"] {
             std::fs::create_dir_all(home.join(d)).unwrap();
         }

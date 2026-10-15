@@ -13,10 +13,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 const USAGE: &str = "\
-s9s: a k9s-style terminal UI for AWS (ECS, CloudWatch Logs, load balancers, autoscaling...)
+e9s: a k9s-style terminal UI for AWS (ECS, CloudWatch Logs, load balancers, autoscaling...)
 
 USAGE
-  s9s [flags]
+  e9s [flags]
 
 WHERE
   -p, --profile NAME     AWS profile (default: AWS_PROFILE, the only profile, or a picker)
@@ -33,13 +33,13 @@ HOW
       --headless         hide the header
       --logoless         hide the logo
       --crumbsless       hide the breadcrumbs
-      --readonly         accepted for k9s habits; s9s is always read-only
+      --readonly         accepted for k9s habits; e9s is always read-only
   -h, --help             this help
 
 Press c inside to copy the command that reopens the view you are on, and ? for every key.";
 
 fn fail(msg: &str) -> ! {
-    eprintln!("s9s: {msg}\ntry --help");
+    eprintln!("e9s: {msg}\ntry --help");
     std::process::exit(2);
 }
 
@@ -64,9 +64,9 @@ fn main() -> std::io::Result<()> {
             "--logoless" => chrome.logoless = true,
             "--crumbsless" => chrome.crumbsless = true,
             "--script" => script = Some(value("--script")),
-            // k9s flag; s9s is always read-only, so it changes nothing.
+            // k9s flag; e9s is always read-only, so it changes nothing.
             "--readonly" => {}
-            "--write" => fail("s9s is read-only and has no --write mode"),
+            "--write" => fail("e9s is read-only and has no --write mode"),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -112,7 +112,7 @@ fn main() -> std::io::Result<()> {
                 let result = run_login(&l);
                 terminal = ratatui::init();
                 // Not terminal.clear(): it asks the terminal for the cursor position, and a terminal that
-                // does not answer in time (a pipe, a slow ssh link) would end s9s right after the login.
+                // does not answer in time (a pipe, a slow ssh link) would end e9s right after the login.
                 ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All))?;
                 app.logged_in(&l, result);
             }
@@ -128,9 +128,9 @@ fn main() -> std::io::Result<()> {
     res
 }
 
-/// `aws sso login` or `aws login`, the one thing s9s still asks the AWS CLI to do.
+/// `aws sso login` or `aws login`, the one thing e9s still asks the AWS CLI to do.
 fn run_login(l: &app::Login) -> Result<(), String> {
-    println!("s9s: aws {}  (s9s comes back when it finishes)\n", l.args.join(" "));
+    println!("e9s: aws {}  (e9s comes back when it finishes)\n", l.args.join(" "));
     match std::process::Command::new("aws").args(&l.args).status() {
         Ok(st) if st.success() => Ok(()),
         Ok(st) => Err(format!("exited with {st}")),

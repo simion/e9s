@@ -1303,6 +1303,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "e9s"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-applicationautoscaling",
+ "aws-sdk-cloudwatch",
+ "aws-sdk-cloudwatchlogs",
+ "aws-sdk-ec2",
+ "aws-sdk-ecr",
+ "aws-sdk-ecs",
+ "aws-sdk-elasticloadbalancingv2",
+ "aws-sdk-lambda",
+ "aws-sdk-rds",
+ "aws-sdk-sqs",
+ "aws-sdk-sts",
+ "aws-smithy-types",
+ "chrono",
+ "ratatui",
+ "regex",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2908,32 +2934,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "s9s"
-version = "0.1.0"
-dependencies = [
- "aws-config",
- "aws-sdk-applicationautoscaling",
- "aws-sdk-cloudwatch",
- "aws-sdk-cloudwatchlogs",
- "aws-sdk-ec2",
- "aws-sdk-ecr",
- "aws-sdk-ecs",
- "aws-sdk-elasticloadbalancingv2",
- "aws-sdk-lambda",
- "aws-sdk-rds",
- "aws-sdk-sqs",
- "aws-sdk-sts",
- "aws-smithy-types",
- "chrono",
- "ratatui",
- "regex",
- "serde_json",
- "sha1",
- "sha2 0.10.9",
- "tokio",
-]
 
 [[package]]
 name = "schannel"

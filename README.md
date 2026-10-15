@@ -1,4 +1,4 @@
-# s9s
+# e9s
 
 A read-only, k9s-style terminal UI for AWS.
 Browse ECS clusters, services, tasks and containers, read and live-tail their CloudWatch logs, and watch a deployment roll, with the same keys as k9s.
@@ -10,14 +10,14 @@ Environment variable and secret values are stripped from every response before t
 
 ## Requirements
 
-- AWS credentials as the AWS CLI uses them: s9s calls AWS through the official AWS SDK for Rust, which reads `~/.aws/config` and `~/.aws/credentials`, so SSO profiles, roles, credential processes and environment variables work as they do for the CLI. A profile you already logged in with `aws sso login` just works.
-- The AWS CLI v2, only to log in from inside s9s (`L` runs `aws sso login`).
+- AWS credentials as the AWS CLI uses them: e9s calls AWS through the official AWS SDK for Rust, which reads `~/.aws/config` and `~/.aws/credentials`, so SSO profiles, roles, credential processes and environment variables work as they do for the CLI. A profile you already logged in with `aws sso login` just works.
+- The AWS CLI v2, only to log in from inside e9s (`L` runs `aws sso login`).
 - A Rust toolchain to build.
 
 ## Install
 
 ```sh
-cargo install --path .     # builds a `s9s` binary into ~/.cargo/bin
+cargo install --path .     # builds a `e9s` binary into ~/.cargo/bin
 ```
 
 Or, while working on the source:
@@ -25,28 +25,28 @@ Or, while working on the source:
 ```sh
 make run ARGS="-p prod"    # build and launch
 make install               # same as ./install.sh
-./install.sh               # puts a `s9s` command in ~/.local/bin (BIN_DIR=/other/dir ./install.sh to choose)
+./install.sh               # puts a `e9s` command in ~/.local/bin (BIN_DIR=/other/dir ./install.sh to choose)
 ./install.sh --uninstall   # removes it
 ```
 
 The installed command is a small launcher that runs this checkout's source.
 When any file under `src/`, `Cargo.toml` or `Cargo.lock` is newer than the built binary, it rebuilds first (seconds; the first build compiles the AWS SDK and takes a few minutes); otherwise it starts straight away.
-So editing the source and running `s9s` again is all a change needs.
+So editing the source and running `e9s` again is all a change needs.
 
 ## Run
 
 ```sh
-s9s                                                    # pick a profile, then a region, then drill in
-s9s -p prod                                            # skip the profile picker
-s9s -p prod -r us-west-1                               # straight to clusters
-s9s -p prod -r us-west-1 --cluster web                 # that cluster's services
-s9s -p prod -r us-west-1 --cluster web -s api          # that service's tasks
-s9s -p prod -r us-west-1 --cluster web -s api -c rollout   # its rollout watch
-s9s -p prod -r us-west-1 -c 'logs /ecs/api ERROR'      # a log group, filtered
+e9s                                                    # pick a profile, then a region, then drill in
+e9s -p prod                                            # skip the profile picker
+e9s -p prod -r us-west-1                               # straight to clusters
+e9s -p prod -r us-west-1 --cluster web                 # that cluster's services
+e9s -p prod -r us-west-1 --cluster web -s api          # that service's tasks
+e9s -p prod -r us-west-1 --cluster web -s api -c rollout   # its rollout watch
+e9s -p prod -r us-west-1 -c 'logs /ecs/api ERROR'      # a log group, filtered
 ```
 
 Every screen you can reach with the arrows and Enter can be opened from the command line, the way k9s takes `--context`, `-n` and `-c`.
-The screens in between are stacked behind it, so Esc walks back up as if you had navigated there.
+The screens in between are stacked behind it, up to the region list and the profile picker, so Esc walks back up as if you had navigated there (for example `-c tasks` sits under clusters and the cluster's services, `-c 'logs <group>'` under log groups); each loads when you reach it.
 Press `c` on any screen to copy the command that reopens it (or the nearest screen the command line can open, such as the task list above a container).
 
 | Flag | Meaning |
@@ -59,21 +59,21 @@ Press `c` on any screen to copy the command that reopens it (or the nearest scre
 | `-c`, `--command CMD` | Open a view as if `:CMD` were typed inside: `-c rollout`, `-c tasks`, `-c 'logs <group> [pattern]'`, `-c sqs` |
 | `--refresh SECONDS` | Auto-refresh interval; `0` turns it off (default 10) |
 | `--headless` / `--logoless` / `--crumbsless` | Hide the header / the logo / the breadcrumbs |
-| `--readonly` | Accepted so k9s habits and aliases work; s9s is always read-only. `--write` is refused |
+| `--readonly` | Accepted so k9s habits and aliases work; e9s is always read-only. `--write` is refused |
 | `-h`, `--help` | Usage |
 
 Startup follows k9s: choose where you are, then navigate.
 
 1. **Profile.** `--profile`, else `AWS_PROFILE`, else the only configured profile, else a picker over `~/.aws/config` and `~/.aws/credentials`. With no profiles at all it uses the default credential chain.
-2. **Identity.** The header shows the profile, region, account and role. Below 120 columns or 30 rows it shrinks to two lines: that context on one, this screen's keys on the next (no logo or quick-view map; `?` lists them). A role whose name does not read as read-only is shown in yellow, as a reminder; s9s still only reads.
+2. **Identity.** The header shows the profile, region, account and role. Below 120 columns or 30 rows it shrinks to two lines: that context on one, this screen's keys on the next (no logo or quick-view map; `?` lists them). A role whose name does not read as read-only is shown in yellow, as a reminder; e9s still only reads.
 3. **Region.** Without `--region` it scans every enabled region in parallel and lists ECS clusters, services and running tasks per region, regions with resources first. Enter opens one.
 
 Every way the AWS CLI signs in works, because the SDK reads the same files: IAM Identity Center (SSO, `sso_session` or the older per-profile settings), `aws login` console credentials (`login_session`), roles (`role_arn` with `source_profile` or `credential_source`), access keys, `credential_process`, web identity, environment variables and instance or container roles.
 Roles that need an MFA code (`mfa_serial`) are not supported: the SDK cannot ask for the code.
 
 The profile picker shows how each profile signs in (AUTH) and its LOGIN state (logged in, expired but renewing on use, not logged in), read from the same token cache file the SDK reads; a role shows the login of the profile it signs in through.
-`L` logs in: the selected profile in the picker, or the current one elsewhere. It runs `aws sso login` (or `aws login`) for the profile that actually holds the login, so a role logs in its source profile. s9s steps aside while the CLI opens the browser (where an SSO session that is still signed in completes on its own), then comes back and reloads.
-When credentials expire while s9s runs, it asks once whether to log in now (Enter) or later (Esc, then `L`); the header stays red until it works. Profiles with keys or `credential_process` have nothing to run: the header says to renew them and press `r`.
+`L` logs in: the selected profile in the picker, or the current one elsewhere. It runs `aws sso login` (or `aws login`) for the profile that actually holds the login, so a role logs in its source profile. e9s steps aside while the CLI opens the browser (where an SSO session that is still signed in completes on its own), then comes back and reloads.
+When credentials expire while e9s runs, it asks once whether to log in now (Enter) or later (Esc, then `L`); the header stays red until it works. Profiles with keys or `credential_process` have nothing to run: the header says to renew them and press `r`.
 
 ## Keys
 
@@ -90,11 +90,11 @@ When credentials expire while s9s runs, it asks once whether to log in now (Ente
 | `j` `k` / `↑` `↓` | Move |
 | `g` `G` / `Home` `End` | Top / bottom |
 | `ctrl-f` `ctrl-b` / `PgDn` `PgUp` (also `ctrl-u`) | Page down / up |
-| `ctrl-d` `ctrl-k` | Delete and kill in k9s; here they only say s9s is read-only |
+| `ctrl-d` `ctrl-k` | Delete and kill in k9s; here they only say e9s is read-only |
 | `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; anything else shows as YAML, and a structured log line is parsed first |
-| `y` | YAML of the selection: the fields s9s reads from AWS, under their API names |
+| `y` | YAML of the selection: the fields e9s reads from AWS, under their API names |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
-| `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says s9s is read-only |
+| `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says e9s is read-only |
 | `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs |
 | `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected |
 | `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
@@ -214,7 +214,7 @@ cargo test        # guard, 10-service and 100-task chunking, 100-stream log batc
 `--script "<tokens>"` drives the real app on an in-memory screen and prints it, for checks without a terminal:
 
 ```sh
-s9s -p prod -r us-west-1 --cluster my-cluster --script "@wait @snap"
+e9s -p prod -r us-west-1 --cluster my-cluster --script "@wait @snap"
 ```
 
 Tokens: `@wait` (until the view has loaded; prints the load time to stderr), `@sleep` (2 s), `@snap` (print the screen), `@shot=<path>` (write the screen as HTML), `@size=WxH` (resize the screen, 200x60 by default), `@cmd` (print the launch command `c` would copy), `<Enter>` `<Esc>` `<Tab>` `<Space>` `<C-x>`; anything else is typed as keys.

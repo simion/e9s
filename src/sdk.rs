@@ -701,7 +701,7 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
             }).await?)
         }
 
-        _ => return Err(AwsError::Api(format!("s9s does not call aws {service} {op}"))),
+        _ => return Err(AwsError::Api(format!("e9s does not call aws {service} {op}"))),
     })
 }
 

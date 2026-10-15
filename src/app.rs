@@ -161,7 +161,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("g G", "top / bottom"),
     ("ctrl-f ctrl-b", "page down / up (also PgDn PgUp, ctrl-u)"),
     ("d", "describe: full detail of the selection"),
-    ("y", "YAML of the selection: the fields s9s reads, under their API names"),
+    ("y", "YAML of the selection: the fields e9s reads, under their API names"),
     ("l", "logs for the selection"),
     ("s", "logs: autoscroll (follow new lines) on / off; on by default"),
     ("f", "logs, describe: fullscreen"),
@@ -357,33 +357,45 @@ impl App {
         app.identity();
         if region.is_none() {
             app.replace_root(View::Regions);
-            return app;
-        }
-        let mut views = vec![View::Clusters];
-        if let Some(c) = &start.cluster {
-            views.push(View::Services { cluster: c.clone() });
-            if let Some(s) = &start.service {
-                views.push(View::Tasks { cluster: c.clone(), service: Some(s.clone()) });
+        } else {
+            let mut views = vec![View::Clusters];
+            if let Some(c) = &start.cluster {
+                views.push(View::Services { cluster: c.clone() });
+                if let Some(s) = &start.service {
+                    views.push(View::Tasks { cluster: c.clone(), service: Some(s.clone()) });
+                }
             }
-        }
-        app.stack = views.into_iter().map(Frame::new).collect();
-        match &start.command {
-            Some(cmd) => {
-                // A service-scoped command keeps the trail above it; any other command is a new root, as in k9s.
-                let canon = canonical(cmd.split_whitespace().next().unwrap_or(""));
-                if matches!(canon, Some("events") | Some("rollout") | Some("failures")) && app.service.is_some() {
+            app.stack = views.into_iter().map(Frame::new).collect();
+            match &start.command {
+                // A service-scoped command keeps the trail above it.
+                Some(cmd) if matches!(canonical(cmd.split_whitespace().next().unwrap_or("")), Some("events" | "rollout" | "failures")) && app.service.is_some() => {
                     let (c, s) = (app.cluster.clone().unwrap_or_default(), app.service.clone().unwrap_or_default());
-                    app.push(match canon {
+                    app.push(match canonical(cmd.split_whitespace().next().unwrap_or("")) {
                         Some("events") => View::Events { cluster: c, service: s },
                         Some("failures") => View::Failures { cluster: c, service: Some(s) },
                         _ => View::Rollout { cluster: c, service: s },
                     });
-                } else {
-                    app.exec(cmd);
                 }
+                Some(cmd) => {
+                    // Any other command opens its view as `:cmd` would, with the screens you would
+                    // have walked through stacked under it.
+                    app.exec(cmd);
+                    let parents = parents_of(&app.top().view);
+                    let at = app.stack.len() - 1;
+                    app.stack.splice(at..at, parents.into_iter().map(Frame::new));
+                }
+                None => app.load(),
             }
-            None => app.load(),
         }
+        // Above it all, the region list and the profile picker, so Esc walks all the way back.
+        let mut above = vec![];
+        if known.len() > 1 && !matches!(app.stack[0].view, View::Profiles) {
+            above.push(View::Profiles);
+        }
+        if !matches!(app.stack[0].view, View::Profiles | View::Regions) {
+            above.push(View::Regions);
+        }
+        app.stack.splice(0..0, above.into_iter().map(Frame::new));
         app
     }
 
@@ -394,7 +406,7 @@ impl App {
         self.stack.last_mut().expect("stack never empty")
     }
 
-    /// Whether the caller's role reads as read-only by name. s9s never writes either way.
+    /// Whether the caller's role reads as read-only by name. e9s never writes either way.
     pub fn read_only_role(&self) -> bool {
         self.arn.as_ref().is_some_and(|a| {
             let role = a.to_lowercase();
@@ -434,7 +446,8 @@ impl App {
     fn pop(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop().unwrap().stop_tail();
-            if self.top().view.auto_refresh() {
+            // Screens stacked by the command line load when first reached.
+            if self.top().view.auto_refresh() || !self.top().loaded {
                 self.load();
             }
         }
@@ -482,7 +495,13 @@ impl App {
                 f.loading = false;
                 match result {
                     Ok(t) => {
-                        let keep = f.selected().map(|r| r.id.clone());
+                        // Back on the picker or region list: the cursor starts on the one in use.
+                        let current = match f.view {
+                            View::Profiles if !f.loaded => Some(self.aws.ctx.profile.clone()),
+                            View::Regions if !f.loaded => Some(self.aws.ctx.region.clone()),
+                            _ => None,
+                        };
+                        let keep = current.or_else(|| f.selected().map(|r| r.id.clone()));
                         let first = !f.loaded;
                         f.table = t;
                         f.error = None;
@@ -723,7 +742,7 @@ impl App {
             KeyCode::Char('q') => {
                 if self.stack.len() > 1 { self.pop() } else { self.quit = true }
             }
-            KeyCode::Char('d') | KeyCode::Char('k') if ctrl => self.flash("s9s is read-only: nothing to delete or kill", true),
+            KeyCode::Char('d') | KeyCode::Char('k') if ctrl => self.flash("e9s is read-only: nothing to delete or kill", true),
             KeyCode::Char('a') if ctrl => self.push(View::Aliases),
             KeyCode::Char('e') if ctrl => self.chrome.headless = !self.chrome.headless,
             KeyCode::Char('g') if ctrl => self.chrome.crumbsless = !self.chrome.crumbsless,
@@ -737,7 +756,7 @@ impl App {
             KeyCode::Char('b') if ctrl => self.move_sel(-page),
             KeyCode::Char('r') => {
                 if self.sso_expired {
-                    crate::sdk::reset(); // read the login again, in case it was renewed outside s9s
+                    crate::sdk::reset(); // read the login again, in case it was renewed outside e9s
                 }
                 self.load();
                 if self.sso_expired || self.arn.is_none() {
@@ -787,7 +806,7 @@ impl App {
                 f.wrap = !f.wrap;
             }
             KeyCode::Char('s') if ctrl => self.save(),
-            KeyCode::Char('s') => self.flash("s9s is read-only: no shell (ctrl-s saves this view)", true),
+            KeyCode::Char('s') => self.flash("e9s is read-only: no shell (ctrl-s saves this view)", true),
             KeyCode::Char('e') => match self.service_of_view() {
                 Some((cluster, service)) => self.push(View::Events { cluster, service }),
                 None => self.flash("e works on a service, or a task or failure of one", true),
@@ -1025,7 +1044,7 @@ impl App {
 
     /// The command line that reopens this view, or the nearest view above it that the CLI can open.
     pub fn launch_command(&self) -> (String, bool) {
-        let bin = std::env::args().next().map(|a| a.rsplit('/').next().unwrap_or(&a).to_string()).unwrap_or_else(|| "s9s".into());
+        let bin = std::env::args().next().map(|a| a.rsplit('/').next().unwrap_or(&a).to_string()).unwrap_or_else(|| "e9s".into());
         let q = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
         let ctx = &self.aws.ctx;
         for (depth, fr) in self.stack.iter().rev().enumerate() {
@@ -1285,7 +1304,7 @@ impl App {
         let slug: String = f.view.title().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
         let dir = format!("{}/Downloads", std::env::var("HOME").unwrap_or_default());
         let ext = if is_logs { "log" } else { "txt" };
-        let path = format!("{dir}/s9s-{}-{}.{ext}", slug.trim_matches('-'), chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        let path = format!("{dir}/e9s-{}-{}.{ext}", slug.trim_matches('-'), chrono::Local::now().format("%Y%m%d-%H%M%S"));
         let what = if is_logs { format!("{n} lines") } else { format!("{n} rows") };
         match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, out)) {
             Ok(()) => self.flash(format!("saved {what} to {path}"), false),
@@ -1410,6 +1429,20 @@ fn default_region(profile: &str) -> String {
         .unwrap_or_else(|| "us-east-1".into())
 }
 
+/// The screens a view sits under when the command line opens it directly (the region list and
+/// profile picker above them are added for every jump).
+fn parents_of(view: &View) -> Vec<View> {
+    match view {
+        View::Services { .. } => vec![View::Clusters],
+        View::Tasks { cluster, service: None } | View::Failures { cluster, service: None } => {
+            vec![View::Clusters, View::Services { cluster: cluster.clone() }]
+        }
+        View::Logs { src: LogSrc::Group(_), .. } => vec![View::LogGroups],
+        View::ScalingPolicies { ns, .. } | View::ScalingActivities { ns, .. } => vec![View::ScalableTargets { ns: ns.clone() }],
+        _ => vec![],
+    }
+}
+
 /// Aliases starting with the typed word, canonical names first.
 pub fn completions(input: &str) -> Vec<&'static str> {
     let w = input.trim_start();
@@ -1443,6 +1476,15 @@ mod tests {
         assert_eq!(f.sel, 3);
         f.filter = "zzz".into();
         assert!(!f.jump_match(0, true));
+    }
+
+    #[test]
+    fn command_line_jumps_stack_their_parents() {
+        let titles = |v: &View| parents_of(v).iter().map(View::title).collect::<Vec<_>>();
+        assert_eq!(titles(&View::Tasks { cluster: "c".into(), service: None }), ["clusters", "services(c)"]);
+        assert_eq!(titles(&View::Logs { src: LogSrc::Group("/g".into()), pattern: String::new(), opts: LogOpts::default() }), ["loggroups"]);
+        assert_eq!(titles(&View::ScalingPolicies { ns: "ecs".into(), resource: None }), ["scaling(ecs)"]);
+        assert!(titles(&View::LoadBalancers).is_empty(), "region-wide views sit right under the region list");
     }
 
     #[test]

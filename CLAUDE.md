@@ -1,4 +1,4 @@
-# s9s
+# e9s
 
 A read-only, k9s-style terminal UI for AWS, in Rust (edition 2024, ratatui 0.30).
 The README is the user guide; this file is for whoever changes the code.
@@ -8,9 +8,9 @@ The README is the user guide; this file is for whoever changes the code.
 ```sh
 make                          # list the targets
 make run ARGS="-p <profile>"  # build and launch
-make test                     # 24 tests, no AWS access needed
-make install                  # ./install.sh: a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes
-s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
+make test                     # 25 tests, no AWS access needed
+make install                  # ./install.sh: a `e9s` launcher in ~/.local/bin that rebuilds when src/ changes
+e9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```
 
 `--script` drives the real app on an in-memory screen and prints it.
@@ -65,7 +65,7 @@ A clean release build takes about 2.5 minutes (eleven SDK crates); incremental b
 
 `aws.rs` works out how each profile signs in (`auth_of`), follows roles to the profile that holds the login (`login_target`), and reads the login state from the exact cache file the SDK reads (`login_state`: sha1 of the sso-session name or start URL under `~/.aws/sso/cache`, sha256 of the `login_session` ARN under `~/.aws/login/cache`).
 An expired or missing login shows `Mode::OfferLogin` once (asked again only after credentials worked again); the login runs with the terminal handed back to the CLI (`main.rs`, `run_login`).
-Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an expired SSO profile, MFA role, keys, `credential_process`, web identity, env vars and `AWS_PROFILE`, plus one real `aws sso login` through `L` (the browser step completed on its own, s9s came back and loaded).
+Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an expired SSO profile, MFA role, keys, `credential_process`, web identity, env vars and `AWS_PROFILE`, plus one real `aws sso login` through `L` (the browser step completed on its own, e9s came back and loaded).
 `aws-config` is built with `credentials-login` for `login_session` profiles.
 
 ## Known limits
@@ -81,8 +81,8 @@ Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an exp
 - **Scale write path.** `Aws::scale` and `App::open_scale` exist but no key opens them, and `sdk::run` implements no writes, so the tool cannot write. Either remove them before publishing, or put them behind an explicit `--write` flag (writes off by default).
 - **Region scan.** It counts ECS clusters, services and tasks per region; EC2, Lambda and RDS are not counted.
 - **Copy in `H`.** Copying the full, runnable command of a selected call is not built.
-- **k9s history keys.** k9s binds `[` `]` to command history and `-` to the last view (`internal/view/app.go`); s9s spends `+` `-` on the refresh interval, which k9s only takes as a flag. Following k9s means moving the interval keys.
-- **k9s keys left out.** `ctrl-w` (wide columns: s9s has no narrow/wide column sets) and `Space` marks (nothing acts on several rows in a read-only tool).
+- **k9s history keys.** k9s binds `[` `]` to command history and `-` to the last view (`internal/view/app.go`); e9s spends `+` `-` on the refresh interval, which k9s only takes as a flag. Following k9s means moving the interval keys.
+- **k9s keys left out.** `ctrl-w` (wide columns: e9s has no narrow/wide column sets) and `Space` marks (nothing acts on several rows in a read-only tool).
 - **Publishing.** No remote yet; CI (`.github/workflows/ci.yml`) runs once it is on GitHub. Real screenshots for the README should come from an account with nothing sensitive in it.
 
 ## Ideas from taws (huseyinbabal/taws, MIT), not built yet
@@ -90,7 +90,7 @@ Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an exp
 taws covers about 61 resource types, shallowly, and writes by default; its ideas were weighed against k9s habits on 2026-10-15.
 - `0`-`9` as recent regions or clusters, like k9s favourite namespaces (conflicts with today's fixed quick views).
 - `/-l key=value` tag filter: EC2 `--filters Name=tag:...`, client-side elsewhere.
-- Shell completion for `-p` and `-r` (`s9s completion zsh`).
+- Shell completion for `-p` and `-r` (`e9s completion zsh`).
 - On expired SSO, a key that suspends the screen and runs only `aws sso login --profile X`.
 - Release binaries, a Homebrew tap and a Docker image.
 - Data-defined list screens for shallow resources (S3, DynamoDB, IAM), still through `Aws::call`.

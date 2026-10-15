@@ -1,5 +1,5 @@
 # make run [ARGS="-p prod -r us-west-1"]   build and launch
-# make install                             a `s9s` launcher in ~/.local/bin (see install.sh)
+# make install                             a `e9s` launcher in ~/.local/bin (see install.sh)
 # make uninstall                           remove that launcher
 # make test                                unit tests, no AWS access needed
 # make shots                               shots/*.html to PNG (headless Chrome)

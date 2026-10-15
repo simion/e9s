@@ -160,11 +160,11 @@ fn header_height(app: &App, screen: Rect) -> u16 {
 }
 
 const LOGO: [&str; 6] = [
-    r"  ____   ___   ____  ",
-    r" / ___| / _ \ / ___| ",
-    r" \___ \| (_) |\___ \ ",
-    r"  ___) |\__, | ___) |",
-    r" |____/   /_/ |____/ ",
+    r"  _____   ___   ____  ",
+    r" | ____| / _ \ / ___| ",
+    r" |  _|  | (_) |\___ \ ",
+    r" | |___  \__, | ___) |",
+    r" |_____|   /_/ |____/ ",
     r"",
 ];
 
@@ -801,7 +801,7 @@ fn offer_login(f: &mut Frame, profile: &str, l: &crate::app::Login) {
         Line::styled(format!("  The login for {who} has expired or was never done{via}."), Style::new().fg(Color::White).bold()),
         Line::raw(""),
         Line::from(vec![Span::styled("  Log in now? This runs  ", Style::new().fg(GRAY)), Span::styled(format!("aws {}", l.args.join(" ")), Style::new().fg(ORANGE).bold())]),
-        Line::styled("  in this terminal (it opens the browser); s9s comes back when it finishes.", Style::new().fg(GRAY)),
+        Line::styled("  in this terminal (it opens the browser); e9s comes back when it finishes.", Style::new().fg(GRAY)),
         Line::raw(""),
         Line::from(vec![
             Span::styled("  <enter> <y> ", Style::new().fg(DODGER).bold()),

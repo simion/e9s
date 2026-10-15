@@ -33,7 +33,7 @@ const SERVICES: &[&str] = &[
 const READ_PREFIXES: &[&str] = &["describe-", "list-", "get-"];
 const READ_EXACT: &[&str] = &["filter-log-events"];
 // Reads that hand out credentials. Not mutations, but nothing here needs them.
-const DENIED: &[&str] = &["get-login-password", "get-authorization-token", "get-session-token", "get-federation-token"];
+const DENIED: &[&str] = &["get-login-password", "get-authorization-token", "get-session-token", "get-federation-token", "get-password-data"];
 
 pub fn check_read_only(service: &str, op: &str) -> Result<(), AwsError> {
     let ok = SERVICES.contains(&service)

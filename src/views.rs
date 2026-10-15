@@ -2123,7 +2123,7 @@ mod tests {
         use crate::aws::check_read_only;
         for (svc, op) in [("ecs", "update-service"), ("ecs", "execute-command"), ("ecs", "stop-task"), ("logs", "delete-log-group"),
             ("application-autoscaling", "register-scalable-target"), ("ecr", "get-login-password"), ("secretsmanager", "get-secret-value"),
-            ("ec2", "run-instances"), ("sqs", "purge-queue"), ("lambda", "invoke")] {
+            ("ec2", "run-instances"), ("sqs", "purge-queue"), ("lambda", "invoke"), ("ec2", "get-password-data")] {
             assert!(check_read_only(svc, op).is_err(), "{svc} {op} allowed");
         }
         let aws = Aws::with_runner(|_, _, _, _| panic!("runner reached"));

@@ -63,8 +63,8 @@ pub const COMMANDS: &[(&[&str], &str)] = &[
 ];
 
 pub const QUICK: &[(char, &str)] = &[
-    ('1', "clusters"), ('2', "svc"), ('3', "tasks"), ('4', "logs"), ('5', "loadbalancers"),
-    ('6', "targetgroups"), ('7', "scaling"), ('8', "ecr"), ('9', "sqs"), ('0', "rds"),
+    ('1', "Clusters"), ('2', "Services"), ('3', "Tasks"), ('4', "Logs"), ('5', "LoadBalancers"),
+    ('6', "TargetGroups"), ('7', "Scaling"), ('8', "ECR"), ('9', "SQS"), ('0', "RDS"),
 ];
 
 pub const KEYS: &[(&str, &str)] = &[
@@ -221,8 +221,10 @@ pub struct Start {
     pub refresh: Option<u64>,
 }
 
+/// Commands ignore case, so `:LoadBalancers` works like `:loadbalancers`.
 pub fn canonical(word: &str) -> Option<&'static str> {
-    COMMANDS.iter().find(|(a, _)| a.contains(&word)).map(|(a, _)| a[0])
+    let word = word.to_lowercase();
+    COMMANDS.iter().find(|(a, _)| a.contains(&word.as_str())).map(|(a, _)| a[0])
 }
 
 pub struct App {

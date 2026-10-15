@@ -26,9 +26,18 @@ The recording and these screens come from `E9S_DEMO=1`, a made-up account (see D
 
 - AWS credentials as the AWS CLI uses them: e9s calls AWS through the official AWS SDK for Rust, which reads `~/.aws/config` and `~/.aws/credentials`, so SSO profiles, roles, credential processes and environment variables work as they do for the CLI. A profile you already logged in with `aws sso login` just works.
 - The AWS CLI v2, only to log in from inside e9s (`L` runs `aws sso login`).
-- A Rust toolchain to build.
+- A Rust toolchain, only to build from source.
 
 ## Install
+
+```sh
+brew install simion/tap/e9s   # macOS and Linux
+cargo install e9s             # from crates.io: builds the AWS SDK, a few minutes
+```
+
+Binaries for macOS (Apple Silicon and Intel) and Linux (x86_64 and arm64) are on the [releases](https://github.com/simion/e9s/releases) page, with a shell installer.
+
+From a checkout:
 
 ```sh
 cargo install --path .     # builds a `e9s` binary into ~/.cargo/bin

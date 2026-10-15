@@ -168,7 +168,8 @@ const LOGO: [&str; 6] = [
 /// The keys that do something in this view, k9s-style.
 fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&str, &str)> = match view {
-        View::Profiles | View::Regions | View::Aliases => vec![("<enter>", "Select")],
+        View::Profiles => vec![("<enter>", "Select"), ("<L>", "Login")],
+        View::Regions | View::Aliases => vec![("<enter>", "Select")],
         View::Clusters => vec![("<enter>", "Services")],
         View::Services { .. } => vec![("<enter>", "Tasks"), ("<R>", "Rollout"), ("<e>", "Events"), ("<F>", "Failures"), ("<l>", "Logs"), ("<m>", "Metrics")],
         View::Failures { .. } => vec![("<enter>", "Containers/Events"), ("<l>", "Logs"), ("<R>", "Rollout"), ("<e>", "Events")],
@@ -211,7 +212,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     let val = |v: String| Span::styled(v, Style::new().fg(ORANGE));
     let who = match (&app.arn, &app.ident_err) {
         _ if app.sso_expired => Span::styled(
-            if ctx.profile.is_empty() { "SSO expired: aws sso login".to_string() } else { format!("SSO expired: aws sso login --profile {}", ctx.profile) },
+            if ctx.profile.is_empty() { "SSO expired: aws sso login".to_string() } else { format!("SSO expired: press L to log in ({})", ctx.profile) },
             Style::new().fg(Color::White).bg(Color::Indexed(160)).bold(),
         ),
         (Some(arn), _) => {
@@ -785,7 +786,7 @@ fn inflight_lines(screen: u64, max: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// `H`: every AWS CLI call this screen made, running first, then newest first, with when it started.
+/// `H`: every AWS call this screen made (as the equivalent CLI command), running first, then newest first, with when it started.
 fn calls(f: &mut Frame, screen: u64, off: u16) -> u16 {
     let r = f.area();
     let log = crate::aws::screen_log(screen);

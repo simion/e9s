@@ -9,7 +9,21 @@ keywords = ["aws", "ecs", "tui", "k9s", "cloudwatch"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+aws-config = { version = "1.12.0", features = ["behavior-version-latest"] }
+aws-sdk-applicationautoscaling = "1.122.0"
+aws-sdk-cloudwatch = "1.134.0"
+aws-sdk-cloudwatchlogs = "1.156.0"
+aws-sdk-ec2 = "1.268.0"
+aws-sdk-ecr = "1.132.0"
+aws-sdk-ecs = "1.150.0"
+aws-sdk-elasticloadbalancingv2 = "1.129.0"
+aws-sdk-lambda = "1.151.0"
+aws-sdk-rds = "1.154.0"
+aws-sdk-sqs = "1.114.0"
+aws-sdk-sts = "1.119.0"
+aws-smithy-types = "1.8.1"
 chrono = "0.4.45"
 ratatui = "0.30.2"
 regex = "1.13.1"
 serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["rt-multi-thread"] }

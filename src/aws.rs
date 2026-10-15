@@ -2,7 +2,6 @@
 //! anything that is not a read on an allowlisted service.
 
 use serde_json::Value;
-use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ctx {
@@ -22,7 +21,7 @@ impl std::fmt::Display for AwsError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             AwsError::SsoExpired(p) if p.is_empty() => write!(f, "SSO session expired or no credentials: run `aws sso login`, then press r"),
-            AwsError::SsoExpired(p) => write!(f, "SSO session expired: run `aws sso login --profile {p}`, then press r"),
+            AwsError::SsoExpired(p) => write!(f, "SSO session expired: press L to log in (aws sso login --profile {p})"),
             AwsError::Api(m) => f.write_str(m),
         }
     }
@@ -83,7 +82,7 @@ impl Scale {
 
 impl Aws {
     pub fn new(ctx: Ctx) -> Self {
-        Aws { ctx, runner: std::sync::Arc::new(run_cli), readonly: false, screen: 0 }
+        Aws { ctx, runner: std::sync::Arc::new(crate::sdk::run), readonly: false, screen: 0 }
     }
 
     /// Same profile, region and transport, logging its calls to `screen`.
@@ -213,33 +212,9 @@ pub fn display_cmd(region: &str, service: &str, op: &str, args: &[String]) -> St
     out.join(" ")
 }
 
-/// The CLI paginates list/describe operations itself unless `--max-items` is passed.
-fn run_cli(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value, AwsError> {
-    let mut cmd = Command::new("aws");
-    cmd.args([service, op, "--region", &ctx.region, "--output", "json", "--no-cli-pager"]);
-    // No profile means the SDK default chain: AWS_PROFILE, env credentials, [default], instance role.
-    if !ctx.profile.is_empty() {
-        cmd.args(["--profile", &ctx.profile]);
-    }
-    let out = cmd
-        .args(args)
-        .env("AWS_PAGER", "")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| AwsError::Api(format!("cannot run aws CLI: {e}")))?;
-    if !out.status.success() {
-        return Err(classify(&String::from_utf8_lossy(&out.stderr), &ctx.profile, service, op));
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    if s.trim().is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_str(&s).map_err(|e| AwsError::Api(format!("aws {service} {op}: unparseable output: {e}")))
-}
-
 pub fn classify(stderr: &str, profile: &str, service: &str, op: &str) -> AwsError {
     let l = stderr.to_lowercase();
-    let sso = ["token has expired", "error loading sso token", "unauthorizedssotoken", "expiredtoken", "sso session", "token is expired", "refresh failed"];
+    let sso = ["token has expired", "error loading sso token", "unauthorizedssotoken", "expiredtoken", "sso session", "token is expired", "refresh failed", "sso token", "loading an access token"];
     if sso.iter().any(|k| l.contains(k)) {
         return AwsError::SsoExpired(profile.to_string());
     }
@@ -279,7 +254,8 @@ pub fn profile_details() -> Vec<(String, std::collections::BTreeMap<String, Stri
         let mut current: Option<usize> = None;
         for line in text.lines().map(str::trim) {
             if let Some(h) = line.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
-                let name = if !is_config || h == "default" { Some(h.trim()) } else { h.strip_prefix("profile ").map(str::trim) };
+                // `[sso-session x]` is kept under its header for now, then folded into its profiles below.
+                let name = if !is_config || h == "default" || h.starts_with("sso-session ") { Some(h.trim()) } else { h.strip_prefix("profile ").map(str::trim) };
                 current = name.map(|n| match out.iter().position(|(p, _)| p == n) {
                     Some(i) => i,
                     None => {
@@ -296,7 +272,47 @@ pub fn profile_details() -> Vec<(String, std::collections::BTreeMap<String, Stri
             }
         }
     }
+    // A profile using an sso-session gets the session's start URL, which names its login in the token cache.
+    let (sessions, mut out): (Vec<_>, Vec<_>) = out.into_iter().partition(|(n, _)| n.starts_with("sso-session "));
+    for (_, kv) in &mut out {
+        let session = kv.get("sso_session").and_then(|n| sessions.iter().find(|(h, _)| h.strip_prefix("sso-session ").map(str::trim) == Some(n.as_str())));
+        if let Some(url) = session.and_then(|(_, s)| s.get("sso_start_url")).cloned() {
+            kv.entry("sso_start_url".into()).or_insert(url);
+        }
+    }
     out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SsoLogin {
+    LoggedIn,
+    /// The access token expired, but a refresh token lets the SDK renew it on the next call.
+    Renewable,
+    LoggedOut,
+}
+
+/// The state of the login for an SSO start URL, from the token cache `aws sso login` writes
+/// (`~/.aws/sso/cache/*.json`). Local files only; tokens are never read into the UI.
+pub fn sso_login(start_url: &str, cache: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> SsoLogin {
+    let mut best = SsoLogin::LoggedOut;
+    for f in std::fs::read_dir(cache).into_iter().flatten().flatten() {
+        let Ok(v) = std::fs::read_to_string(f.path()).map(|t| serde_json::from_str::<Value>(&t).unwrap_or_default()) else { continue };
+        if v["startUrl"].as_str() != Some(start_url) {
+            continue;
+        }
+        let expires = crate::logic::parse_ts(&v["expiresAt"]);
+        if expires.is_some_and(|e| e > now) {
+            return SsoLogin::LoggedIn;
+        }
+        if v.get("refreshToken").is_some() {
+            best = SsoLogin::Renewable;
+        }
+    }
+    best
+}
+
+pub fn sso_cache_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}/.aws/sso/cache", std::env::var("HOME").unwrap_or_default()))
 }
 
 /// The profile whose `sso_account_id` is `account`, from ~/.aws/config.
@@ -344,6 +360,23 @@ pub fn parse_config(text: &str) -> Vec<(String, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sso_login_reads_the_token_cache() {
+        let dir = std::env::temp_dir().join(format!("s9s-sso-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = crate::logic::parse_ts(&Value::String("2026-10-15T12:00:00Z".into())).unwrap();
+        let write = |name: &str, body: &str| std::fs::write(dir.join(name), body).unwrap();
+        write("a.json", r#"{"startUrl": "https://a/start", "expiresAt": "2026-10-15T13:00:00Z", "accessToken": "x"}"#);
+        write("b.json", r#"{"startUrl": "https://b/start", "expiresAt": "2026-10-15T11:00:00Z", "refreshToken": "x"}"#);
+        write("c.json", r#"{"startUrl": "https://c/start", "expiresAt": "2026-10-15T11:00:00Z"}"#);
+        write("client.json", r#"{"clientId": "x", "expiresAt": "2026-12-01T00:00:00Z"}"#);
+        assert_eq!(sso_login("https://a/start", &dir, now), SsoLogin::LoggedIn);
+        assert_eq!(sso_login("https://b/start", &dir, now), SsoLogin::Renewable);
+        assert_eq!(sso_login("https://c/start", &dir, now), SsoLogin::LoggedOut);
+        assert_eq!(sso_login("https://nowhere/start", &dir, now), SsoLogin::LoggedOut);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn display_cmd_collapses_long_argument_lists() {

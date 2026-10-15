@@ -8,7 +8,7 @@ The README is the user guide; this file is for whoever changes the code.
 ```sh
 make                          # list the targets
 make run ARGS="-p <profile>"  # build and launch
-make test                     # 22 tests, no AWS access needed
+make test                     # 24 tests, no AWS access needed
 make install                  # ./install.sh: a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes
 s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```
@@ -26,7 +26,8 @@ macOS has no `timeout`; run long checks in the background and kill them.
 
 | File | What lives there |
 |---|---|
-| `src/aws.rs` | The read-only guard (`check_read_only`: service allowlist, `describe-`/`list-`/`get-` prefixes, `READ_EXACT`, `DENIED`), the CLI transport (`run_cli`), the per-screen command log (`Call`, `screen_log`, `inflight`), `display_cmd` |
+| `src/aws.rs` | The read-only guard (`check_read_only`: service allowlist, `describe-`/`list-`/`get-` prefixes, `READ_EXACT`, `DENIED`), the per-screen command log (`Call`, `screen_log`, `inflight`), `display_cmd`, profiles and the SSO login state (`sso_login`) |
+| `src/sdk.rs` | The transport: AWS SDK clients on one tokio runtime, credentials per profile shared across regions; `run` takes the CLI's service, operation and arguments and returns the CLI's JSON shape, so views never changed. Only the reads in `dispatch` exist |
 | `src/views.rs` | Every view: `View` enum, fetch, columns, health, drill-down, log resolution and live tail (`resolve`, `logs`, `filter_all`, `tail_poll`), failures |
 | `src/app.rs` | State (`App`, `Frame` stack), keys, commands, tail thread, save and copy |
 | `src/ui.rs` | Rendering: header and logo, tables, the log/describe text body, overlays (`help`, `calls`), footer |
@@ -47,9 +48,18 @@ macOS has no `timeout`; run long checks in the background and kill them.
 - Service logs name each running task's stream (`prefix/container/taskid`) and send them 100 per `filter-log-events` call (the API limit), in parallel, merged by timestamp.
   Querying by the service's stream prefix also matched every stream the service ever had (about 10,000 on a busy service) and took 18.6 s for 7 s of logs; naming the streams took about 2.5 s.
 - Live tail polls `filter-log-events` every 2 s with 5 s of overlap, dropping duplicates by `eventId`.
-  The CLI's StartLiveTail prints messages without their stream, so lines cannot be tagged by task.
+  StartLiveTail is billed per minute; polling costs nothing extra and lines keep their stream.
 - If one poll returns more than 10,000 lines, the cursor jumps to now and the screen says lines were skipped.
 - Windows `2`-`6` read up to 5,000 lines per 100 streams and say when cut.
+
+## Transport, and why
+
+Calls go through the AWS SDK for Rust (`src/sdk.rs`); the CLI is only run for `L` (`aws sso login`), with the screen suspended.
+Measured on prod (2026-10-15): a CLI call cost about 1.0 s, of which about 0.7 s was the process (Python start, botocore, reading credentials).
+With the SDK a warm services refresh is 2.2 s, all AWS time (`describe-tasks` of 52 tasks alone takes 1.5 s); screens later in a session got 30 to 40% faster.
+The first call of a run is slower than with the CLI (the SDK fetches role credentials once per profile, the CLI kept them in `~/.aws/cli/cache`).
+A clean release build takes about 2.5 minutes (eleven SDK crates); incremental builds are seconds.
+`dispatch` builds the CLI's JSON by hand from the SDK types (their serde support is behind an unstable flag), so a field a view starts reading must be added there too.
 
 ## Known limits
 
@@ -61,8 +71,7 @@ macOS has no `timeout`; run long checks in the background and kill them.
 
 ## Open decisions
 
-- **Scale write path.** `Aws::scale` and `App::open_scale` exist but no key opens them, so the tool cannot write. Either remove them before publishing, or put them behind an explicit `--write` flag (writes off by default).
-- **Transport.** It shells out to the AWS CLI v2 (SSO and profiles work as for the CLI). The Rust AWS SDK would remove the process per call but adds a large dependency tree.
+- **Scale write path.** `Aws::scale` and `App::open_scale` exist but no key opens them, and `sdk::run` implements no writes, so the tool cannot write. Either remove them before publishing, or put them behind an explicit `--write` flag (writes off by default).
 - **Region scan.** It counts ECS clusters, services and tasks per region; EC2, Lambda and RDS are not counted.
 - **Copy in `H`.** Copying the full, runnable command of a selected call is not built.
 - **k9s history keys.** k9s binds `[` `]` to command history and `-` to the last view (`internal/view/app.go`); s9s spends `+` `-` on the refresh interval, which k9s only takes as a flag. Following k9s means moving the interval keys.

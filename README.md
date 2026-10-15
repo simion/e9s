@@ -10,7 +10,8 @@ Environment variable and secret values are stripped from every response before t
 
 ## Requirements
 
-- AWS CLI v2 on `PATH` (calls run through `aws`, so SSO, profiles and credential processes work exactly as they do for the CLI).
+- AWS credentials as the AWS CLI uses them: s9s calls AWS through the official AWS SDK for Rust, which reads `~/.aws/config` and `~/.aws/credentials`, so SSO profiles, roles, credential processes and environment variables work as they do for the CLI. A profile you already logged in with `aws sso login` just works.
+- The AWS CLI v2, only to log in from inside s9s (`L` runs `aws sso login`).
 - A Rust toolchain to build.
 
 ## Install
@@ -29,7 +30,7 @@ make install               # same as ./install.sh
 ```
 
 The installed command is a small launcher that runs this checkout's source.
-When any file under `src/`, `Cargo.toml` or `Cargo.lock` is newer than the built binary, it rebuilds first (a few seconds); otherwise it starts straight away.
+When any file under `src/`, `Cargo.toml` or `Cargo.lock` is newer than the built binary, it rebuilds first (seconds; the first build compiles the AWS SDK and takes a few minutes); otherwise it starts straight away.
 So editing the source and running `s9s` again is all a change needs.
 
 ## Run
@@ -67,7 +68,9 @@ Startup follows k9s: choose where you are, then navigate.
 2. **Identity.** The header shows the profile, region, account and role. Below 120 columns or 30 rows it shrinks to two lines: that context on one, this screen's keys on the next (no logo or quick-view map; `?` lists them). A role whose name does not read as read-only is shown in yellow, as a reminder; s9s still only reads.
 3. **Region.** Without `--region` it scans every enabled region in parallel and lists ECS clusters, services and running tasks per region, regions with resources first. Enter opens one.
 
-If the SSO session has expired, the header says so and names the command (`aws sso login --profile <name>`); log in and press `r`.
+The profile picker has a LOGIN column (logged in, expired but renewing on use, not logged in), read from the token cache `aws sso login` writes.
+`L` logs in: the selected profile in the picker, or the current one anywhere else. s9s steps aside while `aws sso login --profile <name>` opens the browser, then comes back and reloads.
+If the SSO session expires while s9s runs, the header turns red and says to press `L` (or log in elsewhere and press `r`).
 
 ## Keys
 
@@ -86,7 +89,7 @@ If the SSO session has expired, the header says so and names the command (`aws s
 | `ctrl-f` `ctrl-b` / `PgDn` `PgUp` (also `ctrl-u`) | Page down / up |
 | `ctrl-d` `ctrl-k` | Delete and kill in k9s; here they only say s9s is read-only |
 | `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; anything else shows as YAML, and a structured log line is parsed first |
-| `y` | YAML of the selection, as AWS returned it |
+| `y` | YAML of the selection: the fields s9s reads from AWS, under their API names |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
 | `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says s9s is read-only |
 | `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs |
@@ -110,7 +113,8 @@ If the SSO session has expired, the header says so and names the command (`aws s
 | `ctrl-e` `ctrl-g` | Hide or show the header / the breadcrumbs, as in k9s (`--headless` and `--crumbsless` start with them hidden) |
 | `0`-`9` | Quick views: 1 clusters, 2 services, 3 tasks, 4 log groups, 5 load balancers, 6 target groups, 7 scaling, 8 ECR, 9 SQS, 0 RDS |
 | `?` | Help overlay: what the current screen is in AWS terms and its Kubernetes equivalent, then every key and command. Scroll with `↑` `↓` / `j` `k`, page with `PgUp` `PgDn` / `space`, close with `Esc`, `q` or `?` |
-| `H` | Command log for this screen: every AWS CLI call it made, running first, then newest first, with how long ago it started, how long it took, and a tick or a cross for its result. While a screen loads, finished calls stay listed under the running ones |
+| `L` | Log in with `aws sso login`: the selected profile in the profile picker, else the current profile |
+| `H` | Command log for this screen: every AWS call it made, written as the equivalent `aws` CLI command, running first, then newest first, with how long ago it started, how long it took, and a tick or a cross for its result. While a screen loads, finished calls stay listed under the running ones |
 
 ## Commands
 
@@ -196,7 +200,7 @@ It opens on the newest lines: one stream reads its tail directly; several stream
 Then it follows: every 2 s it reads what arrived since the newest line shown, re-reading 5 s back for lines CloudWatch ingests late and dropping ones already shown.
 If more lines arrive between two reads than one read returns (10,000 per batch), it says so and jumps to now.
 `s` pauses and resumes.
-This polls `filter-log-events` instead of using StartLiveTail, because the CLI's live tail prints messages without the stream they came from, and Live Tail is billed per minute.
+This polls `filter-log-events` instead of using StartLiveTail, because Live Tail is billed per minute and the polled lines already carry their stream.
 
 ## Development
 
@@ -212,7 +216,7 @@ s9s -p prod -r us-west-1 --cluster my-cluster --script "@wait @snap"
 
 Tokens: `@wait` (until the view has loaded; prints the load time to stderr), `@sleep` (2 s), `@snap` (print the screen), `@shot=<path>` (write the screen as HTML), `@size=WxH` (resize the screen, 200x60 by default), `@cmd` (print the launch command `c` would copy), `<Enter>` `<Esc>` `<Tab>` `<Space>` `<C-x>`; anything else is typed as keys.
 
-Layout: `src/aws.rs` is the read-only guard and CLI transport, `src/views.rs` every resource view (fetch, columns, health, drill-down), `src/logic.rs` pure helpers (deployment split, redaction, sorting, time), `src/app.rs` state and keys, `src/ui.rs` rendering.
+Layout: `src/aws.rs` is the read-only guard, `src/sdk.rs` the AWS SDK transport, `src/views.rs` every resource view (fetch, columns, health, drill-down), `src/logic.rs` pure helpers (deployment split, redaction, sorting, time), `src/app.rs` state and keys, `src/ui.rs` rendering.
 
 ## License
 

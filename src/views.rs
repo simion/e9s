@@ -349,8 +349,9 @@ impl View {
                 Ok(t)
             }
             View::Profiles => {
-                let mut t = Table::new(&["PROFILE", "ACCOUNT", "ROLE", "REGION", "SSO SESSION"]);
-                t.info("a profile names an account and a role to sign in as (Kubernetes: a kubeconfig context) · Enter picks one");
+                let mut t = Table::new(&["PROFILE", "ACCOUNT", "ROLE", "REGION", "SSO SESSION", "LOGIN"]);
+                t.info("a profile names an account and a role to sign in as (Kubernetes: a kubeconfig context) · Enter picks one · L logs in (aws sso login)");
+                let (cache, now) = (crate::aws::sso_cache_dir(), Utc::now());
                 for (p, kv) in crate::aws::profile_details() {
                     let g = |k: &str| kv.get(k).cloned().unwrap_or_default();
                     let role = if kv.contains_key("role_arn") { short(&g("role_arn")).to_string() } else { g("sso_role_name") };
@@ -359,7 +360,15 @@ impl View {
                     } else {
                         g("role_arn").split(':').nth(4).unwrap_or("").to_string()
                     };
-                    t.row(p.clone(), Health::None, json!({"profile": p, "region": kv.get("region")}), vec![p, account, role, g("region"), g("sso_session")]);
+                    use crate::aws::SsoLogin;
+                    let (health, login) = match kv.get("sso_start_url").map(|u| crate::aws::sso_login(u, &cache, now)) {
+                        Some(SsoLogin::LoggedIn) => (Health::Ok, "logged in"),
+                        Some(SsoLogin::Renewable) => (Health::Warn, "expired, renews on use"),
+                        Some(SsoLogin::LoggedOut) => (Health::Bad, "not logged in (L)"),
+                        None => (Health::None, "-"),
+                    };
+                    let sso = kv.contains_key("sso_start_url");
+                    t.row(p.clone(), health, json!({"profile": p, "region": kv.get("region"), "sso": sso}), vec![p, account, role, g("region"), g("sso_session"), login.into()]);
                 }
                 t.empty = Some("no profiles in ~/.aws/config or ~/.aws/credentials".into());
                 Ok(t)

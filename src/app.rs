@@ -152,7 +152,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("g G", "top / bottom"),
     ("ctrl-f ctrl-b", "page down / up (also PgDn PgUp, ctrl-u)"),
     ("d", "describe: full detail of the selection"),
-    ("y", "YAML of the selection, as AWS returned it"),
+    ("y", "YAML of the selection: the fields s9s reads, under their API names"),
     ("l", "logs for the selection"),
     ("s", "logs: autoscroll (follow new lines) on / off; on by default"),
     ("f", "logs, describe: fullscreen"),
@@ -168,6 +168,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("e", "events of the selected service"),
     ("m", "metrics (services, load balancers, target groups)"),
     ("r ctrl-r", "refresh now"),
+    ("L", "log in with aws sso login: the selected profile in :profile, else the current one"),
     ("c", "copy the command that reopens this view (logs: the lines shown; describe: the page)"),
     ("+ -", "auto-refresh interval up / down (off, 5s .. 60s)"),
     ("< >", "sort by previous / next column"),
@@ -175,7 +176,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("N A S", "sort by name / age / status"),
     ("ctrl-e ctrl-g", "hide or show the header / the breadcrumbs"),
     ("0-9", "quick views (header shows the map)"),
-    ("H", "AWS CLI calls this screen made: running, then finished, with time and result"),
+    ("H", "AWS calls this screen made, as aws CLI commands: running, then finished, with time and result"),
     ("?", "this help"),
 ];
 
@@ -311,6 +312,8 @@ pub struct App {
     pub flash: Option<(String, bool, Instant)>,
     pub page: usize,
     pub quit: bool,
+    /// A profile to log in with `aws sso login`; the main loop pauses the screen to run it.
+    pub login: Option<String>,
     cluster: Option<String>,
     service: Option<String>,
     tx: Sender<Msg>,
@@ -332,7 +335,7 @@ impl App {
         let mut app = App {
             chrome: Default::default(), aws: Arc::new(Aws::new(Ctx { profile, region: home })), arn: None, account: None, ident_err: None, sso_expired: false,
             stack: vec![], mode: Mode::Normal, pick: None, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
-            quit: false, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
+            quit: false, login: None, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
         };
         if pick_profile {
             app.replace_root(View::Profiles);
@@ -713,11 +716,15 @@ impl App {
             KeyCode::Char('f') if ctrl => self.move_sel(page),
             KeyCode::Char('b') if ctrl => self.move_sel(-page),
             KeyCode::Char('r') => {
+                if self.sso_expired {
+                    crate::sdk::reset(); // read the login again, in case it was renewed outside s9s
+                }
                 self.load();
                 if self.sso_expired || self.arn.is_none() {
                     self.identity();
                 }
             }
+            KeyCode::Char('L') => self.ask_login(),
             KeyCode::PageDown => self.move_sel(page),
             KeyCode::PageUp => self.move_sel(-page),
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
@@ -814,6 +821,38 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `L`: the selected profile in the picker, else the current one, if it signs in through SSO.
+    fn ask_login(&mut self) {
+        let (profile, sso) = match (&self.top().view, self.top().selected()) {
+            (View::Profiles, Some(r)) => (r.id.clone(), r.json["sso"].as_bool() == Some(true)),
+            _ => {
+                let p = self.aws.ctx.profile.clone();
+                let sso = crate::aws::profile_details().iter().any(|(n, kv)| *n == p && kv.contains_key("sso_start_url"));
+                (p, sso)
+            }
+        };
+        if profile.is_empty() || !sso {
+            let who = if profile.is_empty() { "the default credentials".to_string() } else { format!("profile {profile}") };
+            return self.flash(format!("{who} does not sign in through SSO: nothing to log in to"), true);
+        }
+        self.login = Some(profile);
+    }
+
+    /// After `aws sso login` ran: read credentials again, re-check identity, reload the screen.
+    pub fn logged_in(&mut self, profile: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                crate::sdk::reset();
+                self.flash(format!("logged in: {profile}"), false);
+                if profile == self.aws.ctx.profile {
+                    self.identity();
+                }
+                self.load();
+            }
+            Err(e) => self.flash(format!("aws sso login --profile {profile} failed: {e}"), true),
         }
     }
 

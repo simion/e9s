@@ -61,7 +61,7 @@ pub fn describe(view: &View, row: &Row) -> Option<Vec<String>> {
         _ => return None,
     }
     p.line(0, "");
-    p.line(0, "(y shows the raw JSON)");
+    p.line(0, "(y shows these fields as YAML)");
     Some(p.0)
 }
 

@@ -1,0 +1,17 @@
+# Termic repo config: https://termic.dev
+version: 1
+scripts:
+  setup: ''
+  run: make run
+  archive: ''
+  preview_url: ''
+  files_to_copy: []
+  run_scripts:
+    - label: install
+      command: make install
+sandbox:
+  enabled_by_default: false
+  allowed_hosts: []
+  allowed_paths: []
+exclude: []
+extra_named_ports: []

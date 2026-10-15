@@ -8,6 +8,20 @@ Every AWS call goes through one function (`Aws::call` in `src/aws.rs`) that only
 Credential getters such as `ecr get-login-password` are refused too.
 Environment variable and secret values are stripped from every response before they are shown or saved, so only their names appear.
 
+![e9s: services, a rollout, live logs, metrics, failures and the AWS call log](docs/demo.gif)
+
+## Screens
+
+The recording and these screens come from `E9S_DEMO=1`, a made-up account (see Development).
+
+| Services | Rollout watch (`R`) |
+|---|---|
+| ![Services of a cluster](docs/screens/services.png) | ![A rollout in progress](docs/screens/rollout.png) |
+| **Live logs (`l`)** | **Metrics (`m`)** |
+| ![Live tail of every task of a service](docs/screens/logs.png) | ![CPU and memory, last 3 hours](docs/screens/metrics.png) |
+| **Failures (`F`)** | **Tasks** |
+| ![Crashed tasks and problem events](docs/screens/failures.png) | ![Tasks of both generations](docs/screens/tasks.png) |
+
 ## Requirements
 
 - AWS credentials as the AWS CLI uses them: e9s calls AWS through the official AWS SDK for Rust, which reads `~/.aws/config` and `~/.aws/credentials`, so SSO profiles, roles, credential processes and environment variables work as they do for the CLI. A profile you already logged in with `aws sso login` just works.
@@ -218,6 +232,9 @@ e9s -p prod -r us-west-1 --cluster my-cluster --script "@wait @snap"
 ```
 
 Tokens: `@wait` (until the view has loaded; prints the load time to stderr), `@sleep` (2 s), `@snap` (print the screen), `@shot=<path>` (write the screen as HTML), `@size=WxH` (resize the screen, 200x60 by default), `@cmd` (print the launch command `c` would copy), `<Enter>` `<Esc>` `<Tab>` `<Space>` `<C-x>`; anything else is typed as keys.
+
+`E9S_DEMO=1` answers every read from a made-up account instead of AWS (`src/demo.rs`: one cluster mid-rollout, one service running out of memory, logs that keep coming).
+The recording above comes from it: `make demo` records `docs/demo.gif` again with [vhs](https://github.com/charmbracelet/vhs) from `docs/demo/demo.tape`.
 
 Layout: `src/aws.rs` is the read-only guard, `src/sdk.rs` the AWS SDK transport, `src/views.rs` every resource view (fetch, columns, health, drill-down), `src/logic.rs` pure helpers (deployment split, redaction, sorting, time), `src/app.rs` state and keys, `src/ui.rs` rendering.
 

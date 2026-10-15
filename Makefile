@@ -3,12 +3,13 @@
 # make uninstall                           remove that launcher
 # make test                                unit tests, no AWS access needed
 # make shots                               shots/*.html to PNG (headless Chrome)
+# make demo                                record docs/demo.gif from the made-up demo account (needs vhs)
 
 CARGO ?= $(shell command -v cargo || ls $$HOME/.cargo/bin/cargo /opt/homebrew/opt/rustup/bin/cargo /usr/local/opt/rustup/bin/cargo 2>/dev/null | head -n 1)
 # Rustup's proxies find rustc through PATH.
 export PATH := $(dir $(CARGO)):$(PATH)
 
-.PHONY: help run install uninstall test shots
+.PHONY: help run install uninstall test shots demo
 .DEFAULT_GOAL := help
 
 help:
@@ -31,3 +32,7 @@ CHROME ?= /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
 shots:
 	cd shots && for h in *.html; do "$(CHROME)" --headless=new --disable-gpu --hide-scrollbars \
 	  --window-size=1660,1010 --screenshot="$${h%.html}.png" "file://$$PWD/$$h" >/dev/null 2>&1; done; ls *.png | wc -l
+
+demo:
+	$(CARGO) build --release --locked
+	vhs docs/demo/demo.tape

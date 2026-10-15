@@ -1,0 +1,15 @@
+[profile prod]
+sso_session = acme
+sso_account_id = 123456789012
+sso_role_name = ReadOnlyAccess
+region = us-east-1
+[profile staging]
+sso_session = acme
+sso_account_id = 210987654321
+sso_role_name = ReadOnlyAccess
+region = us-east-1
+[profile sandbox]
+region = eu-west-1
+[sso-session acme]
+sso_start_url = https://acme.awsapps.com/start
+sso_region = us-east-1

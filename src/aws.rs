@@ -82,7 +82,9 @@ impl Scale {
 
 impl Aws {
     pub fn new(ctx: Ctx) -> Self {
-        Aws { ctx, runner: std::sync::Arc::new(crate::sdk::run), readonly: false, screen: 0 }
+        // E9S_DEMO=1: a made-up account answers, for screenshots and recordings.
+        let runner: Runner = if std::env::var_os("E9S_DEMO").is_some() { std::sync::Arc::new(crate::demo::run) } else { std::sync::Arc::new(crate::sdk::run) };
+        Aws { ctx, runner, readonly: false, screen: 0 }
     }
 
     /// Same profile, region and transport, logging its calls to `screen`.

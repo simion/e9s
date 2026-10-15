@@ -1,5 +1,6 @@
 mod app;
 mod aws;
+mod demo;
 mod describe;
 mod learn;
 mod logic;

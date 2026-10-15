@@ -27,6 +27,7 @@ macOS has no `timeout`; run long checks in the background and kill them.
 | File | What lives there |
 |---|---|
 | `src/aws.rs` | The read-only guard (`check_read_only`: service allowlist, `describe-`/`list-`/`get-` prefixes, `READ_EXACT`, `DENIED`), the per-screen command log (`Call`, `screen_log`, `inflight`), `display_cmd`, profiles and the SSO login state (`sso_login`) |
+| `src/demo.rs` | `E9S_DEMO=1`: a made-up account for the README recording (`make demo`, `docs/demo/demo.tape`) and `docs/screens`. A field a view starts reading needs adding here too, as in `sdk.rs` |
 | `src/sdk.rs` | The transport: AWS SDK clients on one tokio runtime, credentials per profile shared across regions; `run` takes the CLI's service, operation and arguments and returns the CLI's JSON shape, so views never changed. Only the reads in `dispatch` exist |
 | `src/views.rs` | Every view: `View` enum, fetch, columns, health, drill-down, log resolution and live tail (`resolve`, `logs`, `filter_all`, `tail_poll`), failures |
 | `src/app.rs` | State (`App`, `Frame` stack), keys, commands, tail thread, save and copy |
@@ -83,7 +84,7 @@ Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an exp
 - **Copy in `H`.** Copying the full, runnable command of a selected call is not built.
 - **k9s history keys.** k9s binds `[` `]` to command history and `-` to the last view (`internal/view/app.go`); e9s spends `+` `-` on the refresh interval, which k9s only takes as a flag. Following k9s means moving the interval keys.
 - **k9s keys left out.** `ctrl-w` (wide columns: e9s has no narrow/wide column sets) and `Space` marks (nothing acts on several rows in a read-only tool).
-- **Publishing.** No remote yet; CI (`.github/workflows/ci.yml`) runs once it is on GitHub. Real screenshots for the README should come from an account with nothing sensitive in it.
+- **Publishing.** Public at github.com/simion/e9s; CI is `.github/workflows/ci.yml`. README images come from `E9S_DEMO=1` only, never from a real account.
 
 ## Ideas from taws (huseyinbabal/taws, MIT), not built yet
 

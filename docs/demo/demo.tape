@@ -1,10 +1,11 @@
 # The README recording: `make demo` (needs vhs). E9S_DEMO=1 answers every read from a made-up account;
 # HOME is docs/demo/home, so the profiles and their SSO login are made up too.
+# 1750x796 at FontSize 22 is 120x30, the smallest terminal with the full header and logo.
 Output docs/demo.gif
 Set Shell bash
 Set FontSize 22
-Set Width 1400
-Set Height 820
+Set Width 1750
+Set Height 796
 Set Padding 16
 Set TypingSpeed 80ms
 Set Theme "Builtin Dark"

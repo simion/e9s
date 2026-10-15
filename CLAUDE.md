@@ -7,7 +7,7 @@ The README is the user guide; this file is for whoever changes the code.
 
 ```sh
 make run ARGS="-p <profile>"  # build and launch
-make test                     # 19 tests, no AWS access needed
+make test                     # 22 tests, no AWS access needed
 make install                  # ./install.sh: a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes
 s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```
@@ -15,6 +15,7 @@ s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 `--script` drives the real app on an in-memory screen and prints it.
 Tokens are separated by spaces: `:svc <Enter> @wait H @snap`, not `:svc<Enter>`.
 `@shot=shots/<name>` writes the screen as HTML with exact colours; `make shots` renders every `shots/*.html` to PNG with headless Chrome (`shots/` is gitignored).
+The screen is 200x60; `@size=140x40` checks a laptop-sized terminal, where most layout problems show first.
 This is how every UI change gets checked without a terminal.
 
 The Makefile finds cargo even when it is not on PATH (rustup under Homebrew); plain `cargo` calls need `export PATH=/opt/homebrew/opt/rustup/bin:$PATH` there.

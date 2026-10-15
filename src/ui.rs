@@ -115,16 +115,29 @@ fn note_style(h: Health) -> Style {
     }
 }
 
-/// Hard-wrap to `w` columns. Cells wrap instead of being cut, so no message loses a word.
+/// Wrap to `w` columns at spaces, splitting only a word longer than a line.
+/// Cells wrap instead of being cut, so no message loses a word.
 fn wrap(text: &str, w: usize) -> Vec<String> {
     let w = w.max(1);
     let mut out = vec![];
     for part in text.split('\n') {
-        let chars: Vec<char> = part.chars().collect();
-        if chars.is_empty() {
-            out.push(String::new());
+        let mut line: Vec<char> = vec![];
+        for ch in part.chars() {
+            line.push(ch);
+            if line.len() > w {
+                // Break at the last space (dropping it), else split the word; a leading indent is kept.
+                let rest = match line.iter().rposition(|&c| c == ' ').filter(|&i| i > 0) {
+                    Some(i) => {
+                        let rest = line.split_off(i + 1);
+                        line.pop();
+                        rest
+                    }
+                    None => line.split_off(w),
+                };
+                out.push(std::mem::replace(&mut line, rest).into_iter().collect());
+            }
         }
-        out.extend(chars.chunks(w).map(|c| c.iter().collect::<String>()));
+        out.push(line.into_iter().collect());
     }
     out
 }
@@ -192,7 +205,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         (Some(arn), _) => {
             // The role, not the whole ARN: assumed-role/<role>/<session>.
             let who = arn.split_once(":assumed-role/").or_else(|| arn.split_once(":user/")).map(|x| x.1).unwrap_or(arn);
-            let role = who.split('/').next().unwrap_or(who).to_string();
+            let role = sso_role(who.split('/').next().unwrap_or(who));
             if app.read_only_role() { val(role) } else { Span::styled(format!("{role} (may write; tool only reads)"), Style::new().fg(Color::Indexed(220)).bold()) }
         }
         (None, Some(e)) => Span::styled(e.clone(), Style::new().fg(Color::Indexed(202))),
@@ -254,6 +267,14 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), b);
     if logo_w > 0 && c.width >= logo_w {
         f.render_widget(Paragraph::new(LOGO.iter().map(|l| Line::styled(*l, Style::new().fg(ORANGE).bold())).collect::<Vec<_>>()), c);
+    }
+}
+
+/// An SSO role `AWSReservedSSO_<permission set>_<16 hex>` reads as its permission set.
+fn sso_role(role: &str) -> String {
+    match role.strip_prefix("AWSReservedSSO_").and_then(|r| r.rsplit_once('_')) {
+        Some((set, hash)) if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) => format!("{set} (SSO)"),
+        _ => role.to_string(),
     }
 }
 
@@ -389,26 +410,28 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
     let cols: Vec<usize> = (0..ncol).filter(|&c| Some(c) != detail).collect();
     let cell = |i: usize, c: usize| rows[i].cells.get(c).map(String::as_str).unwrap_or("");
     let avail = inner.width as usize;
-    let mut widths: Vec<usize> = cols.iter().map(|&c| top.table.headers[c].chars().count() + 2).collect();
+    let mut widths: Vec<usize> = cols.iter().map(|&c| top.table.headers[c].chars().count()).collect();
     for &i in &vis {
         for (k, &c) in cols.iter().enumerate() {
             widths[k] = widths[k].max(cell(i, c).chars().count().min(avail));
         }
     }
-    // The last grid column takes what is left. Without a detail line it is the explanation column,
-    // so it keeps about a quarter of the width. Narrow the widest columns to fit; cells wrap, never cut.
+    // The last grid column takes what is left, keeping at least 20 columns. Narrow the widest
+    // columns to fit; cells wrap, never cut.
     let n = cols.len();
-    let last_min = match widths.last() {
-        Some(&w) if detail.is_none() && n > 3 => (avail / 4).max(20).min(w.max(20)),
-        Some(&w) => w.min(20),
-        None => 0, // first frame: nothing loaded yet, no columns
-    };
+    let last_min = widths.last().map_or(0, |&w| w.min(20)); // 0: first frame, nothing loaded yet
     while n > 1 && widths[..n - 1].iter().map(|w| w + 1).sum::<usize>() + last_min > avail {
         let (i, w) = widths[..n - 1].iter().enumerate().max_by_key(|x| *x.1).map(|(i, w)| (i, *w)).unwrap();
         if w <= 6 {
             break;
         }
         widths[i] -= 1;
+    }
+    // Room to spare (the last column's content fits too): up to 2 columns of air after each column.
+    if n > 1 {
+        let used: usize = widths[..n - 1].iter().map(|w| w + 1).sum();
+        let pad = (avail.saturating_sub(used + widths[n - 1]) / (n - 1)).min(2);
+        widths[..n - 1].iter_mut().for_each(|w| *w += pad);
     }
     let used: usize = widths[..n.saturating_sub(1)].iter().map(|w| w + 1).sum();
     if let Some(last) = widths.last_mut() {
@@ -870,4 +893,22 @@ fn help(f: &mut Frame, view: &View, off: u16) -> u16 {
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).scroll((off, 0)).block(block), r);
     max
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sso_roles_read_as_their_permission_set() {
+        assert_eq!(super::sso_role("AWSReservedSSO_ReadOnlyAccess_b86e2a4cc906d012"), "ReadOnlyAccess (SSO)");
+        assert_eq!(super::sso_role("deploy-bot"), "deploy-bot");
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_splits_only_long_words() {
+        assert_eq!(super::wrap("runningCount sums both", 14), ["runningCount", "sums both"]);
+        assert_eq!(super::wrap("checkout-service-prod", 9), ["checkout-", "service-p", "rod"]);
+        assert_eq!(super::wrap("a\n\nb", 5), ["a", "", "b"]);
+        assert_eq!(super::wrap("", 5), [""]);
+        assert_eq!(super::wrap(" note text", 6), [" note", "text"], "the indent stays");
+    }
 }

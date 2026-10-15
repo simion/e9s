@@ -118,7 +118,7 @@ fn main() -> std::io::Result<()> {
 }
 
 /// Headless run for checks without a tty: drives the real App and renderer on an in-memory screen.
-/// Tokens: `@wait` (until the view loads), `@sleep` (2s), `@snap` (print the screen),
+/// Tokens: `@wait` (until the view loads), `@sleep` (2s), `@snap` (print the screen), `@size=WxH` (default 200x60),
 /// `<Enter>` `<Esc>` `<Up>` `<Down>` `<Tab>` `<Space>` `<C-x>`, anything else is typed as keys.
 fn run_script(app: &mut App, rx: &mpsc::Receiver<Msg>, script: &str) -> std::io::Result<()> {
     use ratatui::backend::TestBackend;
@@ -150,6 +150,10 @@ fn run_script(app: &mut App, rx: &mpsc::Receiver<Msg>, script: &str) -> std::io:
             }
             "@sleep" => pump(app, Duration::from_secs(2)),
             "@cmd" => println!("launch: {:?}", app.launch_command()),
+            t if t.starts_with("@size=") => match t[6..].split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))) {
+                Some((w, h)) => term.backend_mut().resize(w, h),
+                None => eprintln!("{t}: expected @size=<width>x<height>"),
+            },
             t if t.starts_with("@shot=") => {
                 let _ = term.draw(|f| ui::draw(f, app));
                 let path = format!("{}.html", &t[6..]);

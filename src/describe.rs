@@ -182,8 +182,9 @@ fn task(p: &mut Page, t: &Value) {
     let ip = arr(t, "/containers").iter().flat_map(|c| arr(c, "/networkInterfaces")).map(|ni| s(ni, "/privateIpv4Address")).find(|x| !x.is_empty());
     p.kv(0, "Private IP", ip.unwrap_or_default());
 
+    // In time order: a crash stops execution before ECS starts stopping the task; a scheduler stop is the other way round.
     p.section("Timeline");
-    for (label, ptr) in [
+    let mut steps = [
         ("Created", "/createdAt"),
         ("Image pull started", "/pullStartedAt"),
         ("Image pull finished", "/pullStoppedAt"),
@@ -191,7 +192,9 @@ fn task(p: &mut Page, t: &Value) {
         ("Stopping", "/stoppingAt"),
         ("Stopped", "/stoppedAt"),
         ("Execution stopped", "/executionStoppedAt"),
-    ] {
+    ];
+    steps.sort_by_key(|(_, ptr)| t.pointer(ptr).and_then(parse_ts));
+    for (label, ptr) in steps {
         p.kv(2, label, when(t, ptr));
     }
 
@@ -313,6 +316,7 @@ mod tests {
                 "taskArn": "arn:aws:ecs:us-west-1:1:task/prod/abc123", "lastStatus": "STOPPED", "desiredStatus": "STOPPED",
                 "stopCode": "EssentialContainerExited", "stoppedReason": "Essential container in task exited",
                 "createdAt": "2026-10-14T10:00:00Z", "stoppedAt": "2026-10-14T10:05:00Z",
+                "stoppingAt": "2026-10-14T10:04:30Z", "executionStoppedAt": "2026-10-14T10:04:00Z",
                 "containers": [{"name": "app", "image": "repo/app:v42", "lastStatus": "STOPPED", "exitCode": 137, "reason": "OutOfMemoryError"}]
             }),
         };
@@ -321,5 +325,7 @@ mod tests {
         assert!(page.contains("Exit code:") && page.contains("137") && page.contains("OutOfMemoryError"), "{page}");
         assert!(page.contains("Tag:") && page.contains("v42"), "{page}");
         assert!(!page.contains("Image pull started"), "empty fields are skipped: {page}");
+        let at = |k: &str| page.find(k).unwrap();
+        assert!(at("Execution stopped") < at("Stopping") && at("Stopping") < at("Stopped:"), "timeline in time order: {page}");
     }
 }

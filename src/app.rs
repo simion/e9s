@@ -47,7 +47,7 @@ pub const COMMANDS: &[(&[&str], &str)] = &[
     (&["failures", "fail"], "failed tasks and problem events of the last hour, whole cluster"),
     (&["taskdefs", "td"], "task definition families"),
     (&["logs", "lg"], "log groups; :logs <group> [filter pattern] opens events"),
-    (&["lb", "alb", "elb", "ing"], "load balancers"),
+    (&["lb", "loadbalancers", "alb", "elb", "ing"], "load balancers"),
     (&["tg", "targetgroups"], "all target groups"),
     (&["scaling", "as", "hpa"], "scalable targets [namespace, default ecs]"),
     (&["policies", "pol"], "scaling policies [namespace]"),
@@ -63,8 +63,8 @@ pub const COMMANDS: &[(&[&str], &str)] = &[
 ];
 
 pub const QUICK: &[(char, &str)] = &[
-    ('1', "clusters"), ('2', "svc"), ('3', "tasks"), ('4', "logs"), ('5', "lb"),
-    ('6', "tg"), ('7', "scaling"), ('8', "ecr"), ('9', "sqs"), ('0', "rds"),
+    ('1', "clusters"), ('2', "svc"), ('3', "tasks"), ('4', "logs"), ('5', "loadbalancers"),
+    ('6', "targetgroups"), ('7', "scaling"), ('8', "ecr"), ('9', "sqs"), ('0', "rds"),
 ];
 
 pub const KEYS: &[(&str, &str)] = &[

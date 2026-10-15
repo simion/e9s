@@ -273,7 +273,11 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{} ", busy_slot(top.loading || top.tail.is_some())), Style::new().fg(ORANGE).bold()),
             val(refresh),
         ]),
-        Line::from(vec![key("Rev:"), val(format!("v{}", env!("CARGO_PKG_VERSION")))]),
+        // k9s shows a newer release next to the running one.
+        Line::from(match crate::upgrade::NEWER.get() {
+            Some(v) => vec![key("Rev:"), val(format!("v{} ", env!("CARGO_PKG_VERSION"))), Span::styled(format!("⚡v{v}"), Style::new().fg(AQUA).bold())],
+            None => vec![key("Rev:"), val(format!("v{}", env!("CARGO_PKG_VERSION")))],
+        }),
     ];
     let info_w = info.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 4;
     let logo_w = if app.chrome.logoless { 0 } else { LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 1 };

@@ -6,6 +6,7 @@ mod learn;
 mod logic;
 mod sdk;
 mod ui;
+mod upgrade;
 mod views;
 
 use app::{App, Msg};
@@ -96,6 +97,7 @@ fn main() -> std::io::Result<()> {
     if let Some(s) = script {
         return run_script(&mut app, &rx, &s);
     }
+    upgrade::spawn_check();
     let mut terminal = ratatui::init();
     let res = (|| -> std::io::Result<()> {
         while !app.quit {
@@ -126,6 +128,9 @@ fn main() -> std::io::Result<()> {
     })();
     app.shutdown();
     ratatui::restore();
+    if let (Some(v), Some(cmd)) = (upgrade::NEWER.get(), upgrade::command()) {
+        println!("e9s {v} is out (this is {}). Upgrade with:\n  {cmd}", env!("CARGO_PKG_VERSION"));
+    }
     res
 }
 

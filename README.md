@@ -56,6 +56,13 @@ The installed command is a small launcher that runs this checkout's source.
 When any file under `src/`, `Cargo.toml` or `Cargo.lock` is newer than the built binary, it rebuilds first (seconds; the first build compiles the AWS SDK and takes a few minutes); otherwise it starts straight away.
 So editing the source and running `e9s` again is all a change needs.
 
+## Upgrade
+
+At startup e9s asks GitHub for the latest release, as k9s does, in the background.
+When there is a newer one, the header shows it next to `Rev:`, and quitting prints the command that upgrades your install: `brew upgrade e9s`, `cargo install e9s`, or the shell installer again.
+e9s never installs anything itself.
+`E9S_NO_UPGRADE_CHECK=1` turns the check off; builds from a checkout skip it.
+
 ## Run
 
 ```sh

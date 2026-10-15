@@ -175,6 +175,8 @@ pub enum MetricTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub enum View {
     Profiles,
+    /// k9s ctrl-a: every command and its aliases.
+    Aliases,
     Regions,
     Clusters,
     Services { cluster: String },
@@ -220,6 +222,7 @@ impl View {
     pub fn title(&self) -> String {
         match self {
             View::Profiles => "profiles".into(),
+            View::Aliases => "aliases".into(),
             View::Regions => "regions".into(),
             View::Clusters => "clusters".into(),
             View::Services { cluster } => format!("services({cluster})"),
@@ -272,7 +275,7 @@ impl View {
     }
 
     pub fn auto_refresh(&self) -> bool {
-        !matches!(self, View::Logs { .. } | View::Detail { .. } | View::Profiles | View::Regions)
+        !matches!(self, View::Logs { .. } | View::Detail { .. } | View::Profiles | View::Regions | View::Aliases)
     }
 
     /// Where Enter goes.
@@ -337,6 +340,14 @@ impl View {
 
     pub fn fetch(&self, aws: &Aws) -> Result<Table, AwsError> {
         match self {
+            View::Aliases => {
+                let mut t = Table::new(&["COMMAND", "ALIASES", "VIEW"]);
+                t.info("Enter opens the view (k9s ctrl-a) · / filters");
+                for (names, what) in crate::app::COMMANDS {
+                    t.row(names[0], Health::None, Value::Null, vec![names[0].to_string(), names[1..].join(" "), what.to_string()]);
+                }
+                Ok(t)
+            }
             View::Profiles => {
                 let mut t = Table::new(&["PROFILE", "ACCOUNT", "ROLE", "REGION", "SSO SESSION"]);
                 t.info("a profile names an account and a role to sign in as (Kubernetes: a kubeconfig context) · Enter picks one");
@@ -1279,7 +1290,7 @@ fn logs(aws: &Aws, src: &LogSrc, pattern: &str, opts: LogOpts) -> Result<Table, 
                 fetch(0, LOG_MAX_ITEMS)?
             };
             let evs = arr(&v, "/events");
-            t.info(format!("{} · {} · head: the first {} lines ({}) · not following (f follows from the newest line shown) · {keys}", sel.group, streams_note(&sel), evs.len(), between(evs)));
+            t.info(format!("{} · {} · head: the first {} lines ({}) · not following (s follows from the newest line shown) · {keys}", sel.group, streams_note(&sel), evs.len(), between(evs)));
             t.empty = Some(format!("no log events{matching}"));
             v
         }
@@ -1293,7 +1304,7 @@ fn logs(aws: &Aws, src: &LogSrc, pattern: &str, opts: LogOpts) -> Result<Table, 
                     evs.len(), between(evs),
                 ));
             } else {
-                t.info(format!("{} · {} · last {span}: {} events · following new lines (f pauses) · {keys}", sel.group, streams_note(&sel), evs.len()));
+                t.info(format!("{} · {} · last {span}: {} events · following new lines (s pauses) · {keys}", sel.group, streams_note(&sel), evs.len()));
             }
             t.empty = Some(format!("no log events{matching} in the last {span}"));
             v
@@ -1305,7 +1316,7 @@ fn logs(aws: &Aws, src: &LogSrc, pattern: &str, opts: LogOpts) -> Result<Table, 
             let v = aws.call("logs", "get-log-events", &args![
                 "--log-group-name", sel.group, "--log-stream-name", sel.streams[0], "--no-start-from-head", "--limit", LOG_MAX_ITEMS,
             ])?;
-            t.info(format!("{} · newest {} lines of this stream · following new lines (f pauses) · {keys}", sel.group, arr(&v, "/events").len()));
+            t.info(format!("{} · newest {} lines of this stream · following new lines (s pauses) · {keys}", sel.group, arr(&v, "/events").len()));
             t.empty = Some("this stream has no log events".into());
             v
         }
@@ -1319,7 +1330,7 @@ fn logs(aws: &Aws, src: &LogSrc, pattern: &str, opts: LogOpts) -> Result<Table, 
                 let v = fetch(now - w * 1000, LOG_MAX_ITEMS)?;
                 let evs = arr(&v, "/events");
                 t.info(format!(
-                    "{} · {} · busy: about {per_sec:.0} lines/s, started from the most recent {} ({}) · following new lines (f pauses) · {keys}",
+                    "{} · {} · busy: about {per_sec:.0} lines/s, started from the most recent {} ({}) · following new lines (s pauses) · {keys}",
                     sel.group, streams_note(&sel), evs.len(), between(evs),
                 ));
                 (v, w)
@@ -1330,7 +1341,7 @@ fn logs(aws: &Aws, src: &LogSrc, pattern: &str, opts: LogOpts) -> Result<Table, 
                 } else {
                     (probe, 60)
                 };
-                t.info(format!("{} · {} · last {}: {} events · following new lines (f pauses) · {keys}", sel.group, streams_note(&sel), fmt_dur(w), arr(&v, "/events").len()));
+                t.info(format!("{} · {} · last {}: {} events · following new lines (s pauses) · {keys}", sel.group, streams_note(&sel), fmt_dur(w), arr(&v, "/events").len()));
                 (v, w)
             };
             t.empty = Some(format!("no log events{matching} in the last {}", fmt_dur(span)));

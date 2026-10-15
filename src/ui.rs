@@ -45,11 +45,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let note_h = notes.len().min(12) as u16;
     let prompt_h = if matches!(app.mode, Mode::Command(_) | Mode::Filter(_) | Mode::Pattern(_)) { 3 } else { 0 };
     let [head, prompt_area, note_area, body, foot] = Layout::vertical([
-        Constraint::Length(if app.chrome.headless { 0 } else { HEADER_H }),
+        Constraint::Length(if app.chrome.headless || app.top().full { 0 } else { HEADER_H }),
         Constraint::Length(prompt_h),
         Constraint::Length(note_h),
         Constraint::Min(3),
-        Constraint::Length(if app.chrome.crumbsless && app.flash.is_none() && !app.top().loading { 0 } else { 1 }),
+        Constraint::Length(if (app.chrome.crumbsless || app.top().full) && app.flash.is_none() && !app.top().loading { 0 } else { 1 }),
     ])
     .areas(f.area());
     if head.height > 0 {
@@ -79,6 +79,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         table_body(f, app, body)
     }
     footer(f, app, foot);
+    suggestions(f, app, prompt_area);
     if let Mode::Help(off) = app.mode {
         let max = help(f, &app.top().view, off);
         if off > max {
@@ -142,7 +143,7 @@ const LOGO: [&str; 6] = [
 /// The keys that do something in this view, k9s-style.
 fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
     let mut v: Vec<(&str, &str)> = match view {
-        View::Profiles | View::Regions => vec![("<enter>", "Select")],
+        View::Profiles | View::Regions | View::Aliases => vec![("<enter>", "Select")],
         View::Clusters => vec![("<enter>", "Services")],
         View::Services { .. } => vec![("<enter>", "Tasks"), ("<R>", "Rollout"), ("<e>", "Events"), ("<F>", "Failures"), ("<l>", "Logs"), ("<m>", "Metrics")],
         View::Failures { .. } => vec![("<enter>", "Containers/Events"), ("<l>", "Logs")],
@@ -151,24 +152,24 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
         View::Containers { .. } => vec![("<l>", "Logs")],
         View::Events { .. } => vec![("<R>", "Rollout"), ("<l>", "Logs"), ("<m>", "Metrics")],
         View::Logs { .. } => vec![
-            ("<0>", "Tail"), ("<1>", "Head"), ("<2-6>", "1m-1h"), ("<f>", "Pause/follow"), ("</>", "Filter"), ("<p>", "Pattern"),
-            ("<a>", "All containers"), ("<m>", "Mark"), ("<C>", "Clear"), ("<c>", "Copy"), ("<w>", "Wrap"), ("<t>", "Time"), ("<s>", "Save"),
+            ("<0>", "Tail"), ("<1>", "Head"), ("<2-6>", "1m-1h"), ("<s>", "Autoscroll"), ("<f>", "Fullscreen"), ("</>", "Filter"), ("<p>", "Pattern"),
+            ("<a>", "All containers"), ("<m>", "Mark"), ("<C>", "Clear"), ("<c>", "Copy"), ("<w>", "Wrap"), ("<t>", "Time"), ("<ctrl-s>", "Save"),
         ],
-        View::Detail { .. } => vec![("<w>", "Wrap"), ("<s>", "Save")],
+        View::Detail { .. } => vec![("</>", "Search"), ("<n N>", "Next/Prev"), ("<w>", "Wrap"), ("<ctrl-s>", "Save")],
         View::TaskDefFamilies => vec![("<enter>", "Revisions")],
         View::TaskDefRevisions { .. } => vec![("<enter>", "Containers")],
-        View::LogGroups => vec![("<enter>", "Streams"), ("<l>", "Logs"), ("<f>", "Tail")],
-        View::LogStreams { .. } => vec![("<enter>", "Logs"), ("<f>", "Tail")],
+        View::LogGroups => vec![("<enter>", "Streams"), ("<l>", "Logs")],
+        View::LogStreams { .. } => vec![("<enter>", "Logs")],
         View::LoadBalancers => vec![("<enter>", "Target groups"), ("<m>", "Metrics")],
         View::TargetGroups { .. } => vec![("<enter>", "Targets"), ("<m>", "Metrics")],
         View::Targets { .. } => vec![("<m>", "Metrics")],
         View::ScalableTargets { .. } => vec![("<enter>", "Activities"), ("<p>", "Policies")],
         View::EcrRepos => vec![("<enter>", "Images")],
-        View::Lambda => vec![("<l>", "Logs"), ("<f>", "Tail")],
+        View::Lambda => vec![("<l>", "Logs")],
         _ => vec![],
     };
     if !matches!(view, View::Detail { .. }) {
-        v.extend([("<d>", "Describe"), ("<y>", "JSON")]);
+        v.extend([("<d>", "Describe"), ("<y>", "YAML")]);
     }
     v.extend([("<r>", "Refresh"), ("<esc>", "Back"), ("<?>", "Help")]);
     v
@@ -515,7 +516,8 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
         if matches!(src, crate::views::LogSrc::Service { .. }) {
             spans.extend(toggle("AllContainers", opts.all, "a"));
         }
-        spans.extend(toggle("Autoscroll", frame.tail.is_some(), "f"));
+        spans.extend(toggle("Autoscroll", frame.tail.is_some(), "s"));
+        spans.extend(toggle("FullScreen", frame.full, "f"));
         spans.extend(toggle("Wrap", frame.wrap, "w"));
         spans.extend(toggle("Timestamps", frame.show_time, "t"));
         f.render_widget(Paragraph::new(Line::from(spans)).centered(), Rect { height: 1, ..inner });
@@ -533,8 +535,21 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
         fn push(out: &mut Vec<(char, Style)>, t: &str, st: Style) {
             out.extend(t.chars().map(|ch| (ch, st)));
         }
+        // Paint the filter's matches in `text`, which starts at `at` in `out`.
+        let mark = |out: &mut Vec<(char, Style)>, at: usize, text: &str| {
+            let Some(re) = &hl else { return };
+            let starts: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
+            for m in re.find_iter(text) {
+                for (k, &b) in starts.iter().enumerate() {
+                    if b >= m.start() && b < m.end() {
+                        out[at + k].1 = Style::new().fg(Color::Black).bg(ORANGE);
+                    }
+                }
+            }
+        };
         if !is_logs {
             push(&mut out, &c[0], Style::new());
+            mark(&mut out, 0, &c[0]);
             return out;
         }
         if frame.table.rows[i].json.as_str() == Some(crate::app::MARK) {
@@ -550,16 +565,7 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
         }
         let msg_at = out.len();
         push(&mut out, &c[2], base);
-        if let Some(re) = &hl {
-            let starts: Vec<usize> = c[2].char_indices().map(|(b, _)| b).collect();
-            for m in re.find_iter(&c[2]) {
-                for (k, &b) in starts.iter().enumerate() {
-                    if b >= m.start() && b < m.end() {
-                        out[msg_at + k].1 = Style::new().fg(Color::Black).bg(ORANGE);
-                    }
-                }
-            }
-        }
+        mark(&mut out, msg_at, &c[2]);
         if selected {
             for x in out.iter_mut().filter(|x| x.1.bg != Some(ORANGE)) {
                 x.1 = x.1.bg(Color::Indexed(238));
@@ -662,6 +668,36 @@ fn prompt(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(hint, Style::new().fg(GRAY)),
     ]);
     f.render_widget(Paragraph::new(line).block(Block::new().borders(Borders::ALL).border_style(Style::new().fg(AQUA))), area);
+}
+
+/// Command mode: the suggestions for what was typed, under the prompt, Up/Down's pick highlighted (k9s).
+fn suggestions(f: &mut Frame, app: &App, prompt: Rect) {
+    let Mode::Command(s) = &app.mode else { return };
+    let (prefix, pick) = app.pick.clone().map_or((s.clone(), None), |(p, i)| (p, Some(i)));
+    if prefix.trim().is_empty() || prompt.height == 0 {
+        return;
+    }
+    let list = completions(&prefix);
+    let room = f.area().height.saturating_sub(prompt.y + prompt.height + 2) as usize;
+    let start = pick.map_or(0, |i| (i + 1).saturating_sub(room.min(8)));
+    let shown: Vec<Line> = list
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(room.min(8))
+        .map(|(i, a)| {
+            let what = COMMANDS.iter().find(|(x, _)| x.contains(a)).map(|(_, d)| *d).unwrap_or("");
+            let st = if Some(i) == pick { Style::new().fg(Color::Black).bg(AQUA) } else { Style::new().fg(Color::White) };
+            Line::from(vec![Span::styled(format!(" {a:<14}"), st), Span::styled(format!(" {what}"), Style::new().fg(GRAY))])
+        })
+        .collect();
+    if shown.is_empty() {
+        return;
+    }
+    let w = shown.iter().map(|l| l.width()).max().unwrap_or(0) as u16 + 2;
+    let r = Rect { x: prompt.x + 1, y: prompt.y + prompt.height, width: w.min(prompt.width.saturating_sub(1)), height: shown.len() as u16 + 2 };
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(shown).block(Block::new().borders(Borders::ALL).border_style(Style::new().fg(GRAY))), r);
 }
 
 /// One call of the command log: a spinner while it runs, then a tick or a cross, and its time.

@@ -4,6 +4,9 @@ use crate::views::View;
 
 pub fn about(view: &View) -> (&'static str, &'static [&'static str]) {
     match view {
+        View::Aliases => ("Aliases", &[
+            "Every command and its short names. Kubernetes: k9s ctrl-a, the resource aliases.",
+        ]),
         View::Profiles => ("Profiles", &[
             "A profile is a named way to get credentials, kept in ~/.aws/config. Kubernetes: a kubeconfig context.",
             "With AWS SSO a profile names an account and a role in it (for example ReadOnlyAccess); `aws sso login` refreshes it.",
@@ -74,7 +77,7 @@ pub fn about(view: &View) -> (&'static str, &'static [&'static str]) {
             "CloudWatch Logs stores container output. A log group is a destination (often one per service); a log stream is one",
             "source inside it. With the awslogs driver each container of each task writes its own stream: <prefix>/<container>/<task-id>.",
             "Kubernetes: kubectl logs <pod> -c <container>, except the logs outlive the task.",
-            "Logs follow new lines by default (f pauses). A service's logs merge every running task's stream by time, each line",
+            "Logs follow new lines by default (s pauses). A service's logs merge every running task's stream by time, each line",
             "tagged with its task id in its own colour. Kubernetes: kubectl logs -f deployment/<name>, or k9s logs on a deployment.",
             "/ filters and highlights lines on screen; p sets a CloudWatch filter pattern (server-side search, reloads).",
         ]),

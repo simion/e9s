@@ -58,6 +58,7 @@ Press `c` on any screen to copy the command that reopens it (or the nearest scre
 | `-c`, `--command CMD` | Open a view as if `:CMD` were typed inside: `-c rollout`, `-c tasks`, `-c 'logs <group> [pattern]'`, `-c sqs` |
 | `--refresh SECONDS` | Auto-refresh interval; `0` turns it off (default 10) |
 | `--headless` / `--logoless` / `--crumbsless` | Hide the header / the logo / the breadcrumbs |
+| `--readonly` | Accepted so k9s habits and aliases work; s9s is always read-only. `--write` is refused |
 | `-h`, `--help` | Usage |
 
 Startup follows k9s: choose where you are, then navigate.
@@ -72,19 +73,22 @@ If the SSO session has expired, the header says so and names the command (`aws s
 
 | Key | Action |
 |---|---|
-| `:` | Command mode. Tab completes; suggestions show as you type |
-| `/` | Filter rows live: regex, case-insensitive. `!re` inverts. Enter keeps it, Esc clears it. In logs, matches are highlighted and the view stays at the newest line |
+| `:` | Command mode. Suggestions list under the prompt as you type; `↑` `↓` pick one, Tab completes |
+| `ctrl-a` | Every command and its aliases; Enter opens one |
+| `/` | Filter rows live: regex, case-insensitive. `!re` inverts, `-f abc` is fuzzy (the letters in order). Enter keeps it, Esc clears it. In logs, matches are highlighted and the view stays at the newest line. In describe and YAML it searches instead: every line stays, matches are highlighted, `n` `N` jump to the next / previous |
 | `Esc` | Clear the filter, else go back one level |
 | `q` | Back one level; quits at the root |
 | `ctrl-c` | Quit |
 | `Enter` | Drill into the selected row |
 | `j` `k` / `↑` `↓` | Move |
 | `g` `G` / `Home` `End` | Top / bottom |
-| `ctrl-d` `ctrl-u` / `PgDn` `PgUp` (also `ctrl-f` `ctrl-b`) | Page down / up |
+| `ctrl-f` `ctrl-b` / `PgDn` `PgUp` (also `ctrl-u`) | Page down / up |
+| `ctrl-d` `ctrl-k` | Delete and kill in k9s; here they only say s9s is read-only |
 | `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; anything else shows as YAML, and a structured log line is parsed first |
-| `y` | Raw JSON of the selection |
+| `y` | YAML of the selection, as AWS returned it |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
-| `f` | Logs follow new lines by default; in a log view `f` pauses and resumes. On a resource it opens its logs, like `l` |
+| `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says s9s is read-only |
+| `f` | Logs: fullscreen, hiding the header and breadcrumbs |
 | `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected |
 | `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
 | `w` | Wrap long lines in logs and describe on or off (on by default) |
@@ -92,7 +96,7 @@ If the SSO session has expired, the header says so and names the command (`aws s
 | `0` `1` `2`-`6` | Logs, as in k9s: start from the newest lines (tail, the default), from the first lines (head, not followed), or 1m, 5m, 15m, 30m, 1h back. A window reads up to 5000 lines per 100 streams and says when it was cut |
 | `a` | Service logs: every container of each task that logs to the same group, tagged `container/task` |
 | `m` / `C` / `c` | Logs: draw a mark line across the view / clear the screen (following continues) / copy the lines shown (after the filter) |
-| `s` / `ctrl-s` | Save the current view (after filter and sort) to `~/Downloads`. Logs save as a `.log` with full timestamps and task ids, including every line tailed so far (the view keeps the last 50,000) |
+| `ctrl-s` | Save the current view (after filter and sort) to `~/Downloads`. Logs save as a `.log` with full timestamps and task ids, including every line tailed so far (the view keeps the last 50,000) |
 | `R` | Rollout watch for the selected service (see below) |
 | `e` | Events of the selected service, newest first, untruncated |
 | `m` | CloudWatch metrics for the selected service, load balancer or target group |
@@ -186,7 +190,7 @@ The service's stream prefix alone would also match every stream it ever had (10,
 It opens on the newest lines: one stream reads its tail directly; several streams take one call to measure the rate, then fetch the last few seconds' worth (about 1000 lines).
 Then it follows: every 2 s it reads what arrived since the newest line shown, re-reading 5 s back for lines CloudWatch ingests late and dropping ones already shown.
 If more lines arrive between two reads than one read returns (10,000 per batch), it says so and jumps to now.
-`f` pauses and resumes.
+`s` pauses and resumes.
 This polls `filter-log-events` instead of using StartLiveTail, because the CLI's live tail prints messages without the stream they came from, and Live Tail is billed per minute.
 
 ## Development

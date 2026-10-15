@@ -32,6 +32,7 @@ HOW
       --headless         hide the header
       --logoless         hide the logo
       --crumbsless       hide the breadcrumbs
+      --readonly         accepted for k9s habits; s9s is always read-only
   -h, --help             this help
 
 Press c inside to copy the command that reopens the view you are on, and ? for every key.";
@@ -62,6 +63,9 @@ fn main() -> std::io::Result<()> {
             "--logoless" => chrome.logoless = true,
             "--crumbsless" => chrome.crumbsless = true,
             "--script" => script = Some(value("--script")),
+            // k9s flag; s9s is always read-only, so it changes nothing.
+            "--readonly" => {}
+            "--write" => fail("s9s is read-only and has no --write mode"),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -115,7 +119,7 @@ fn main() -> std::io::Result<()> {
 
 /// Headless run for checks without a tty: drives the real App and renderer on an in-memory screen.
 /// Tokens: `@wait` (until the view loads), `@sleep` (2s), `@snap` (print the screen),
-/// `<Enter>` `<Esc>` `<Tab>` `<Space>` `<C-x>`, anything else is typed as keys.
+/// `<Enter>` `<Esc>` `<Up>` `<Down>` `<Tab>` `<Space>` `<C-x>`, anything else is typed as keys.
 fn run_script(app: &mut App, rx: &mpsc::Receiver<Msg>, script: &str) -> std::io::Result<()> {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -163,6 +167,8 @@ fn run_script(app: &mut App, rx: &mpsc::Receiver<Msg>, script: &str) -> std::io:
             }
             "<Enter>" => app.on_key(key(KeyCode::Enter, KeyModifiers::NONE)),
             "<Esc>" => app.on_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            "<Up>" => app.on_key(key(KeyCode::Up, KeyModifiers::NONE)),
+            "<Down>" => app.on_key(key(KeyCode::Down, KeyModifiers::NONE)),
             "<Space>" => app.on_key(key(KeyCode::Char(' '), KeyModifiers::NONE)),
             "<Tab>" => app.on_key(key(KeyCode::Tab, KeyModifiers::NONE)),
             t if t.starts_with("<C-") && t.len() == 5 => app.on_key(key(KeyCode::Char(t.as_bytes()[3] as char), KeyModifiers::CONTROL)),

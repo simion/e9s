@@ -7,7 +7,7 @@ The README is the user guide; this file is for whoever changes the code.
 
 ```sh
 make run ARGS="-p <profile>"  # build and launch
-make test                     # 16 tests, no AWS access needed
+make test                     # 17 tests, no AWS access needed
 make install                  # ./install.sh: a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes
 s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```
@@ -64,6 +64,17 @@ macOS has no `timeout`; run long checks in the background and kill them.
 - **Region scan.** It counts ECS clusters, services and tasks per region; EC2, Lambda and RDS are not counted.
 - **Copy in `H`.** Copying the full, runnable command of a selected call is not built.
 - **Publishing.** No remote yet; CI (`.github/workflows/ci.yml`) runs once it is on GitHub. Real screenshots for the README should come from an account with nothing sensitive in it.
+
+## Ideas from taws (huseyinbabal/taws, MIT), not built yet
+
+taws covers about 61 resource types, shallowly, and writes by default; its ideas were weighed against k9s habits on 2026-10-15.
+- `0`-`9` as recent regions or clusters, like k9s favourite namespaces (conflicts with today's fixed quick views).
+- `/-l key=value` tag filter: EC2 `--filters Name=tag:...`, client-side elsewhere.
+- Shell completion for `-p` and `-r` (`s9s completion zsh`).
+- On expired SSO, a key that suspends the screen and runs only `aws sso login --profile X`.
+- Release binaries, a Homebrew tap and a Docker image.
+- Data-defined list screens for shallow resources (S3, DynamoDB, IAM), still through `Aws::call`.
+Not to copy: write actions, decoding secrets, shells, Enter as describe, `R` refresh, `[` `]` paging, its own credential chain.
 
 ## Writing
 

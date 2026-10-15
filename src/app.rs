@@ -140,19 +140,21 @@ pub const QUICK: &[(char, &str)] = &[
 ];
 
 pub const KEYS: &[(&str, &str)] = &[
-    (":", "command mode (Tab completes)"),
-    ("/", "filter rows live: regex, case-insensitive, !re inverts"),
+    (":", "command mode (Tab completes, Up/Down pick a suggestion)"),
+    ("ctrl-a", "every command and its aliases"),
+    ("/", "filter rows live: regex, case-insensitive, !re inverts, -f fuzzy; in describe it searches (n N next/prev)"),
     ("Esc", "clear filter, else back one level"),
     ("q", "back one level; quits at the root"),
     ("ctrl-c", "quit"),
     ("Enter", "drill into the selected row"),
     ("j k / ↑ ↓", "move"),
     ("g G", "top / bottom"),
-    ("ctrl-d ctrl-u", "page down / up (also PgDn PgUp)"),
+    ("ctrl-f ctrl-b", "page down / up (also PgDn PgUp, ctrl-u)"),
     ("d", "describe: full detail of the selection"),
-    ("y", "raw JSON of the selection"),
+    ("y", "YAML of the selection, as AWS returned it"),
     ("l", "logs for the selection"),
-    ("f", "logs follow new lines by default; f pauses and resumes"),
+    ("s", "logs: autoscroll (follow new lines) on / off; on by default"),
+    ("f", "logs: fullscreen"),
     ("t", "logs: show or hide timestamps"),
     ("0-6", "logs: start from the tail, the head, or 1m 5m 15m 30m 1h back (elsewhere 0-9 are quick views)"),
     ("a", "service logs: all containers of each task, not just the main one"),
@@ -160,7 +162,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("F", "failures of the last hour: failed tasks and problem events (service, or whole cluster)"),
     ("p", "logs: filter pattern · scaling: policies"),
     ("w", "wrap lines (logs, describe)"),
-    ("s ctrl-s", "save the current view to ~/Downloads (logs: every line so far, as .log)"),
+    ("ctrl-s", "save the current view to ~/Downloads (logs: every line so far, as .log)"),
     ("R", "rollout watch of the selected service"),
     ("e", "events of the selected service"),
     ("m", "metrics (services, load balancers, target groups)"),
@@ -199,6 +201,8 @@ pub struct Frame {
     pub wrap: bool,
     /// Logs: show each line's time (k9s `t`).
     pub show_time: bool,
+    /// Logs: k9s fullscreen (`f`), header and breadcrumbs hidden.
+    pub full: bool,
     /// Set while live tail polls; clearing it stops the poller.
     pub tail: Option<Arc<AtomicBool>>,
 }
@@ -207,14 +211,15 @@ impl Frame {
     fn new(view: View) -> Self {
         Frame {
             id: NEXT_SCREEN.fetch_add(1, Ordering::Relaxed), view, table: Table::default(), sel: 0, offset: 0, filter: String::new(), sort: None, loading: false, load_started: Instant::now(),
-            loaded: false, error: None, seq: 0, wrap: true, show_time: true, tail: None,
+            loaded: false, error: None, seq: 0, wrap: true, show_time: true, full: false, tail: None,
         }
     }
 
     /// Row indexes after filter and sort, in display order.
     pub fn visible(&self) -> Vec<usize> {
         let rows = &self.table.rows;
-        let re = filter_re(&self.filter);
+        // Describe keeps every line and highlights matches (k9s details search); the rest filter.
+        let re = filter_re(&self.filter).filter(|_| !matches!(self.view, View::Detail { .. }));
         let mut idx: Vec<usize> = (0..rows.len())
             .filter(|&i| re.as_ref().is_none_or(|(r, inv)| r.is_match(&rows[i].cells.join(" ")) != *inv))
             .collect();
@@ -232,6 +237,20 @@ impl Frame {
         self.visible().get(self.sel).map(|&i| &self.table.rows[i])
     }
 
+    /// Describe search: put the next (or previous) line matching the filter at the top. False if none.
+    fn jump_match(&mut self, from: usize, forward: bool) -> bool {
+        let Some((re, _)) = filter_re(&self.filter) else { return false };
+        let n = self.table.rows.len();
+        let hit = (0..n)
+            .map(|k| if forward { (from + k) % n } else { (from + n - k) % n })
+            .find(|&i| re.is_match(&self.table.rows[i].cells.join(" ")));
+        if let Some(i) = hit {
+            self.sel = i;
+            self.offset = i;
+        }
+        hit.is_some()
+    }
+
     fn stop_tail(&mut self) {
         if let Some(run) = self.tail.take() {
             run.store(false, Ordering::Relaxed);
@@ -244,6 +263,11 @@ pub fn filter_re(f: &str) -> Option<(Regex, bool)> {
         return None;
     }
     let (inv, pat) = f.strip_prefix('!').map_or((false, f), |p| (true, p));
+    // k9s `-f`: fuzzy, the letters in order with anything between.
+    if let Some(fz) = pat.strip_prefix("-f ").map(str::trim).filter(|p| !p.is_empty()) {
+        let re = fz.chars().map(|c| regex::escape(&c.to_string())).collect::<Vec<_>>().join(".*?");
+        return Regex::new(&format!("(?i){re}")).ok().map(|r| (r, inv));
+    }
     Regex::new(&format!("(?i){pat}"))
         .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(pat))))
         .ok()
@@ -268,6 +292,8 @@ pub fn canonical(word: &str) -> Option<&'static str> {
 pub struct App {
     /// Which parts of the screen to hide (--headless, --logoless, --crumbsless).
     pub chrome: crate::ui::Chrome,
+    /// Command mode: the typed prefix and which suggestion Up/Down picked.
+    pub pick: Option<(String, usize)>,
     pub aws: Arc<Aws>,
     pub arn: Option<String>,
     pub account: Option<String>,
@@ -300,7 +326,7 @@ impl App {
         let home = region.clone().unwrap_or_else(|| default_region(&profile));
         let mut app = App {
             chrome: Default::default(), aws: Arc::new(Aws::new(Ctx { profile, region: home })), arn: None, account: None, ident_err: None, sso_expired: false,
-            stack: vec![], mode: Mode::Normal, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
+            stack: vec![], mode: Mode::Normal, pick: None, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
             quit: false, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
         };
         if pick_profile {
@@ -570,15 +596,41 @@ impl App {
             Mode::Calls(off) => self.mode = self.scroll(k, off).map_or(Mode::Normal, Mode::Calls),
             Mode::Scale(form) => self.scale_key(form, k),
             Mode::Normal => self.normal_key(k),
-            Mode::Command(s) => self.mode = self.edit(s, k, Mode::Command, |app, s| app.exec(&s)),
+            Mode::Command(s) if matches!(k.code, KeyCode::Up | KeyCode::Down) => {
+                // k9s: Up/Down walk the suggestions for what was typed.
+                let (prefix, i) = self.pick.take().unwrap_or((s.clone(), usize::MAX));
+                let list = completions(&prefix);
+                if list.is_empty() {
+                    self.mode = Mode::Command(s);
+                    return;
+                }
+                let i = match (k.code, i) {
+                    (KeyCode::Down, usize::MAX) => 0,
+                    (KeyCode::Up, usize::MAX) => list.len() - 1,
+                    (KeyCode::Down, i) => (i + 1) % list.len(),
+                    (_, i) => (i + list.len() - 1) % list.len(),
+                };
+                self.mode = Mode::Command(list[i].to_string());
+                self.pick = Some((prefix, i));
+            }
+            Mode::Command(s) => {
+                self.pick = None;
+                self.mode = self.edit(s, k, Mode::Command, |app, s| app.exec(&s))
+            }
             Mode::Filter(s) => {
                 self.mode = self.edit(s, k, Mode::Filter, |app, s| app.top_mut().filter = s);
                 if let Mode::Filter(s) = &self.mode {
                     let s = s.clone();
                     let f = self.top_mut();
                     f.filter = s;
-                    // Logs stay at the newest line, the way a followed log reads.
-                    f.sel = if matches!(f.view, View::Logs { .. }) { f.visible().len().saturating_sub(1) } else { 0 };
+                    // Logs stay at the newest line, the way a followed log reads; describe jumps to the first match.
+                    match f.view {
+                        View::Logs { .. } => f.sel = f.visible().len().saturating_sub(1),
+                        View::Detail { .. } => {
+                            f.jump_match(0, true);
+                        }
+                        _ => f.sel = 0,
+                    }
                 } else if k.code == KeyCode::Esc {
                     self.top_mut().filter.clear();
                 }
@@ -643,7 +695,8 @@ impl App {
             KeyCode::Char('q') => {
                 if self.stack.len() > 1 { self.pop() } else { self.quit = true }
             }
-            KeyCode::Char('d') if ctrl => self.move_sel(page),
+            KeyCode::Char('d') | KeyCode::Char('k') if ctrl => self.flash("s9s is read-only: nothing to delete or kill", true),
+            KeyCode::Char('a') if ctrl => self.push(View::Aliases),
             KeyCode::Char('u') if ctrl => self.move_sel(-page),
             KeyCode::Char('f') if ctrl => self.move_sel(page),
             KeyCode::Char('b') if ctrl => self.move_sel(-page),
@@ -661,11 +714,21 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.move_sel(isize::MAX / 2),
             KeyCode::Enter => self.enter(),
             KeyCode::Char('d') => self.describe(false),
+            KeyCode::Char('n') | KeyCode::Char('N') if matches!(self.top().view, View::Detail { .. }) && !self.top().filter.is_empty() => {
+                let fwd = k.code == KeyCode::Char('n');
+                let f = self.top_mut();
+                let from = if fwd { f.sel + 1 } else { f.sel + f.table.rows.len().max(1) - 1 };
+                if !f.jump_match(from, fwd) {
+                    self.flash("no match", true);
+                }
+            }
             KeyCode::Char('y') => self.describe(true),
             KeyCode::Char('l') => self.open_logs(),
-            KeyCode::Char('f') => {
-                if matches!(self.top().view, View::Logs { .. }) { self.toggle_tail() } else { self.open_logs() }
+            KeyCode::Char('f') if matches!(self.top().view, View::Logs { .. }) => {
+                let f = self.top_mut();
+                f.full = !f.full;
             }
+            KeyCode::Char('s') if !ctrl && matches!(self.top().view, View::Logs { .. }) => self.toggle_tail(),
             KeyCode::Char('c') => self.copy_launch_command(),
             KeyCode::Char('t') if matches!(self.top().view, View::Logs { .. }) => {
                 let f = self.top_mut();
@@ -676,7 +739,7 @@ impl App {
                 f.wrap = !f.wrap;
             }
             KeyCode::Char('s') if ctrl => self.save(),
-            KeyCode::Char('s') => self.save(),
+            KeyCode::Char('s') => self.flash("s9s is read-only: no shell (ctrl-s saves this view)", true),
             KeyCode::Char('e') => match self.service_of_view() {
                 Some((cluster, service)) => self.push(View::Events { cluster, service }),
                 None => self.flash("e works on a service", true),
@@ -951,6 +1014,10 @@ impl App {
                 self.set_region(&row.id);
                 return self.push(View::Clusters);
             }
+            View::Aliases => {
+                self.pop();
+                return self.exec(&row.id);
+            }
             View::Clusters => self.cluster = Some(row.id.clone()),
             View::Services { .. } => self.service = Some(row.id.clone()),
             _ => {}
@@ -975,13 +1042,13 @@ impl App {
             _ => row.json.clone(),
         };
         let lines = if raw {
-            serde_json::to_string_pretty(&doc).unwrap_or_default().lines().map(String::from).collect()
+            to_yaml(&doc)
         } else {
             crate::describe::describe(&f.view, row).unwrap_or_else(|| to_yaml(&doc))
         };
         // Name the page after what the row shows first (a name), not the ID buried in its ARN.
         let name = row.cells.first().filter(|c| !c.is_empty()).cloned().unwrap_or_else(|| short(&row.id).to_string());
-        self.push(View::Detail { title: format!("{}({name})", if raw { "json" } else { "describe" }), lines });
+        self.push(View::Detail { title: format!("{}({name})", if raw { "yaml" } else { "describe" }), lines });
     }
 
     fn open_logs(&mut self) {
@@ -1052,7 +1119,7 @@ impl App {
         let f = self.top_mut();
         if f.tail.is_some() {
             f.stop_tail();
-            self.flash("live tail stopped (f resumes)", false);
+            self.flash("live tail stopped (s resumes)", false);
             return;
         }
         let Some(sel) = f.table.tail.clone() else {
@@ -1246,4 +1313,29 @@ pub fn completions(input: &str) -> Vec<&'static str> {
     let mut out: Vec<&str> = COMMANDS.iter().flat_map(|(a, _)| a.iter().copied()).filter(|a| a.starts_with(w)).collect();
     out.sort_by_key(|a| (a.len() != w.len(), !COMMANDS.iter().any(|(x, _)| x[0] == *a)));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_filter_and_describe_search() {
+        let (re, inv) = filter_re("-f mtrn").unwrap();
+        assert!(!inv && re.is_match("my-task-runner") && !re.is_match("runner-task-my"));
+        assert!(filter_re("!-f api").unwrap().1);
+
+        let mut f = Frame::new(View::Detail { title: "t".into(), lines: vec![] });
+        f.table = Table::text(["a: 1", "b: x", "c: 2", "d: x"].map(String::from).to_vec());
+        f.filter = "x".into();
+        assert_eq!(f.visible().len(), 4, "describe keeps every line");
+        assert!(f.jump_match(0, true));
+        assert_eq!(f.sel, 1);
+        assert!(f.jump_match(2, true));
+        assert_eq!(f.sel, 3);
+        assert!(f.jump_match(0, false), "wraps backwards");
+        assert_eq!(f.sel, 3);
+        f.filter = "zzz".into();
+        assert!(!f.jump_match(0, true));
+    }
 }

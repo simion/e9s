@@ -913,13 +913,18 @@ pub fn event_health(m: &str) -> Health {
     }
 }
 
-/// For display: ARNs to their names and `(task <32 hex>)` to the 12-character id the task list shows.
+/// For display: ARNs to their names, `(task <32 hex>)` to the 12-character id the task list shows,
+/// and the leading `(service <name>)` dropped, since every view that shows events already names the service.
 /// Matching and counting always use the raw message.
 pub fn short_event(m: &str) -> String {
     use std::sync::OnceLock;
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"\(task ([0-9a-f]{12})[0-9a-f]{20}\)").unwrap());
-    re.replace_all(&short_arns(m), "$1").into_owned()
+    static RE: OnceLock<(regex::Regex, regex::Regex)> = OnceLock::new();
+    let (task, svc) = RE.get_or_init(|| {
+        (regex::Regex::new(r"\(task ([0-9a-f]{12})[0-9a-f]{20}\)").unwrap(), regex::Regex::new(r"^\(service [^,)]+(\) |, )").unwrap())
+    });
+    let m = short_arns(m);
+    let m = task.replace_all(&m, "$1");
+    svc.replace(&m,|c: &regex::Captures| if &c[1] == ", " { "(" } else { "" }).into_owned()
 }
 
 fn events(aws: &Aws, cluster: &str, service: &str) -> Result<Table, AwsError> {
@@ -1033,7 +1038,7 @@ fn containers(aws: &Aws, cluster: &str, task: &str) -> Result<Table, AwsError> {
     if !s(&x, "/stoppedReason").is_empty() {
         t.note(task_health(&x), format!("task stopped: {}: {}", s(&x, "/stopCode"), s(&x, "/stoppedReason")));
     }
-    t.info("l: this container's logs · f: live tail");
+    t.info("l: this container's logs, following new lines (s pauses)");
     for c in arr(&x, "/containers") {
         let last = s(c, "/lastStatus");
         let h = if c.get("exitCode").is_some_and(|e| !e.is_null()) && n(c, "/exitCode") != 0 || s(c, "/healthStatus") == "UNHEALTHY" {
@@ -1161,7 +1166,7 @@ fn log_groups(aws: &Aws) -> Result<Table, AwsError> {
     let v = aws.call("logs", "describe-log-groups", &[])?;
     let mut t = Table::new(&["NAME", "RETENTION", "STORED", "AGE"]);
     t.trunc(&v, "describe-log-groups");
-    t.info("a log group is where a service's logs go; RETENTION never means kept, and billed, forever");
+    t.info("a log group is where a service's logs go; RETENTION `never expires` means kept, and billed, forever");
     for g in arr(&v, "/logGroups") {
         let name = s(g, "/logGroupName");
         let ret = g.get("retentionInDays").map(|r| format!("{r}d")).unwrap_or_else(|| "never expires".into());
@@ -1773,7 +1778,7 @@ fn ec2(aws: &Aws) -> Result<Table, AwsError> {
 
 fn ecr_repos(aws: &Aws) -> Result<Table, AwsError> {
     let v = aws.call("ecr", "describe-repositories", &[])?;
-    let mut t = Table::new(&["NAME", "URI", "TAGS", "SCAN ON PUSH", "AGE"]);
+    let mut t = Table::new(&["NAME", "URI", "TAG MUTABILITY", "SCAN ON PUSH", "AGE"]);
     for r in arr(&v, "/repositories") {
         let name = s(r, "/repositoryName");
         t.row(name.clone(), Health::None, r.clone(), vec![
@@ -2044,6 +2049,16 @@ mod tests {
         assert_eq!(task_health(&elb), Health::Bad);
         assert_eq!(stop_kind(&crash, &sp), "crashed (non-zero exit)");
         assert_eq!(task_health(&crash), Health::Bad);
+    }
+
+    #[test]
+    fn events_drop_the_service_prefix() {
+        assert_eq!(short_event("(service api) has reached a steady state."), "has reached a steady state.");
+        assert_eq!(
+            short_event("(service api, taskSet ecs-svc/123) has begun draining connections on 4 tasks."),
+            "(taskSet ecs-svc/123) has begun draining connections on 4 tasks."
+        );
+        assert_eq!(short_event("(service api) has started 1 tasks: (task 0123456789abcdef0123456789abcdef)."), "has started 1 tasks: 0123456789ab.");
     }
 
     #[test]

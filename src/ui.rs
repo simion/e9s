@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let note_h = notes.len().min(12) as u16;
     let prompt_h = if matches!(app.mode, Mode::Command(_) | Mode::Filter(_) | Mode::Pattern(_)) { 3 } else { 0 };
     let [head, prompt_area, note_area, body, foot] = Layout::vertical([
-        Constraint::Length(if app.chrome.headless || app.top().full { 0 } else { HEADER_H }),
+        Constraint::Length(header_height(app, f.area())),
         Constraint::Length(prompt_h),
         Constraint::Length(note_h),
         Constraint::Min(3),
@@ -143,6 +143,18 @@ fn wrap(text: &str, w: usize) -> Vec<String> {
 }
 
 const HEADER_H: u16 = 7;
+/// Below this size the header shrinks to two lines: context, then this view's keys (no logo, no quick views).
+const FULL_HEADER_MIN: (u16, u16) = (120, 30);
+
+fn header_height(app: &App, screen: Rect) -> u16 {
+    if app.chrome.headless || app.top().full {
+        0
+    } else if screen.width < FULL_HEADER_MIN.0 || screen.height < FULL_HEADER_MIN.1 {
+        2
+    } else {
+        HEADER_H
+    }
+}
 
 const LOGO: [&str; 6] = [
     r"  ____   ___   ____  ",
@@ -221,8 +233,23 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             None => "manual".into(),
         }
     };
+    let profile = if ctx.profile.is_empty() { "(default chain)".to_string() } else { ctx.profile.clone() };
+    if area.height < HEADER_H {
+        let dot = || Span::styled(" · ", Style::new().fg(GRAY));
+        let context = Line::from(vec![
+            val(profile), dot(), val(ctx.region.clone()), dot(), val(app.account.clone().unwrap_or_else(|| "-".into())), dot(), who, dot(),
+            Span::styled(format!("{} ", busy_slot(top.loading || top.tail.is_some())), Style::new().fg(ORANGE).bold()),
+            val(refresh),
+        ]);
+        let keys: Vec<Span> = actions(&top.view)
+            .into_iter()
+            .flat_map(|(k, d)| [Span::styled(format!("{k} "), Style::new().fg(DODGER).bold()), Span::styled(format!("{d}  "), Style::new().fg(GRAY))])
+            .collect();
+        f.render_widget(Paragraph::new(vec![context, Line::from(keys)]), area);
+        return;
+    }
     let info = vec![
-        Line::from(vec![key("Profile:"), val(if ctx.profile.is_empty() { "(default chain)".into() } else { ctx.profile.clone() })]),
+        Line::from(vec![key("Profile:"), val(profile)]),
         Line::from(vec![key("Region:"), val(ctx.region.clone())]),
         Line::from(vec![key("Account:"), val(app.account.clone().unwrap_or_else(|| "-".into()))]),
         Line::from(vec![key("Role:"), who]),

@@ -64,7 +64,7 @@ Press `c` on any screen to copy the command that reopens it (or the nearest scre
 Startup follows k9s: choose where you are, then navigate.
 
 1. **Profile.** `--profile`, else `AWS_PROFILE`, else the only configured profile, else a picker over `~/.aws/config` and `~/.aws/credentials`. With no profiles at all it uses the default credential chain.
-2. **Identity.** The header shows the profile, region, account and role. A role whose name does not read as read-only is shown in yellow, as a reminder; s9s still only reads.
+2. **Identity.** The header shows the profile, region, account and role. Below 120 columns or 30 rows it shrinks to two lines: that context on one, this screen's keys on the next (no logo or quick-view map; `?` lists them). A role whose name does not read as read-only is shown in yellow, as a reminder; s9s still only reads.
 3. **Region.** Without `--region` it scans every enabled region in parallel and lists ECS clusters, services and running tasks per region, regions with resources first. Enter opens one.
 
 If the SSO session has expired, the header says so and names the command (`aws sso login --profile <name>`); log in and press `r`.

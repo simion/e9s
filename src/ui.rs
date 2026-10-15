@@ -839,7 +839,7 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
     }
     let idle = app.flash.is_none() && !(app.top().loading && !app.top().table.rows.is_empty());
     if idle {
-        spans.push(Span::styled(" <?> explains this screen in AWS and Kubernetes terms", Style::new().fg(GRAY)));
+        spans.push(Span::styled(" <?> help", Style::new().fg(GRAY)));
     }
     if let Some((m, bad, _)) = &app.flash {
         spans.push(Span::styled(format!("  {m}"), Style::new().fg(if *bad { Color::Indexed(202) } else { Color::Indexed(83) })));

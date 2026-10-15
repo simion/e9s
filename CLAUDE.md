@@ -6,9 +6,9 @@ The README is the user guide; this file is for whoever changes the code.
 ## Build and check
 
 ```sh
-cargo build --release
-cargo test                    # 16 tests, no AWS access needed
-./install.sh                  # a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes
+make run ARGS="-p <profile>"  # build and launch
+make test                     # 16 tests, no AWS access needed
+make install                  # ./install.sh: a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes
 s9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```
 
@@ -17,7 +17,7 @@ Tokens are separated by spaces: `:svc <Enter> @wait H @snap`, not `:svc<Enter>`.
 `@shot=<path>` writes the screen as HTML, which headless Chrome can turn into a PNG.
 This is how every UI change gets checked without a terminal.
 
-If cargo is not on PATH on macOS with Homebrew rustup: `export PATH=/opt/homebrew/opt/rustup/bin:$PATH`.
+The Makefile finds cargo even when it is not on PATH (rustup under Homebrew); plain `cargo` calls need `export PATH=/opt/homebrew/opt/rustup/bin:$PATH` there.
 macOS has no `timeout`; run long checks in the background and kill them.
 
 ## Layout

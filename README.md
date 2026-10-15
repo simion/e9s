@@ -22,6 +22,8 @@ cargo install --path .     # builds a `s9s` binary into ~/.cargo/bin
 Or, while working on the source:
 
 ```sh
+make run ARGS="-p prod"    # build and launch
+make install               # same as ./install.sh
 ./install.sh               # puts a `s9s` command in ~/.local/bin (BIN_DIR=/other/dir ./install.sh to choose)
 ./install.sh --uninstall   # removes it
 ```

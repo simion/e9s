@@ -21,6 +21,8 @@ const DODGER: Color = Color::Indexed(33);
 const FUCHSIA: Color = Color::Indexed(201);
 const SKY: Color = Color::Indexed(117);
 const GRAY: Color = Color::Indexed(245);
+// Text on coloured bars: true-colour black, as k9s writes it (config/color.go); ANSI black is often themed grey.
+const INK: Color = Color::Rgb(0, 0, 0);
 
 fn color(h: Health) -> Style {
     match h {
@@ -34,7 +36,7 @@ fn color(h: Health) -> Style {
 
 /// k9s cursor: the row's own colour as the bar, so a warning row still reads as one when selected.
 fn cursor(h: Health) -> Style {
-    Style::new().fg(Color::Black).bg(color(h).fg.unwrap_or(AQUA)).bold()
+    Style::new().fg(INK).bg(color(h).fg.unwrap_or(AQUA)).bold()
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -620,7 +622,7 @@ fn text_body(f: &mut Frame, app: &mut App, area: Rect) {
             for m in re.find_iter(text) {
                 for (k, &b) in starts.iter().enumerate() {
                     if b >= m.start() && b < m.end() {
-                        out[at + k].1 = Style::new().fg(Color::Black).bg(ORANGE);
+                        out[at + k].1 = Style::new().fg(INK).bg(ORANGE);
                     }
                 }
             }
@@ -770,7 +772,7 @@ fn suggestions(f: &mut Frame, app: &App, prompt: Rect) {
         .take(room.min(8))
         .map(|(i, a)| {
             let what = COMMANDS.iter().find(|(x, _)| x.contains(a)).map(|(_, d)| *d).unwrap_or("");
-            let st = if Some(i) == pick { Style::new().fg(Color::Black).bg(AQUA) } else { Style::new().fg(Color::White) };
+            let st = if Some(i) == pick { Style::new().fg(INK).bg(AQUA) } else { Style::new().fg(Color::White) };
             Line::from(vec![Span::styled(format!(" {a:<14}"), st), Span::styled(format!(" {what}"), Style::new().fg(GRAY))])
         })
         .collect();
@@ -888,8 +890,8 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
     for (i, fr) in app.stack.iter().enumerate().filter(|_| !app.chrome.crumbsless) {
         let name = fr.view.title();
         let name = name.split('(').next().unwrap_or(&name).to_string();
-        let bg = if i + 1 == app.stack.len() { ORANGE } else { SKY };
-        spans.push(Span::styled(format!(" <{name}> "), Style::new().fg(Color::Black).bg(bg).bold()));
+        let bg = if i + 1 == app.stack.len() { ORANGE } else { AQUA }; // k9s crumbs: aqua, the current one orange
+        spans.push(Span::styled(format!(" <{name}> "), Style::new().fg(INK).bg(bg).bold()));
         spans.push(Span::raw(" "));
     }
     let idle = app.flash.is_none() && !(app.top().loading && !app.top().table.rows.is_empty());

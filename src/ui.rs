@@ -300,14 +300,16 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     // Group rows by metric label, keeping first-seen order: Average and Maximum share a panel.
-    let mut groups: Vec<(String, Vec<(String, Vec<f64>)>)> = vec![];
+    // Each series is (minutes before now as a negative x, value), so gaps in the data stay gaps.
+    let mut groups: Vec<(String, Vec<(String, Vec<(f64, f64)>)>)> = vec![];
     for r in &app.top().table.rows {
         let label = r.json["label"].as_str().unwrap_or("").to_string();
         let stat = r.json["stat"].as_str().unwrap_or("").to_string();
-        let vals: Vec<f64> = r.json["values"].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).collect()).unwrap_or_default();
+        let nums = |k: &str| -> Vec<f64> { r.json[k].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).collect()).unwrap_or_default() };
+        let pts: Vec<(f64, f64)> = nums("ago").into_iter().map(|a| -a).zip(nums("values")).collect();
         match groups.iter_mut().find(|g| g.0 == label) {
-            Some(g) => g.1.push((stat, vals)),
-            None => groups.push((label, vec![(stat, vals)])),
+            Some(g) => g.1.push((stat, pts)),
+            None => groups.push((label, vec![(stat, pts)])),
         }
     }
     let cols = if inner.width >= 120 && groups.len() > 1 { 2 } else { 1 };
@@ -320,7 +322,7 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
             .iter()
             .enumerate()
             .flat_map(|(i, (stat, vals))| {
-                let v = vals.last().map(|x| fmt_metric(*x)).unwrap_or_else(|| "no data".into());
+                let v = vals.last().map(|x| fmt_metric(x.1)).unwrap_or_else(|| "no data".into());
                 [Span::styled(format!(" {} ", stat.to_lowercase()), Style::new().fg(GRAY)), Span::styled(v, Style::new().fg(LINE_COLORS[i % 3]).bold())]
             })
             .collect();
@@ -329,26 +331,23 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::new().fg(Color::Indexed(240)))
             .title(Line::styled(format!(" {label} "), Style::new().fg(Color::White).bold()))
             .title(Line::from(latest).right_aligned());
-        let points: Vec<Vec<(f64, f64)>> = series.iter().map(|(_, v)| v.iter().enumerate().map(|(i, y)| (i as f64, *y)).collect()).collect();
-        let len = series.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
-        if len == 0 {
+        if series.iter().all(|(_, v)| v.is_empty()) {
             f.render_widget(Paragraph::new("  no datapoints in the last 3 hours").fg(GRAY).block(panel), cell);
             continue;
         }
-        let hi = series.iter().flat_map(|(_, v)| v.iter().copied()).fold(f64::MIN, f64::max);
+        let hi = series.iter().flat_map(|(_, v)| v.iter().map(|p| p.1)).fold(f64::MIN, f64::max);
         let (y_lo, y_hi) = if label.contains('%') { (0.0, 100f64.max(hi)) } else { (0.0, if hi > 0.0 { hi * 1.15 } else { 1.0 }) };
         let datasets: Vec<Dataset> = series
             .iter()
-            .zip(&points)
             .enumerate()
-            .map(|(i, ((stat, _), pts))| {
+            .map(|(i, (stat, pts))| {
                 Dataset::default().name(stat.to_lowercase()).marker(Marker::Braille).graph_type(GraphType::Line).style(Style::new().fg(LINE_COLORS[i % 3])).data(pts)
             })
             .collect();
-        let span_min = (len.saturating_sub(1) * 5) as i64;
+        let span = crate::views::METRIC_MINUTES;
         let x_labels = vec![
-            Span::styled(format!("-{}", crate::logic::fmt_dur(span_min * 60)), Style::new().fg(GRAY)),
-            Span::styled(format!("-{}", crate::logic::fmt_dur(span_min * 30)), Style::new().fg(GRAY)),
+            Span::styled(format!("-{}", crate::logic::fmt_dur(span * 60)), Style::new().fg(GRAY)),
+            Span::styled(format!("-{}", crate::logic::fmt_dur(span * 30)), Style::new().fg(GRAY)),
             Span::styled("now", Style::new().fg(GRAY)),
         ];
         let y_labels = vec![
@@ -358,7 +357,7 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
         ];
         let chart = Chart::new(datasets)
             .block(panel)
-            .x_axis(Axis::default().bounds([0.0, (len.max(2) - 1) as f64]).labels(x_labels).style(Style::new().fg(Color::Indexed(240))))
+            .x_axis(Axis::default().bounds([-(span as f64), 0.0]).labels(x_labels).style(Style::new().fg(Color::Indexed(240))))
             .y_axis(Axis::default().bounds([y_lo, y_hi]).labels(y_labels).style(Style::new().fg(Color::Indexed(240))))
             .legend_position(None);
         f.render_widget(chart, cell);

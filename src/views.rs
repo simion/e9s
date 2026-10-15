@@ -1666,8 +1666,21 @@ fn q(label: &str, ns: &'static str, metric: &'static str, dims: &[(&'static str,
     Q { label: label.into(), ns, metric, dims: dims.to_vec(), stat }
 }
 
-/// One GetMetricData call; values ascending per query, in query order.
-fn metric_data(aws: &Aws, qs: &[Q], minutes: i64, period: i64) -> Result<Vec<Vec<f64>>, AwsError> {
+/// How far back the metrics view reads, in minutes.
+pub const METRIC_MINUTES: i64 = 180;
+
+/// One query's datapoints as (minutes before `now`, value), oldest first.
+/// CloudWatch leaves out periods with no data, so a point's place comes from its timestamp, not its index.
+fn metric_points(r: &Value, now: chrono::DateTime<Utc>) -> Vec<(f64, f64)> {
+    arr(r, "/Timestamps")
+        .iter()
+        .zip(arr(r, "/Values"))
+        .filter_map(|(t, v)| Some(((now - parse_ts(t)?).num_seconds() as f64 / 60.0, v.as_f64()?)))
+        .collect()
+}
+
+/// One GetMetricData call; each query's points (minutes ago, value), oldest first, in query order.
+fn metric_data(aws: &Aws, qs: &[Q], minutes: i64, period: i64) -> Result<Vec<Vec<(f64, f64)>>, AwsError> {
     let queries: Vec<Value> = qs
         .iter()
         .enumerate()
@@ -1688,9 +1701,9 @@ fn metric_data(aws: &Aws, qs: &[Q], minutes: i64, period: i64) -> Result<Vec<Vec
         "--start-time", start.to_rfc3339(), "--end-time", end.to_rfc3339(),
         "--scan-by", "TimestampAscending",
     ])?;
-    let mut by_id: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut by_id: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
     for r in arr(&v, "/MetricDataResults") {
-        by_id.entry(s(r, "/Id")).or_default().extend(arr(r, "/Values").iter().filter_map(Value::as_f64));
+        by_id.entry(s(r, "/Id")).or_default().extend(metric_points(r, end));
     }
     Ok((0..qs.len()).map(|i| by_id.remove(&format!("m{i}")).unwrap_or_default()).collect())
 }
@@ -1740,15 +1753,16 @@ fn metrics(aws: &Aws, target: &MetricTarget) -> Result<Table, AwsError> {
             ]
         }
     };
-    let data = metric_data(aws, &qs, 180, 300)?;
-    for (x, vals) in qs.iter().zip(data) {
+    let data = metric_data(aws, &qs, METRIC_MINUTES, 300)?;
+    for (x, pts) in qs.iter().zip(data) {
+        let vals: Vec<f64> = pts.iter().map(|p| p.1).collect();
         let (lo, hi) = vals.iter().fold((f64::MAX, f64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
         let cells = if vals.is_empty() {
             vec![x.label.clone(), x.stat.into(), "no data".into(), "".into(), "".into(), "".into()]
         } else {
             vec![x.label.clone(), x.stat.into(), fmt_num(*vals.last().unwrap()), fmt_num(lo), fmt_num(hi), sparkline(&vals)]
         };
-        t.row(format!("{} {}", x.label, x.stat), Health::None, json!({"label": x.label, "stat": x.stat, "values": vals}), cells);
+        t.row(format!("{} {}", x.label, x.stat), Health::None, json!({"label": x.label, "stat": x.stat, "values": vals, "ago": pts.iter().map(|p| p.0).collect::<Vec<_>>()}), cells);
     }
     Ok(t)
 }
@@ -1822,7 +1836,7 @@ fn sqs(aws: &Aws) -> Result<Table, AwsError> {
             .map(|nm| q(nm, "AWS/SQS", "ApproximateAgeOfOldestMessage", &[("QueueName", nm.clone())], "Maximum"))
             .collect();
         match metric_data(aws, &qs, 15, 60) {
-            Ok(d) => d.into_iter().enumerate().for_each(|(i, v)| oldest[ci * 500 + i] = v.last().copied()),
+            Ok(d) => d.into_iter().enumerate().for_each(|(i, v)| oldest[ci * 500 + i] = v.last().map(|p| p.1)),
             Err(e @ AwsError::SsoExpired(_)) => return Err(e),
             Err(e) => t.bad(format!("oldest-message metric: {e}")),
         }
@@ -2049,6 +2063,13 @@ mod tests {
         assert_eq!(task_health(&elb), Health::Bad);
         assert_eq!(stop_kind(&crash, &sp), "crashed (non-zero exit)");
         assert_eq!(task_health(&crash), Health::Bad);
+    }
+
+    #[test]
+    fn metric_points_keep_their_time_across_gaps() {
+        let now = parse_ts(&json!("2026-10-15T12:00:00Z")).unwrap();
+        let r = json!({"Timestamps": ["2026-10-15T09:00:00Z", "2026-10-15T11:55:00Z"], "Values": [3.0, 7.5]});
+        assert_eq!(metric_points(&r, now), vec![(180.0, 3.0), (5.0, 7.5)]);
     }
 
     #[test]

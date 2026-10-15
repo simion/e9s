@@ -146,15 +146,19 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
         View::Profiles | View::Regions | View::Aliases => vec![("<enter>", "Select")],
         View::Clusters => vec![("<enter>", "Services")],
         View::Services { .. } => vec![("<enter>", "Tasks"), ("<R>", "Rollout"), ("<e>", "Events"), ("<F>", "Failures"), ("<l>", "Logs"), ("<m>", "Metrics")],
-        View::Failures { .. } => vec![("<enter>", "Containers/Events"), ("<l>", "Logs")],
-        View::Tasks { .. } => vec![("<enter>", "Containers"), ("<l>", "Logs"), ("<R>", "Rollout"), ("<F>", "Failures")],
+        View::Failures { .. } => vec![("<enter>", "Containers/Events"), ("<l>", "Logs"), ("<R>", "Rollout"), ("<e>", "Events")],
+        View::Tasks { .. } => vec![("<enter>", "Containers"), ("<l>", "Logs"), ("<R>", "Rollout"), ("<e>", "Events"), ("<F>", "Failures")],
         View::Rollout { .. } => vec![("<enter>", "Containers"), ("<l>", "Logs"), ("<e>", "Events"), ("<m>", "Metrics")],
         View::Containers { .. } => vec![("<l>", "Logs")],
         View::Events { .. } => vec![("<R>", "Rollout"), ("<l>", "Logs"), ("<m>", "Metrics")],
-        View::Logs { .. } => vec![
-            ("<0>", "Tail"), ("<1>", "Head"), ("<2-6>", "1m-1h"), ("<s>", "Autoscroll"), ("<f>", "Fullscreen"), ("</>", "Filter"), ("<p>", "Pattern"),
-            ("<a>", "All containers"), ("<m>", "Mark"), ("<C>", "Clear"), ("<c>", "Copy"), ("<w>", "Wrap"), ("<t>", "Time"), ("<ctrl-s>", "Save"),
-        ],
+        View::Logs { src, .. } => {
+            let mut v = vec![("<0>", "Tail"), ("<1>", "Head"), ("<2-6>", "1m-1h"), ("<s>", "Autoscroll"), ("<f>", "Fullscreen"), ("</>", "Filter"), ("<p>", "Pattern")];
+            if matches!(src, crate::views::LogSrc::Service { .. }) {
+                v.push(("<a>", "All containers"));
+            }
+            v.extend([("<m>", "Mark"), ("<C>", "Clear"), ("<c>", "Copy"), ("<w>", "Wrap"), ("<t>", "Time"), ("<ctrl-s>", "Save")]);
+            v
+        }
         View::Detail { .. } => vec![("</>", "Search"), ("<n N>", "Next/Prev"), ("<w>", "Wrap"), ("<ctrl-s>", "Save")],
         View::TaskDefFamilies => vec![("<enter>", "Revisions")],
         View::TaskDefRevisions { .. } => vec![("<enter>", "Containers")],

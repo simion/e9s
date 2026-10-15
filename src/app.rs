@@ -742,7 +742,7 @@ impl App {
             KeyCode::Char('s') => self.flash("s9s is read-only: no shell (ctrl-s saves this view)", true),
             KeyCode::Char('e') => match self.service_of_view() {
                 Some((cluster, service)) => self.push(View::Events { cluster, service }),
-                None => self.flash("e works on a service", true),
+                None => self.flash("e works on a service, or a task or failure of one", true),
             },
             KeyCode::Char('m') => match self.top().view.metrics(self.top().selected()) {
                 Some(target) => self.push(View::Metrics { target }),
@@ -768,7 +768,7 @@ impl App {
                     self.service = Some(service.clone());
                     self.push(View::Rollout { cluster, service })
                 }
-                None => self.flash("R works on a service (services, tasks of a service, events)", true),
+                None => self.flash("R works on a service, or a task or failure of one", true),
             },
             KeyCode::Char('+') | KeyCode::Char('=') => self.step_interval(1),
             KeyCode::Char('-') => self.step_interval(-1),
@@ -792,10 +792,15 @@ impl App {
         }
     }
 
-    /// The service the current view is about: the selected row in services, else the view's own service.
+    /// The service the current view is about: the selected row in services (or the service of the
+    /// selected task or failure, across a cluster), else the view's own service.
     fn service_of_view(&self) -> Option<(String, String)> {
         match (&self.top().view, self.top().selected()) {
             (View::Services { cluster }, Some(r)) => Some((cluster.clone(), r.id.clone())),
+            (View::Tasks { cluster, service: None }, Some(r)) => {
+                r.json["group"].as_str().and_then(|g| g.strip_prefix("service:")).map(|s| (cluster.clone(), s.to_string()))
+            }
+            (View::Failures { cluster, .. }, Some(r)) => Some((cluster.clone(), r.cells[1].clone())),
             (View::Tasks { cluster, service: Some(sv) } | View::Events { cluster, service: sv } | View::Rollout { cluster, service: sv }, _) => {
                 Some((cluster.clone(), sv.clone()))
             }

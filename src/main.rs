@@ -106,15 +106,15 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             }
-            if let Some(p) = app.login.take() {
+            if let Some(l) = app.login.take() {
                 // The CLI's own login, on the real terminal: it opens the browser and waits.
                 ratatui::restore();
-                let result = sso_login(&p);
+                let result = run_login(&l);
                 terminal = ratatui::init();
                 // Not terminal.clear(): it asks the terminal for the cursor position, and a terminal that
                 // does not answer in time (a pipe, a slow ssh link) would end s9s right after the login.
                 ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All))?;
-                app.logged_in(&p, result);
+                app.logged_in(&l, result);
             }
             while let Ok(m) = rx.try_recv() {
                 app.on_msg(m);
@@ -128,10 +128,10 @@ fn main() -> std::io::Result<()> {
     res
 }
 
-/// `aws sso login --profile <p>`, the one thing s9s still asks the AWS CLI to do.
-fn sso_login(profile: &str) -> Result<(), String> {
-    println!("s9s: aws sso login --profile {profile}  (s9s comes back when it finishes)\n");
-    match std::process::Command::new("aws").args(["sso", "login", "--profile", profile]).status() {
+/// `aws sso login` or `aws login`, the one thing s9s still asks the AWS CLI to do.
+fn run_login(l: &app::Login) -> Result<(), String> {
+    println!("s9s: aws {}  (s9s comes back when it finishes)\n", l.args.join(" "));
+    match std::process::Command::new("aws").args(&l.args).status() {
         Ok(st) if st.success() => Ok(()),
         Ok(st) => Err(format!("exited with {st}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("the aws CLI is not installed; logging in needs it".into()),
@@ -201,8 +201,8 @@ fn run_script(app: &mut App, rx: &mpsc::Receiver<Msg>, script: &str) -> std::io:
             t => t.chars().for_each(|c| app.on_key(key(KeyCode::Char(c), KeyModifiers::NONE))),
         }
         // No browser here: report the login that would run.
-        if let Some(p) = app.login.take() {
-            println!("login: aws sso login --profile {p}");
+        if let Some(l) = app.login.take() {
+            println!("login: aws {}", l.args.join(" "));
         }
         let _ = term.draw(|f| ui::draw(f, app));
     }

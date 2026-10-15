@@ -61,6 +61,13 @@ The first call of a run is slower than with the CLI (the SDK fetches role creden
 A clean release build takes about 2.5 minutes (eleven SDK crates); incremental builds are seconds.
 `dispatch` builds the CLI's JSON by hand from the SDK types (their serde support is behind an unstable flag), so a field a view starts reading must be added there too.
 
+## Authentication
+
+`aws.rs` works out how each profile signs in (`auth_of`), follows roles to the profile that holds the login (`login_target`), and reads the login state from the exact cache file the SDK reads (`login_state`: sha1 of the sso-session name or start URL under `~/.aws/sso/cache`, sha256 of the `login_session` ARN under `~/.aws/login/cache`).
+An expired or missing login shows `Mode::OfferLogin` once (asked again only after credentials worked again); the login runs with the terminal handed back to the CLI (`main.rs`, `run_login`).
+Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an expired SSO profile, MFA role, keys, `credential_process`, web identity, env vars and `AWS_PROFILE`, plus one real `aws sso login` through `L` (the browser step completed on its own, s9s came back and loaded).
+`aws-config` is built with `credentials-login` for `login_session` profiles.
+
 ## Known limits
 
 - A 5 m or longer window on a busy service is cut, and the tail that follows starts behind and skips ahead.

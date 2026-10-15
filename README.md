@@ -68,9 +68,12 @@ Startup follows k9s: choose where you are, then navigate.
 2. **Identity.** The header shows the profile, region, account and role. Below 120 columns or 30 rows it shrinks to two lines: that context on one, this screen's keys on the next (no logo or quick-view map; `?` lists them). A role whose name does not read as read-only is shown in yellow, as a reminder; s9s still only reads.
 3. **Region.** Without `--region` it scans every enabled region in parallel and lists ECS clusters, services and running tasks per region, regions with resources first. Enter opens one.
 
-The profile picker has a LOGIN column (logged in, expired but renewing on use, not logged in), read from the token cache `aws sso login` writes.
-`L` logs in: the selected profile in the picker, or the current one anywhere else. s9s steps aside while `aws sso login --profile <name>` opens the browser, then comes back and reloads.
-If the SSO session expires while s9s runs, the header turns red and says to press `L` (or log in elsewhere and press `r`).
+Every way the AWS CLI signs in works, because the SDK reads the same files: IAM Identity Center (SSO, `sso_session` or the older per-profile settings), `aws login` console credentials (`login_session`), roles (`role_arn` with `source_profile` or `credential_source`), access keys, `credential_process`, web identity, environment variables and instance or container roles.
+Roles that need an MFA code (`mfa_serial`) are not supported: the SDK cannot ask for the code.
+
+The profile picker shows how each profile signs in (AUTH) and its LOGIN state (logged in, expired but renewing on use, not logged in), read from the same token cache file the SDK reads; a role shows the login of the profile it signs in through.
+`L` logs in: the selected profile in the picker, or the current one elsewhere. It runs `aws sso login` (or `aws login`) for the profile that actually holds the login, so a role logs in its source profile. s9s steps aside while the CLI opens the browser (where an SSO session that is still signed in completes on its own), then comes back and reloads.
+When credentials expire while s9s runs, it asks once whether to log in now (Enter) or later (Esc, then `L`); the header stays red until it works. Profiles with keys or `credential_process` have nothing to run: the header says to renew them and press `r`.
 
 ## Keys
 
@@ -113,7 +116,7 @@ If the SSO session expires while s9s runs, the header turns red and says to pres
 | `ctrl-e` `ctrl-g` | Hide or show the header / the breadcrumbs, as in k9s (`--headless` and `--crumbsless` start with them hidden) |
 | `0`-`9` | Quick views: 1 clusters, 2 services, 3 tasks, 4 log groups, 5 load balancers, 6 target groups, 7 scaling, 8 ECR, 9 SQS, 0 RDS |
 | `?` | Help overlay: what the current screen is in AWS terms and its Kubernetes equivalent, then every key and command. Scroll with `↑` `↓` / `j` `k`, page with `PgUp` `PgDn` / `space`, close with `Esc`, `q` or `?` |
-| `L` | Log in with `aws sso login`: the selected profile in the profile picker, else the current profile |
+| `L` | Log in (`aws sso login` or `aws login`): the selected profile in the profile picker, else the current one; a role logs in through its source profile |
 | `H` | Command log for this screen: every AWS call it made, written as the equivalent `aws` CLI command, running first, then newest first, with how long ago it started, how long it took, and a tick or a cross for its result. While a screen loads, finished calls stay listed under the running ones |
 
 ## Commands

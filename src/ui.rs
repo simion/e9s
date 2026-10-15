@@ -86,6 +86,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             app.mode = Mode::Help(max);
         }
     }
+    if let Mode::OfferLogin(l) = &app.mode {
+        offer_login(f, &app.aws.ctx.profile, l);
+    }
     if let Mode::Calls(off) = app.mode {
         let max = calls(f, app.top().id, off);
         if off > max {
@@ -212,7 +215,10 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     let val = |v: String| Span::styled(v, Style::new().fg(ORANGE));
     let who = match (&app.arn, &app.ident_err) {
         _ if app.sso_expired => Span::styled(
-            if ctx.profile.is_empty() { "SSO expired: aws sso login".to_string() } else { format!("SSO expired: press L to log in ({})", ctx.profile) },
+            match &app.expired_login {
+                Some(l) => format!("login expired: press L (aws {})", l.args.join(" ")),
+                None => "credentials expired or missing: renew them, then r".to_string(),
+            },
             Style::new().fg(Color::White).bg(Color::Indexed(160)).bold(),
         ),
         (Some(arn), _) => {
@@ -784,6 +790,36 @@ fn inflight_lines(screen: u64, max: usize) -> Vec<Line<'static>> {
         lines.push(Line::styled(format!("{} working", spinner()), Style::new().fg(GRAY)));
     }
     lines
+}
+
+/// The login expired: a centred box offering to run the login now.
+fn offer_login(f: &mut Frame, profile: &str, l: &crate::app::Login) {
+    let who = if profile.is_empty() { "the default credentials".to_string() } else { format!("profile {profile}") };
+    let via = if l.profile != profile { format!(" (it signs in through {})", l.profile) } else { String::new() };
+    let lines = vec![
+        Line::raw(""),
+        Line::styled(format!("  The login for {who} has expired or was never done{via}."), Style::new().fg(Color::White).bold()),
+        Line::raw(""),
+        Line::from(vec![Span::styled("  Log in now? This runs  ", Style::new().fg(GRAY)), Span::styled(format!("aws {}", l.args.join(" ")), Style::new().fg(ORANGE).bold())]),
+        Line::styled("  in this terminal (it opens the browser); s9s comes back when it finishes.", Style::new().fg(GRAY)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  <enter> <y> ", Style::new().fg(DODGER).bold()),
+            Span::styled("log in     ", Style::new().fg(GRAY)),
+            Span::styled("<esc> <n> ", Style::new().fg(DODGER).bold()),
+            Span::styled("not now (L logs in later)", Style::new().fg(GRAY)),
+        ]),
+    ];
+    let area = f.area();
+    let w = (lines.iter().map(|l| l.width()).max().unwrap_or(40) as u16 + 4).min(area.width);
+    let h = (lines.len() as u16 + 3).min(area.height);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(ORANGE))
+        .title(Line::styled(" Login expired ", Style::new().fg(ORANGE).bold()).centered());
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(lines).block(block), r);
 }
 
 /// `H`: every AWS call this screen made (as the equivalent CLI command), running first, then newest first, with when it started.

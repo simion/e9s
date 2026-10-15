@@ -20,8 +20,8 @@ pub enum AwsError {
 impl std::fmt::Display for AwsError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            AwsError::SsoExpired(p) if p.is_empty() => write!(f, "SSO session expired or no credentials: run `aws sso login`, then press r"),
-            AwsError::SsoExpired(p) => write!(f, "SSO session expired: press L to log in (aws sso login --profile {p})"),
+            AwsError::SsoExpired(p) if p.is_empty() => write!(f, "no credentials, or they expired: set them up (aws configure, aws sso login), then press r"),
+            AwsError::SsoExpired(p) => write!(f, "credentials for profile {p} expired or are missing: press L to log in, or renew them and press r"),
             AwsError::Api(m) => f.write_str(m),
         }
     }
@@ -214,7 +214,7 @@ pub fn display_cmd(region: &str, service: &str, op: &str, args: &[String]) -> St
 
 pub fn classify(stderr: &str, profile: &str, service: &str, op: &str) -> AwsError {
     let l = stderr.to_lowercase();
-    let sso = ["token has expired", "error loading sso token", "unauthorizedssotoken", "expiredtoken", "sso session", "token is expired", "refresh failed", "sso token", "loading an access token"];
+    let sso = ["token has expired", "error loading sso token", "unauthorizedssotoken", "expiredtoken", "sso session", "token is expired", "refresh failed", "sso token", "loading an access token", "no providers in chain", "credentials have expired", "login token", ".aws/sso/cache/", ".aws/login/cache/"];
     if sso.iter().any(|k| l.contains(k)) {
         return AwsError::SsoExpired(profile.to_string());
     }
@@ -265,8 +265,11 @@ pub fn profile_details() -> Vec<(String, std::collections::BTreeMap<String, Stri
                 });
             } else if let (Some(i), Some((k, v))) = (current, line.split_once('=')) {
                 // Only non-secret settings: credentials files hold keys, which are never read into the UI.
+                // That keys exist is kept (it is how the profile signs in), and the web identity token's path.
                 let k = k.trim();
-                if !k.contains("secret") && !k.contains("key") && !k.contains("token") {
+                if k == "aws_access_key_id" {
+                    out[i].1.insert("static_keys".into(), "yes".into());
+                } else if k == "web_identity_token_file" || (!k.contains("secret") && !k.contains("key") && !k.contains("token")) {
                     out[i].1.insert(k.to_string(), v.trim().to_string());
                 }
             }
@@ -283,36 +286,105 @@ pub fn profile_details() -> Vec<(String, std::collections::BTreeMap<String, Stri
     out
 }
 
+type Profiles = [(String, std::collections::BTreeMap<String, String>)];
+
+/// How a profile gets credentials, in the order the SDK checks them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Auth {
+    /// IAM Identity Center; `session` is the sso-session name, absent for the older per-profile settings.
+    Sso { session: Option<String>, start_url: String },
+    /// `aws login` (console credentials), `login_session = <arn>`.
+    Console { session: String },
+    /// `role_arn` assumed with another profile's credentials; `mfa` roles need a code the SDK cannot ask for.
+    Role { source: String, mfa: bool },
+    Keys,
+    Process,
+    WebIdentity,
+    /// Nothing in the files: environment variables, container or instance credentials.
+    Unknown,
+}
+
+pub fn auth_of(profile: &str, all: &Profiles) -> Auth {
+    let Some((_, kv)) = all.iter().find(|(p, _)| p == profile) else { return Auth::Unknown };
+    let get = |k: &str| kv.get(k).cloned();
+    if get("role_arn").is_some_and(|r| !r.is_empty()) {
+        if kv.contains_key("web_identity_token_file") {
+            return Auth::WebIdentity;
+        }
+        let source = get("source_profile").or_else(|| get("credential_source")).unwrap_or_default();
+        return Auth::Role { source, mfa: kv.contains_key("mfa_serial") };
+    }
+    if let Some(url) = get("sso_start_url") {
+        return Auth::Sso { session: get("sso_session"), start_url: url };
+    }
+    if let Some(arn) = get("login_session") {
+        return Auth::Console { session: arn };
+    }
+    if kv.contains_key("static_keys") {
+        Auth::Keys
+    } else if kv.contains_key("credential_process") {
+        Auth::Process
+    } else {
+        Auth::Unknown
+    }
+}
+
+/// The profile to log in for `profile` and how: itself for SSO or `aws login`, the source profile for a role.
+pub fn login_target(profile: &str, all: &Profiles) -> Option<(String, Auth)> {
+    let mut p = profile.to_string();
+    for _ in 0..8 {
+        match auth_of(&p, all) {
+            Auth::Role { source, mfa: false } if !source.is_empty() && source != p => p = source,
+            a @ (Auth::Sso { .. } | Auth::Console { .. }) => return Some((p, a)),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The CLI command that logs `profile` in, without the leading `aws`.
+pub fn login_args(profile: &str, auth: &Auth) -> Vec<String> {
+    let verb: &[&str] = if matches!(auth, Auth::Console { .. }) { &["login"] } else { &["sso", "login"] };
+    verb.iter().map(|s| s.to_string()).chain(["--profile".to_string(), profile.to_string()]).collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SsoLogin {
+pub enum LoginState {
     LoggedIn,
     /// The access token expired, but a refresh token lets the SDK renew it on the next call.
     Renewable,
     LoggedOut,
 }
 
-/// The state of the login for an SSO start URL, from the token cache `aws sso login` writes
-/// (`~/.aws/sso/cache/*.json`). Local files only; tokens are never read into the UI.
-pub fn sso_login(start_url: &str, cache: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> SsoLogin {
-    let mut best = SsoLogin::LoggedOut;
-    for f in std::fs::read_dir(cache).into_iter().flatten().flatten() {
-        let Ok(v) = std::fs::read_to_string(f.path()).map(|t| serde_json::from_str::<Value>(&t).unwrap_or_default()) else { continue };
-        if v["startUrl"].as_str() != Some(start_url) {
-            continue;
+/// The state of a login, read from the exact cache file the SDK reads (the CLI writes it):
+/// `~/.aws/sso/cache/<sha1 of session name, or of start URL>.json`, `~/.aws/login/cache/<sha256 of ARN>.json`.
+/// Local files only; tokens are never read into the UI.
+pub fn login_state(auth: &Auth, home: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> Option<LoginState> {
+    use sha1::Digest;
+    let (path, expires_ptr) = match auth {
+        Auth::Sso { session, start_url } => {
+            let id = session.as_deref().unwrap_or(start_url);
+            (home.join(format!(".aws/sso/cache/{:x}.json", sha1::Sha1::digest(id.as_bytes()))), "/expiresAt")
         }
-        let expires = crate::logic::parse_ts(&v["expiresAt"]);
-        if expires.is_some_and(|e| e > now) {
-            return SsoLogin::LoggedIn;
+        Auth::Console { session } => {
+            (home.join(format!(".aws/login/cache/{:x}.json", sha2::Sha256::digest(session.trim().as_bytes()))), "/accessToken/expiresAt")
         }
-        if v.get("refreshToken").is_some() {
-            best = SsoLogin::Renewable;
-        }
-    }
-    best
+        _ => return None,
+    };
+    let Ok(v) = std::fs::read_to_string(path).map(|t| serde_json::from_str::<Value>(&t).unwrap_or_default()) else {
+        return Some(LoginState::LoggedOut);
+    };
+    Some(if v.pointer(expires_ptr).and_then(crate::logic::parse_ts).is_some_and(|e| e > now) {
+        LoginState::LoggedIn
+    } else if v.get("refreshToken").is_some() {
+        LoginState::Renewable
+    } else {
+        LoginState::LoggedOut
+    })
 }
 
-pub fn sso_cache_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}/.aws/sso/cache", std::env::var("HOME").unwrap_or_default()))
+pub fn home() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
 
 /// The profile whose `sso_account_id` is `account`, from ~/.aws/config.
@@ -362,20 +434,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sso_login_reads_the_token_cache() {
-        let dir = std::env::temp_dir().join(format!("s9s-sso-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn auth_methods_and_login_state() {
+        use std::collections::BTreeMap;
+        let p = |name: &str, kv: &[(&str, &str)]| (name.to_string(), kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>());
+        let all = vec![
+            p("sso", &[("sso_session", "corp"), ("sso_start_url", "https://corp/start")]),
+            p("legacy", &[("sso_start_url", "https://old/start")]),
+            p("console", &[("login_session", "arn:aws:iam::1:user/me")]),
+            p("role", &[("role_arn", "arn:aws:iam::1:role/r"), ("source_profile", "sso")]),
+            p("mfa", &[("role_arn", "arn:aws:iam::1:role/r"), ("source_profile", "sso"), ("mfa_serial", "arn:aws:iam::1:mfa/me")]),
+            p("keys", &[("static_keys", "yes")]),
+            p("proc", &[("credential_process", "x")]),
+            p("web", &[("role_arn", "arn:aws:iam::1:role/r"), ("web_identity_token_file", "/t")]),
+        ];
+        assert!(matches!(auth_of("legacy", &all), Auth::Sso { session: None, .. }));
+        assert_eq!(auth_of("keys", &all), Auth::Keys);
+        assert_eq!(auth_of("proc", &all), Auth::Process);
+        assert_eq!(auth_of("web", &all), Auth::WebIdentity);
+        // A role logs in through its source profile; an MFA role cannot be driven by the SDK.
+        assert_eq!(login_target("role", &all).map(|t| t.0), Some("sso".into()));
+        assert_eq!(login_target("mfa", &all), None);
+        assert_eq!(login_target("keys", &all), None);
+        let (who, how) = login_target("console", &all).unwrap();
+        assert_eq!(login_args(&who, &how), ["login", "--profile", "console"]);
+        assert_eq!(login_args("sso", &auth_of("sso", &all)), ["sso", "login", "--profile", "sso"]);
+
+        // The cache file names are the SDK's: sha1 of the session name (or start URL), sha256 of the login ARN.
+        let home = std::env::temp_dir().join(format!("s9s-home-{}", std::process::id()));
+        for d in [".aws/sso/cache", ".aws/login/cache"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
         let now = crate::logic::parse_ts(&Value::String("2026-10-15T12:00:00Z".into())).unwrap();
-        let write = |name: &str, body: &str| std::fs::write(dir.join(name), body).unwrap();
-        write("a.json", r#"{"startUrl": "https://a/start", "expiresAt": "2026-10-15T13:00:00Z", "accessToken": "x"}"#);
-        write("b.json", r#"{"startUrl": "https://b/start", "expiresAt": "2026-10-15T11:00:00Z", "refreshToken": "x"}"#);
-        write("c.json", r#"{"startUrl": "https://c/start", "expiresAt": "2026-10-15T11:00:00Z"}"#);
-        write("client.json", r#"{"clientId": "x", "expiresAt": "2026-12-01T00:00:00Z"}"#);
-        assert_eq!(sso_login("https://a/start", &dir, now), SsoLogin::LoggedIn);
-        assert_eq!(sso_login("https://b/start", &dir, now), SsoLogin::Renewable);
-        assert_eq!(sso_login("https://c/start", &dir, now), SsoLogin::LoggedOut);
-        assert_eq!(sso_login("https://nowhere/start", &dir, now), SsoLogin::LoggedOut);
-        std::fs::remove_dir_all(&dir).unwrap();
+        use sha1::Digest;
+        let sso_file = home.join(format!(".aws/sso/cache/{:x}.json", sha1::Sha1::digest(b"corp")));
+        std::fs::write(&sso_file, r#"{"startUrl": "https://corp/start", "expiresAt": "2026-10-15T13:00:00Z"}"#).unwrap();
+        assert_eq!(login_state(&auth_of("sso", &all), &home, now), Some(LoginState::LoggedIn));
+        std::fs::write(&sso_file, r#"{"expiresAt": "2026-10-15T11:00:00Z", "refreshToken": "x"}"#).unwrap();
+        assert_eq!(login_state(&auth_of("sso", &all), &home, now), Some(LoginState::Renewable));
+        // The legacy profile's token lives under the hash of its start URL, which is not there.
+        assert_eq!(login_state(&auth_of("legacy", &all), &home, now), Some(LoginState::LoggedOut));
+        let console_file = home.join(format!(".aws/login/cache/{:x}.json", sha2::Sha256::digest(b"arn:aws:iam::1:user/me")));
+        std::fs::write(&console_file, r#"{"accessToken": {"expiresAt": "2026-10-15T13:00:00Z"}}"#).unwrap();
+        assert_eq!(login_state(&auth_of("console", &all), &home, now), Some(LoginState::LoggedIn));
+        assert_eq!(login_state(&Auth::Keys, &home, now), None);
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

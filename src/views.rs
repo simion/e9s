@@ -349,10 +349,11 @@ impl View {
                 Ok(t)
             }
             View::Profiles => {
-                let mut t = Table::new(&["PROFILE", "ACCOUNT", "ROLE", "REGION", "SSO SESSION", "LOGIN"]);
-                t.info("a profile names an account and a role to sign in as (Kubernetes: a kubeconfig context) · Enter picks one · L logs in (aws sso login)");
-                let (cache, now) = (crate::aws::sso_cache_dir(), Utc::now());
-                for (p, kv) in crate::aws::profile_details() {
+                use crate::aws::{Auth, LoginState};
+                let mut t = Table::new(&["PROFILE", "ACCOUNT", "ROLE", "REGION", "AUTH", "LOGIN"]);
+                t.info("a profile names an account and a role to sign in as (Kubernetes: a kubeconfig context) · Enter picks one · L logs in");
+                let (all, home, now) = (crate::aws::profile_details(), crate::aws::home(), Utc::now());
+                for (p, kv) in &all {
                     let g = |k: &str| kv.get(k).cloned().unwrap_or_default();
                     let role = if kv.contains_key("role_arn") { short(&g("role_arn")).to_string() } else { g("sso_role_name") };
                     let account = if kv.contains_key("sso_account_id") {
@@ -360,15 +361,27 @@ impl View {
                     } else {
                         g("role_arn").split(':').nth(4).unwrap_or("").to_string()
                     };
-                    use crate::aws::SsoLogin;
-                    let (health, login) = match kv.get("sso_start_url").map(|u| crate::aws::sso_login(u, &cache, now)) {
-                        Some(SsoLogin::LoggedIn) => (Health::Ok, "logged in"),
-                        Some(SsoLogin::Renewable) => (Health::Warn, "expired, renews on use"),
-                        Some(SsoLogin::LoggedOut) => (Health::Bad, "not logged in (L)"),
-                        None => (Health::None, "-"),
+                    let auth = match crate::aws::auth_of(p, &all) {
+                        Auth::Sso { session: Some(s), .. } => format!("sso ({s})"),
+                        Auth::Sso { session: None, .. } => "sso (legacy)".into(),
+                        Auth::Console { .. } => "aws login".into(),
+                        Auth::Role { mfa: true, .. } => "role with MFA (not supported)".into(),
+                        Auth::Role { source, .. } => format!("role via {source}"),
+                        Auth::Keys => "access keys".into(),
+                        Auth::Process => "credential_process".into(),
+                        Auth::WebIdentity => "web identity".into(),
+                        Auth::Unknown => "-".into(),
                     };
-                    let sso = kv.contains_key("sso_start_url");
-                    t.row(p.clone(), health, json!({"profile": p, "region": kv.get("region"), "sso": sso}), vec![p, account, role, g("region"), g("sso_session"), login.into()]);
+                    // A role shows the login of the profile it signs in through.
+                    let target = crate::aws::login_target(p, &all);
+                    let via = target.as_ref().filter(|(t, _)| t != p).map(|(t, _)| format!(" (via {t})")).unwrap_or_default();
+                    let (health, login) = match target.as_ref().and_then(|(_, a)| crate::aws::login_state(a, &home, now)) {
+                        Some(LoginState::LoggedIn) => (Health::Ok, format!("logged in{via}")),
+                        Some(LoginState::Renewable) => (Health::Warn, format!("expired, renews on use{via}")),
+                        Some(LoginState::LoggedOut) => (Health::Bad, format!("not logged in{via} (L)")),
+                        None => (Health::None, "-".into()),
+                    };
+                    t.row(p.clone(), health, json!({"profile": p, "region": kv.get("region")}), vec![p.clone(), account, role, g("region"), auth, login]);
                 }
                 t.empty = Some("no profiles in ~/.aws/config or ~/.aws/credentials".into());
                 Ok(t)

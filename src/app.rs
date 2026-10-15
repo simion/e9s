@@ -108,6 +108,15 @@ pub enum Mode {
     /// This screen's AWS calls, scrolled by this many lines.
     Calls(u16),
     Scale(ScaleForm),
+    /// The login expired: offer to run the login command for this profile.
+    OfferLogin(Login),
+}
+
+/// A login to run: the profile to log in and the `aws` arguments that do it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Login {
+    pub profile: String,
+    pub args: Vec<String>,
 }
 
 pub const COMMANDS: &[(&[&str], &str)] = &[
@@ -168,7 +177,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("e", "events of the selected service"),
     ("m", "metrics (services, load balancers, target groups)"),
     ("r ctrl-r", "refresh now"),
-    ("L", "log in with aws sso login: the selected profile in :profile, else the current one"),
+    ("L", "log in (aws sso login or aws login): the selected profile in :profile, else the current one; a role logs in its source profile"),
     ("c", "copy the command that reopens this view (logs: the lines shown; describe: the page)"),
     ("+ -", "auto-refresh interval up / down (off, 5s .. 60s)"),
     ("< >", "sort by previous / next column"),
@@ -312,8 +321,12 @@ pub struct App {
     pub flash: Option<(String, bool, Instant)>,
     pub page: usize,
     pub quit: bool,
-    /// A profile to log in with `aws sso login`; the main loop pauses the screen to run it.
-    pub login: Option<String>,
+    /// A login to run (`aws sso login` or `aws login`); the main loop pauses the screen to run it.
+    pub login: Option<Login>,
+    /// The expired login was already offered; asked again only after credentials worked once more.
+    offered: bool,
+    /// When credentials expired: the login that would renew them, for the header (None: nothing to run).
+    pub expired_login: Option<Login>,
     cluster: Option<String>,
     service: Option<String>,
     tx: Sender<Msg>,
@@ -335,7 +348,7 @@ impl App {
         let mut app = App {
             chrome: Default::default(), aws: Arc::new(Aws::new(Ctx { profile, region: home })), arn: None, account: None, ident_err: None, sso_expired: false,
             stack: vec![], mode: Mode::Normal, pick: None, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
-            quit: false, login: None, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
+            quit: false, login: None, offered: false, expired_login: None, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
         };
         if pick_profile {
             app.replace_root(View::Profiles);
@@ -461,9 +474,9 @@ impl App {
         match m {
             Msg::Loaded { seq, result } => {
                 if let Err(AwsError::SsoExpired(_)) = &result {
-                    self.sso_expired = true;
+                    self.credentials_expired();
                 } else if result.is_ok() {
-                    self.sso_expired = false;
+                    (self.sso_expired, self.offered) = (false, false);
                 }
                 let Some(f) = self.stack.iter_mut().find(|f| f.seq == seq) else { return };
                 f.loading = false;
@@ -498,10 +511,12 @@ impl App {
                         self.arn = v["Arn"].as_str().map(String::from);
                         self.account = v["Account"].as_str().map(String::from);
                         self.ident_err = None;
-                        self.sso_expired = false;
+                        (self.sso_expired, self.offered) = (false, false);
                     }
                     Err(e) => {
-                        self.sso_expired = matches!(e, AwsError::SsoExpired(_));
+                        if matches!(e, AwsError::SsoExpired(_)) {
+                            self.credentials_expired();
+                        }
                         self.ident_err = Some(e.to_string());
                     }
                 }
@@ -601,6 +616,11 @@ impl App {
         }
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Help(off) => self.mode = self.scroll(k, off).map_or(Mode::Normal, Mode::Help),
+            Mode::OfferLogin(l) => match k.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('L') => self.login = Some(l),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.flash("not logged in: L logs in later", true),
+                _ => self.mode = Mode::OfferLogin(l),
+            },
             Mode::Calls(off) => self.mode = self.scroll(k, off).map_or(Mode::Normal, Mode::Calls),
             Mode::Scale(form) => self.scale_key(form, k),
             Mode::Normal => self.normal_key(k),
@@ -824,35 +844,52 @@ impl App {
         }
     }
 
-    /// `L`: the selected profile in the picker, else the current one, if it signs in through SSO.
-    fn ask_login(&mut self) {
-        let (profile, sso) = match (&self.top().view, self.top().selected()) {
-            (View::Profiles, Some(r)) => (r.id.clone(), r.json["sso"].as_bool() == Some(true)),
-            _ => {
-                let p = self.aws.ctx.profile.clone();
-                let sso = crate::aws::profile_details().iter().any(|(n, kv)| *n == p && kv.contains_key("sso_start_url"));
-                (p, sso)
-            }
-        };
-        if profile.is_empty() || !sso {
-            let who = if profile.is_empty() { "the default credentials".to_string() } else { format!("profile {profile}") };
-            return self.flash(format!("{who} does not sign in through SSO: nothing to log in to"), true);
-        }
-        self.login = Some(profile);
+    /// What logs `profile` in: itself (SSO, `aws login`) or, for a role, the profile it signs in through.
+    pub fn login_for(profile: &str) -> Option<Login> {
+        let all = crate::aws::profile_details();
+        crate::aws::login_target(profile, &all).map(|(p, auth)| Login { args: crate::aws::login_args(&p, &auth), profile: p })
     }
 
-    /// After `aws sso login` ran: read credentials again, re-check identity, reload the screen.
-    pub fn logged_in(&mut self, profile: &str, result: Result<(), String>) {
+    /// `L`: the selected profile in the picker, else the current one.
+    fn ask_login(&mut self) {
+        let profile = match (&self.top().view, self.top().selected()) {
+            (View::Profiles, Some(r)) => r.id.clone(),
+            _ => self.aws.ctx.profile.clone(),
+        };
+        match App::login_for(&profile) {
+            Some(l) => self.login = Some(l),
+            None => {
+                let who = if profile.is_empty() { "the default credentials".to_string() } else { format!("profile {profile}") };
+                self.flash(format!("{who} has no login to run (keys, credential_process or an MFA role): renew its credentials, then r"), true);
+            }
+        }
+    }
+
+    /// Credentials expired or are missing. The first time, if the profile has a login, offer to run it.
+    fn credentials_expired(&mut self) {
+        self.sso_expired = true;
+        if self.offered || self.login.is_some() {
+            return;
+        }
+        self.offered = true;
+        self.expired_login = App::login_for(&self.aws.ctx.profile);
+        if let (Some(l), Mode::Normal) = (&self.expired_login, &self.mode) {
+            self.mode = Mode::OfferLogin(l.clone());
+        }
+    }
+
+    /// After the login command ran: read credentials again, re-check identity, reload the screen.
+    pub fn logged_in(&mut self, login: &Login, result: Result<(), String>) {
         match result {
             Ok(()) => {
                 crate::sdk::reset();
-                self.flash(format!("logged in: {profile}"), false);
-                if profile == self.aws.ctx.profile {
-                    self.identity();
-                }
+                self.flash(format!("logged in: {}", login.profile), false);
+                // No second offer if it still fails: the header keeps the L hint.
+                self.offered = true;
+                self.identity();
                 self.load();
             }
-            Err(e) => self.flash(format!("aws sso login --profile {profile} failed: {e}"), true),
+            Err(e) => self.flash(format!("aws {} failed: {e}", login.args.join(" ")), true),
         }
     }
 

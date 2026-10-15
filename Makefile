@@ -1,13 +1,18 @@
 # make run [ARGS="-p prod -r us-west-1"]   build and launch
 # make install                             a `s9s` launcher in ~/.local/bin (see install.sh)
-# make test
-# make shots                              shots/*.html to PNG (headless Chrome)
+# make uninstall                           remove that launcher
+# make test                                unit tests, no AWS access needed
+# make shots                               shots/*.html to PNG (headless Chrome)
 
 CARGO ?= $(shell command -v cargo || ls $$HOME/.cargo/bin/cargo /opt/homebrew/opt/rustup/bin/cargo /usr/local/opt/rustup/bin/cargo 2>/dev/null | head -n 1)
 # Rustup's proxies find rustc through PATH.
 export PATH := $(dir $(CARGO)):$(PATH)
 
-.PHONY: run install uninstall test shots
+.PHONY: help run install uninstall test shots
+.DEFAULT_GOAL := help
+
+help:
+	@sed -n 's/^# make/make/p' $(firstword $(MAKEFILE_LIST))
 
 run:
 	$(CARGO) run --release --locked -- $(ARGS)

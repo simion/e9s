@@ -6,6 +6,7 @@ The README is the user guide; this file is for whoever changes the code.
 ## Build and check
 
 ```sh
+make                          # list the targets
 make run ARGS="-p <profile>"  # build and launch
 make test                     # 22 tests, no AWS access needed
 make install                  # ./install.sh: a `s9s` launcher in ~/.local/bin that rebuilds when src/ changes

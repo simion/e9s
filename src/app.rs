@@ -1,0 +1,1249 @@
+//! App state and key handling. Fetches run on background threads and come back as `Msg`.
+
+use crate::aws::{Aws, AwsError, Ctx};
+use crate::logic::{short, sort_key, to_yaml};
+use crate::views::*;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use regex::Regex;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc::Sender, Arc};
+use std::time::{Duration, Instant};
+
+pub enum Msg {
+    Loaded { seq: u64, result: Result<Table, AwsError> },
+    Identity { ctx: Ctx, result: Result<Value, AwsError> },
+    Tail { seq: u64, rows: Vec<Row>, skipped: bool },
+    TailEnded { seq: u64, err: String },
+    /// Current desired count and scalable target of the service being scaled.
+    #[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
+    ScaleInfo { desired: Result<Option<i64>, AwsError>, capacity: Result<Option<Capacity>, AwsError> },
+    Scaled(Result<String, String>),
+}
+
+/// An Application Auto Scaling target: namespace, resource id, dimension, min, max.
+pub type Capacity = (String, String, String, i64, i64);
+
+pub struct Field {
+    pub label: &'static str,
+    pub current: i64,
+    pub input: String,
+}
+
+/// The k9s scale dialog: edit, then confirm the exact change, then apply.
+#[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
+pub struct ScaleForm {
+    pub title: String,
+    pub service: Option<(String, String)>,
+    pub capacity: Option<Capacity>,
+    pub fields: Vec<Field>,
+    pub focus: usize,
+    pub loading: bool,
+    pub confirm: bool,
+    pub applying: bool,
+    pub error: Option<String>,
+}
+
+impl ScaleForm {
+    fn value(&self, label: &str) -> Option<Result<i64, String>> {
+        self.fields.iter().find(|f| f.label == label).map(|f| f.input.trim().parse::<i64>().map_err(|_| format!("{label} must be a whole number")))
+    }
+
+    /// The writes this form would make, capacity first so a raised max is in place before desired moves.
+    pub fn changes(&self) -> Result<Vec<crate::aws::Scale>, String> {
+        use crate::aws::Scale;
+        let desired = self.value("Desired").transpose()?;
+        let (min, max) = (self.value("Min").transpose()?, self.value("Max").transpose()?);
+        for (label, v) in [("Desired", desired), ("Min", min), ("Max", max)] {
+            if v.is_some_and(|v| v < 0) {
+                return Err(format!("{label} cannot be negative"));
+            }
+        }
+        let mut out = vec![];
+        if let (Some((ns, res, dim, cmin, cmax)), Some(min), Some(max)) = (&self.capacity, min, max) {
+            if min > max {
+                return Err(format!("Min {min} is above Max {max}"));
+            }
+            if let Some(d) = desired {
+                if d < min || d > max {
+                    return Err(format!("Desired {d} is outside Min {min}..Max {max}: autoscaling would move it back"));
+                }
+            }
+            if (min, max) != (*cmin, *cmax) {
+                out.push(Scale::Capacity { ns: ns.clone(), resource: res.clone(), dimension: dim.clone(), min, max });
+            }
+        }
+        if let (Some((cluster, service)), Some(d)) = (&self.service, desired) {
+            if self.fields.iter().any(|f| f.label == "Desired" && f.current != d) {
+                out.push(Scale::Desired { cluster: cluster.clone(), service: service.clone(), count: d });
+            }
+        }
+        if out.is_empty() {
+            return Err("nothing changed".into());
+        }
+        Ok(out)
+    }
+}
+
+#[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
+pub fn describe_change(c: &crate::aws::Scale, form: &ScaleForm) -> String {
+    use crate::aws::Scale;
+    let cur = |l: &str| form.fields.iter().find(|f| f.label == l).map(|f| f.current).unwrap_or(0);
+    match c {
+        Scale::Desired { cluster, service, count } => format!("ecs update-service {cluster}/{service}: desiredCount {} -> {count}", cur("Desired")),
+        Scale::Capacity { resource, min, max, .. } => {
+            format!("register-scalable-target {resource}: min {} -> {min}, max {} -> {max}", cur("Min"), cur("Max"))
+        }
+    }
+}
+
+pub enum Mode {
+    Normal,
+    Command(String),
+    Filter(String),
+    Pattern(String),
+    /// Help overlay, scrolled by this many lines.
+    Help(u16),
+    /// This screen's AWS calls, scrolled by this many lines.
+    Calls(u16),
+    Scale(ScaleForm),
+}
+
+pub const COMMANDS: &[(&[&str], &str)] = &[
+    (&["clusters", "cl", "ecs"], "ECS clusters"),
+    (&["services", "svc"], "ECS services of [cluster] (default: current)"),
+    (&["tasks", "task", "po"], "ECS tasks of [cluster], running and recently stopped"),
+    (&["events", "ev"], "events of the current service"),
+    (&["rollout", "ro"], "rollout watch of the current service"),
+    (&["failures", "fail"], "failed tasks and problem events of the last hour, whole cluster"),
+    (&["taskdefs", "td"], "task definition families"),
+    (&["logs", "lg"], "log groups; :logs <group> [filter pattern] opens events"),
+    (&["lb", "alb", "elb"], "load balancers"),
+    (&["tg", "targetgroups"], "all target groups"),
+    (&["scaling", "as"], "scalable targets [namespace, default ecs]"),
+    (&["policies", "pol"], "scaling policies [namespace]"),
+    (&["activities", "act"], "scaling activities [namespace]"),
+    (&["ec2"], "EC2 instances"),
+    (&["ecr"], "ECR repositories"),
+    (&["sqs"], "SQS queues"),
+    (&["rds"], "RDS clusters and instances"),
+    (&["lambda", "fn"], "Lambda functions"),
+    (&["profile", "ctx"], "pick a profile, or :profile <name>"),
+    (&["region", "regions"], "regions with resource counts, or :region <name>"),
+    (&["quit", "q"], "quit"),
+];
+
+pub const QUICK: &[(char, &str)] = &[
+    ('1', "clusters"), ('2', "svc"), ('3', "tasks"), ('4', "logs"), ('5', "lb"),
+    ('6', "tg"), ('7', "scaling"), ('8', "ecr"), ('9', "sqs"), ('0', "rds"),
+];
+
+pub const KEYS: &[(&str, &str)] = &[
+    (":", "command mode (Tab completes)"),
+    ("/", "filter rows live: regex, case-insensitive, !re inverts"),
+    ("Esc", "clear filter, else back one level"),
+    ("q", "back one level; quits at the root"),
+    ("ctrl-c", "quit"),
+    ("Enter", "drill into the selected row"),
+    ("j k / ↑ ↓", "move"),
+    ("g G", "top / bottom"),
+    ("ctrl-d ctrl-u", "page down / up (also PgDn PgUp)"),
+    ("d", "describe: full detail of the selection"),
+    ("y", "raw JSON of the selection"),
+    ("l", "logs for the selection"),
+    ("f", "logs follow new lines by default; f pauses and resumes"),
+    ("t", "logs: show or hide timestamps"),
+    ("0-6", "logs: start from the tail, the head, or 1m 5m 15m 30m 1h back (elsewhere 0-9 are quick views)"),
+    ("a", "service logs: all containers of each task, not just the main one"),
+    ("m C c", "logs: draw a mark line, clear the screen, copy the lines shown"),
+    ("F", "failures of the last hour: failed tasks and problem events (service, or whole cluster)"),
+    ("p", "logs: filter pattern · scaling: policies"),
+    ("w", "wrap lines (logs, describe)"),
+    ("s ctrl-s", "save the current view to ~/Downloads (logs: every line so far, as .log)"),
+    ("R", "rollout watch of the selected service"),
+    ("e", "events of the selected service"),
+    ("m", "metrics (services, load balancers, target groups)"),
+    ("r ctrl-r", "refresh now"),
+    ("c", "copy the command that reopens this view"),
+    ("+ -", "auto-refresh interval up / down (off, 5s .. 60s)"),
+    ("< >", "sort by previous / next column"),
+    ("o", "reverse sort order"),
+    ("N A", "sort by name / age"),
+    ("0-9", "quick views (header shows the map)"),
+    ("H", "AWS CLI calls this screen made: running, then finished, with time and result"),
+    ("?", "this help"),
+];
+
+const INTERVALS: &[u64] = &[0, 5, 10, 15, 30, 60];
+const TAIL_CAP: usize = 50_000;
+const TAIL_EVERY: Duration = Duration::from_secs(2);
+
+static NEXT_SCREEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub struct Frame {
+    /// Keys this screen's command log.
+    pub id: u64,
+    pub view: View,
+    pub table: Table,
+    pub sel: usize,
+    pub offset: usize,
+    pub filter: String,
+    pub sort: Option<(usize, bool)>,
+    pub loading: bool,
+    /// When the current fetch started, for the spinner's elapsed time.
+    pub load_started: Instant,
+    pub loaded: bool,
+    pub error: Option<AwsError>,
+    pub seq: u64,
+    pub wrap: bool,
+    /// Logs: show each line's time (k9s `t`).
+    pub show_time: bool,
+    /// Set while live tail polls; clearing it stops the poller.
+    pub tail: Option<Arc<AtomicBool>>,
+}
+
+impl Frame {
+    fn new(view: View) -> Self {
+        Frame {
+            id: NEXT_SCREEN.fetch_add(1, Ordering::Relaxed), view, table: Table::default(), sel: 0, offset: 0, filter: String::new(), sort: None, loading: false, load_started: Instant::now(),
+            loaded: false, error: None, seq: 0, wrap: true, show_time: true, tail: None,
+        }
+    }
+
+    /// Row indexes after filter and sort, in display order.
+    pub fn visible(&self) -> Vec<usize> {
+        let rows = &self.table.rows;
+        let re = filter_re(&self.filter);
+        let mut idx: Vec<usize> = (0..rows.len())
+            .filter(|&i| re.as_ref().is_none_or(|(r, inv)| r.is_match(&rows[i].cells.join(" ")) != *inv))
+            .collect();
+        if let Some((c, desc)) = self.sort {
+            let cell = |i: usize| sort_key(rows[i].cells.get(c).map(String::as_str).unwrap_or(""));
+            idx.sort_by(|&a, &b| cell(a).partial_cmp(&cell(b)).unwrap_or(std::cmp::Ordering::Equal));
+            if desc {
+                idx.reverse();
+            }
+        }
+        idx
+    }
+
+    pub fn selected(&self) -> Option<&Row> {
+        self.visible().get(self.sel).map(|&i| &self.table.rows[i])
+    }
+
+    fn stop_tail(&mut self) {
+        if let Some(run) = self.tail.take() {
+            run.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn filter_re(f: &str) -> Option<(Regex, bool)> {
+    if f.is_empty() || f == "!" {
+        return None;
+    }
+    let (inv, pat) = f.strip_prefix('!').map_or((false, f), |p| (true, p));
+    Regex::new(&format!("(?i){pat}"))
+        .or_else(|_| Regex::new(&format!("(?i){}", regex::escape(pat))))
+        .ok()
+        .map(|r| (r, inv))
+}
+
+/// What the command line asked for.
+#[derive(Default)]
+pub struct Start {
+    pub profile: Option<String>,
+    pub region: Option<String>,
+    pub cluster: Option<String>,
+    pub service: Option<String>,
+    pub command: Option<String>,
+    pub refresh: Option<u64>,
+}
+
+pub fn canonical(word: &str) -> Option<&'static str> {
+    COMMANDS.iter().find(|(a, _)| a.contains(&word)).map(|(a, _)| a[0])
+}
+
+pub struct App {
+    /// Which parts of the screen to hide (--headless, --logoless, --crumbsless).
+    pub chrome: crate::ui::Chrome,
+    pub aws: Arc<Aws>,
+    pub arn: Option<String>,
+    pub account: Option<String>,
+    pub ident_err: Option<String>,
+    pub sso_expired: bool,
+    pub stack: Vec<Frame>,
+    pub mode: Mode,
+    pub interval: u64,
+    pub next_refresh: Instant,
+    pub flash: Option<(String, bool, Instant)>,
+    pub page: usize,
+    pub quit: bool,
+    cluster: Option<String>,
+    service: Option<String>,
+    tx: Sender<Msg>,
+    seq: u64,
+}
+
+impl App {
+    /// k9s-style start. Without flags: pick a profile, then a region, then clusters.
+    /// Flags jump ahead; the screens in between are stacked (not loaded) so Esc walks back up.
+    pub fn new(start: Start, tx: Sender<Msg>) -> Self {
+        let known = crate::aws::profiles();
+        let pick_profile = start.profile.is_none() && known.len() > 1;
+        // A single configured profile is used as is; none means the default credential chain.
+        let profile = start.profile.clone().or_else(|| (known.len() == 1).then(|| known[0].0.clone())).unwrap_or_default();
+        // A cluster, service or command implies a region: the profile's own when none is given.
+        let jump = start.cluster.is_some() || start.command.is_some();
+        let region = start.region.clone().or_else(|| jump.then(|| default_region(&profile)));
+        let home = region.clone().unwrap_or_else(|| default_region(&profile));
+        let mut app = App {
+            chrome: Default::default(), aws: Arc::new(Aws::new(Ctx { profile, region: home })), arn: None, account: None, ident_err: None, sso_expired: false,
+            stack: vec![], mode: Mode::Normal, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
+            quit: false, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
+        };
+        if pick_profile {
+            app.replace_root(View::Profiles);
+            return app;
+        }
+        app.identity();
+        if region.is_none() {
+            app.replace_root(View::Regions);
+            return app;
+        }
+        let mut views = vec![View::Clusters];
+        if let Some(c) = &start.cluster {
+            views.push(View::Services { cluster: c.clone() });
+            if let Some(s) = &start.service {
+                views.push(View::Tasks { cluster: c.clone(), service: Some(s.clone()) });
+            }
+        }
+        app.stack = views.into_iter().map(Frame::new).collect();
+        match &start.command {
+            Some(cmd) => {
+                // A service-scoped command keeps the trail above it; any other command is a new root, as in k9s.
+                let canon = canonical(cmd.split_whitespace().next().unwrap_or(""));
+                if matches!(canon, Some("events") | Some("rollout") | Some("failures")) && app.service.is_some() {
+                    let (c, s) = (app.cluster.clone().unwrap_or_default(), app.service.clone().unwrap_or_default());
+                    app.push(match canon {
+                        Some("events") => View::Events { cluster: c, service: s },
+                        Some("failures") => View::Failures { cluster: c, service: Some(s) },
+                        _ => View::Rollout { cluster: c, service: s },
+                    });
+                } else {
+                    app.exec(cmd);
+                }
+            }
+            None => app.load(),
+        }
+        app
+    }
+
+    pub fn top(&self) -> &Frame {
+        self.stack.last().expect("stack never empty")
+    }
+    fn top_mut(&mut self) -> &mut Frame {
+        self.stack.last_mut().expect("stack never empty")
+    }
+
+    /// Whether the caller's role reads as read-only by name. s9s never writes either way.
+    pub fn read_only_role(&self) -> bool {
+        self.arn.as_ref().is_some_and(|a| {
+            let role = a.to_lowercase();
+            ["readonly", "read-only", "viewonly", "view-only", "securityaudit"].iter().any(|k| role.contains(k))
+        })
+    }
+
+    fn identity(&mut self) {
+        let (aws, tx) = (self.aws.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let result = aws.call("sts", "get-caller-identity", &[]);
+            let _ = tx.send(Msg::Identity { ctx: aws.ctx.clone(), result });
+        });
+    }
+
+    fn load(&mut self) {
+        self.seq += 1;
+        let seq = self.seq;
+        let (aws, tx) = (self.aws.on_screen(self.top().id), self.tx.clone());
+        let f = self.top_mut();
+        f.seq = seq;
+        f.loading = true;
+        f.load_started = Instant::now();
+        let view = f.view.clone();
+        std::thread::spawn(move || {
+            let result = view.fetch(&aws);
+            let _ = tx.send(Msg::Loaded { seq, result });
+        });
+        self.next_refresh = Instant::now() + Duration::from_secs(self.interval.max(1));
+    }
+
+    fn push(&mut self, view: View) {
+        self.stack.push(Frame::new(view));
+        self.load();
+    }
+
+    fn pop(&mut self) {
+        if self.stack.len() > 1 {
+            self.stack.pop().unwrap().stop_tail();
+            if self.top().view.auto_refresh() {
+                self.load();
+            }
+        }
+    }
+
+    fn replace_root(&mut self, view: View) {
+        for f in &mut self.stack {
+            f.stop_tail();
+        }
+        self.stack = vec![Frame::new(view)];
+        self.load();
+    }
+
+    pub fn shutdown(&mut self) {
+        for f in &mut self.stack {
+            f.stop_tail();
+        }
+    }
+
+    fn set_profile(&mut self, profile: String) {
+        let region = default_region(&profile);
+        self.aws = Arc::new(Aws::new(Ctx { profile, region }));
+        (self.arn, self.account, self.ident_err, self.cluster, self.service) = (None, None, None, None, None);
+        self.identity();
+    }
+
+    fn set_region(&mut self, region: &str) {
+        self.aws = Arc::new(self.aws.in_region(region));
+        (self.cluster, self.service) = (None, None);
+    }
+
+    pub fn flash(&mut self, msg: impl Into<String>, bad: bool) {
+        self.flash = Some((msg.into(), bad, Instant::now()));
+    }
+
+    pub fn on_msg(&mut self, m: Msg) {
+        match m {
+            Msg::Loaded { seq, result } => {
+                if let Err(AwsError::SsoExpired(_)) = &result {
+                    self.sso_expired = true;
+                } else if result.is_ok() {
+                    self.sso_expired = false;
+                }
+                let Some(f) = self.stack.iter_mut().find(|f| f.seq == seq) else { return };
+                f.loading = false;
+                match result {
+                    Ok(t) => {
+                        let keep = f.selected().map(|r| r.id.clone());
+                        let first = !f.loaded;
+                        f.table = t;
+                        f.error = None;
+                        f.loaded = true;
+                        let vis = f.visible();
+                        // Logs open on the newest line, except head, which opens on the first.
+                        f.sel = if first && matches!(&f.view, View::Logs { opts, .. } if opts.since != Since::Head) {
+                            vis.len().saturating_sub(1)
+                        } else {
+                            keep.and_then(|id| vis.iter().position(|&i| f.table.rows[i].id == id)).unwrap_or(f.sel.min(vis.len().saturating_sub(1)))
+                        };
+                        // Logs follow by default, like k9s; f stops and restarts it.
+                        if first && matches!(&f.view, View::Logs { opts, .. } if opts.since != Since::Head) {
+                            self.toggle_tail();
+                        }
+                    }
+                    Err(e) => f.error = Some(e),
+                }
+            }
+            Msg::Identity { ctx, result } => {
+                if ctx != self.aws.ctx {
+                    return;
+                }
+                match result {
+                    Ok(v) => {
+                        self.arn = v["Arn"].as_str().map(String::from);
+                        self.account = v["Account"].as_str().map(String::from);
+                        self.ident_err = None;
+                        self.sso_expired = false;
+                    }
+                    Err(e) => {
+                        self.sso_expired = matches!(e, AwsError::SsoExpired(_));
+                        self.ident_err = Some(e.to_string());
+                    }
+                }
+            }
+            Msg::Tail { seq, rows, skipped } => {
+                if skipped {
+                    self.flash("live tail fell behind: lines arrive faster than one poll can read, some were skipped. p narrows", true);
+                }
+                let Some(f) = self.stack.iter_mut().find(|f| f.seq == seq) else { return };
+                let at_end = f.sel + 1 >= f.visible().len();
+                f.table.rows.extend(rows);
+                if f.table.rows.len() > TAIL_CAP {
+                    f.table.rows.drain(..f.table.rows.len() - TAIL_CAP);
+                }
+                if at_end {
+                    f.sel = f.visible().len().saturating_sub(1);
+                }
+            }
+            Msg::ScaleInfo { desired, capacity } => {
+                let Mode::Scale(form) = &mut self.mode else { return };
+                form.loading = false;
+                match (desired, capacity) {
+                    (Err(e), _) | (_, Err(e)) => form.error = Some(e.to_string()),
+                    (Ok(d), Ok(c)) => {
+                        if let Some(d) = d {
+                            form.fields.push(Field { label: "Desired", current: d, input: d.to_string() });
+                        }
+                        if let Some((_, _, _, min, max)) = &c {
+                            form.fields.push(Field { label: "Min", current: *min, input: min.to_string() });
+                            form.fields.push(Field { label: "Max", current: *max, input: max.to_string() });
+                        } else {
+                            form.error = Some("no autoscaling target: only the desired count can change".into());
+                        }
+                        form.capacity = c;
+                    }
+                }
+            }
+            Msg::Scaled(r) => {
+                if matches!(self.mode, Mode::Scale(_)) {
+                    self.mode = Mode::Normal;
+                }
+                match r {
+                    Ok(m) => self.flash(m, false),
+                    Err(m) => self.flash(m, true),
+                }
+                self.load();
+            }
+            Msg::TailEnded { seq, err } => {
+                if let Some(f) = self.stack.iter_mut().find(|f| f.seq == seq) {
+                    if f.tail.take().is_some() {
+                        let msg = if err.trim().is_empty() { "live tail ended".to_string() } else { format!("live tail ended: {}", err.trim()) };
+                        self.flash(msg, true);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn tick(&mut self) {
+        if self.flash.as_ref().is_some_and(|f| f.2.elapsed() > Duration::from_secs(5)) {
+            self.flash = None;
+        }
+        let f = self.top();
+        if self.interval > 0 && Instant::now() >= self.next_refresh && f.view.auto_refresh() && !f.loading {
+            self.load();
+        }
+    }
+
+    pub fn refresh_in(&self) -> Option<u64> {
+        (self.interval > 0 && self.top().view.auto_refresh()).then(|| self.next_refresh.saturating_duration_since(Instant::now()).as_secs())
+    }
+
+    // ---------- keys ----------
+
+    /// Scroll keys for an overlay; None closes it.
+    fn scroll(&self, k: KeyEvent, off: u16) -> Option<u16> {
+        let page = self.page.max(1) as u16;
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        Some(match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('H') | KeyCode::Enter => return None,
+            KeyCode::Down | KeyCode::Char('j') => off.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => off.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => off.saturating_add(page),
+            KeyCode::Char('d') | KeyCode::Char('f') if ctrl => off.saturating_add(page),
+            KeyCode::PageUp => off.saturating_sub(page),
+            KeyCode::Char('u') | KeyCode::Char('b') if ctrl => off.saturating_sub(page),
+            KeyCode::Char('g') | KeyCode::Home => 0,
+            KeyCode::Char('G') | KeyCode::End => u16::MAX,
+            _ => off,
+        })
+    }
+
+    pub fn on_key(&mut self, k: KeyEvent) {
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Help(off) => self.mode = self.scroll(k, off).map_or(Mode::Normal, Mode::Help),
+            Mode::Calls(off) => self.mode = self.scroll(k, off).map_or(Mode::Normal, Mode::Calls),
+            Mode::Scale(form) => self.scale_key(form, k),
+            Mode::Normal => self.normal_key(k),
+            Mode::Command(s) => self.mode = self.edit(s, k, Mode::Command, |app, s| app.exec(&s)),
+            Mode::Filter(s) => {
+                self.mode = self.edit(s, k, Mode::Filter, |app, s| app.top_mut().filter = s);
+                if let Mode::Filter(s) = &self.mode {
+                    let s = s.clone();
+                    let f = self.top_mut();
+                    f.filter = s;
+                    // Logs stay at the newest line, the way a followed log reads.
+                    f.sel = if matches!(f.view, View::Logs { .. }) { f.visible().len().saturating_sub(1) } else { 0 };
+                } else if k.code == KeyCode::Esc {
+                    self.top_mut().filter.clear();
+                }
+            }
+            Mode::Pattern(s) => {
+                self.mode = self.edit(s, k, Mode::Pattern, |app, pat| {
+                    if let View::Logs { src, opts, .. } = app.top().view.clone() {
+                        app.replace_top(View::Logs { src, pattern: pat, opts });
+                    }
+                })
+            }
+        }
+    }
+
+    /// Line editing shared by the prompts. Returns the next mode.
+    fn edit(&mut self, mut s: String, k: KeyEvent, keep: fn(String) -> Mode, done: impl FnOnce(&mut App, String)) -> Mode {
+        match k.code {
+            KeyCode::Esc => return Mode::Normal,
+            KeyCode::Enter => {
+                done(self, s);
+                return std::mem::replace(&mut self.mode, Mode::Normal);
+            }
+            KeyCode::Backspace => {
+                s.pop();
+            }
+            KeyCode::Tab => {
+                if let Some(c) = completions(&s).first() {
+                    s = format!("{c} ");
+                }
+            }
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => s.clear(),
+            KeyCode::Char(c) => s.push(c),
+            _ => {}
+        }
+        keep(s)
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        let len = self.top().visible().len();
+        let f = self.top_mut();
+        f.sel = (f.sel as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
+    }
+
+    fn normal_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if !ctrl && self.log_key(k.code) {
+            return;
+        }
+        let page = self.page.max(1) as isize;
+        match k.code {
+            KeyCode::Char(':') => self.mode = Mode::Command(String::new()),
+            KeyCode::Char('/') => self.mode = Mode::Filter(self.top().filter.clone()),
+            KeyCode::Char('?') => self.mode = Mode::Help(0),
+            KeyCode::Char('H') => self.mode = Mode::Calls(0),
+            KeyCode::Esc => {
+                if self.top().filter.is_empty() {
+                    self.pop();
+                } else {
+                    self.top_mut().filter.clear();
+                }
+            }
+            KeyCode::Char('q') => {
+                if self.stack.len() > 1 { self.pop() } else { self.quit = true }
+            }
+            KeyCode::Char('d') if ctrl => self.move_sel(page),
+            KeyCode::Char('u') if ctrl => self.move_sel(-page),
+            KeyCode::Char('f') if ctrl => self.move_sel(page),
+            KeyCode::Char('b') if ctrl => self.move_sel(-page),
+            KeyCode::Char('r') => {
+                self.load();
+                if self.sso_expired || self.arn.is_none() {
+                    self.identity();
+                }
+            }
+            KeyCode::PageDown => self.move_sel(page),
+            KeyCode::PageUp => self.move_sel(-page),
+            KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.top_mut().sel = 0,
+            KeyCode::Char('G') | KeyCode::End => self.move_sel(isize::MAX / 2),
+            KeyCode::Enter => self.enter(),
+            KeyCode::Char('d') => self.describe(false),
+            KeyCode::Char('y') => self.describe(true),
+            KeyCode::Char('l') => self.open_logs(),
+            KeyCode::Char('f') => {
+                if matches!(self.top().view, View::Logs { .. }) { self.toggle_tail() } else { self.open_logs() }
+            }
+            KeyCode::Char('c') => self.copy_launch_command(),
+            KeyCode::Char('t') if matches!(self.top().view, View::Logs { .. }) => {
+                let f = self.top_mut();
+                f.show_time = !f.show_time;
+            }
+            KeyCode::Char('w') => {
+                let f = self.top_mut();
+                f.wrap = !f.wrap;
+            }
+            KeyCode::Char('s') if ctrl => self.save(),
+            KeyCode::Char('s') => self.save(),
+            KeyCode::Char('e') => match self.service_of_view() {
+                Some((cluster, service)) => self.push(View::Events { cluster, service }),
+                None => self.flash("e works on a service", true),
+            },
+            KeyCode::Char('m') => match self.top().view.metrics(self.top().selected()) {
+                Some(target) => self.push(View::Metrics { target }),
+                None => self.flash("no metrics for this view", true),
+            },
+            KeyCode::Char('p') => match (&self.top().view, self.top().selected()) {
+                (View::Logs { pattern, .. }, _) => self.mode = Mode::Pattern(pattern.clone()),
+                (View::ScalableTargets { ns }, Some(r)) => {
+                    let v = View::ScalingPolicies { ns: ns.clone(), resource: Some(r.id.clone()) };
+                    self.push(v)
+                }
+                _ => self.flash("p works in log and scaling views", true),
+            },
+            KeyCode::Char('F') => match self.service_of_view() {
+                Some((cluster, service)) => self.push(View::Failures { cluster, service: Some(service) }),
+                None => match self.cluster.clone() {
+                    Some(cluster) => self.push(View::Failures { cluster, service: None }),
+                    None => self.flash("F works on a service or inside a cluster", true),
+                },
+            },
+            KeyCode::Char('R') => match self.service_of_view() {
+                Some((cluster, service)) => {
+                    self.service = Some(service.clone());
+                    self.push(View::Rollout { cluster, service })
+                }
+                None => self.flash("R works on a service (services, tasks of a service, events)", true),
+            },
+            KeyCode::Char('+') | KeyCode::Char('=') => self.step_interval(1),
+            KeyCode::Char('-') => self.step_interval(-1),
+            KeyCode::Char('<') => self.sort_step(-1),
+            KeyCode::Char('>') => self.sort_step(1),
+            KeyCode::Char('o') => {
+                let f = self.top_mut();
+                f.sort = Some(f.sort.map_or((0, true), |(c, d)| (c, !d)));
+            }
+            KeyCode::Char('N') => self.sort_by(0),
+            KeyCode::Char('A') => match self.top().table.headers.iter().position(|h| h.contains("AGE")) {
+                Some(c) => self.sort_by(c),
+                None => self.flash("no AGE column here", true),
+            },
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if let Some((_, cmd)) = QUICK.iter().find(|(k, _)| *k == c) {
+                    self.exec(cmd);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The service the current view is about: the selected row in services, else the view's own service.
+    fn service_of_view(&self) -> Option<(String, String)> {
+        match (&self.top().view, self.top().selected()) {
+            (View::Services { cluster }, Some(r)) => Some((cluster.clone(), r.id.clone())),
+            (View::Tasks { cluster, service: Some(sv) } | View::Events { cluster, service: sv } | View::Rollout { cluster, service: sv }, _) => {
+                Some((cluster.clone(), sv.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)] // parked: `s` is unbound until scaling writes are approved
+    fn open_scale(&mut self) {
+        let mut form = ScaleForm {
+            title: String::new(), service: None, capacity: None, fields: vec![], focus: 0,
+            loading: false, confirm: false, applying: false, error: None,
+        };
+        if let (View::ScalableTargets { ns }, Some(r)) = (&self.top().view, self.top().selected()) {
+            let j = &r.json;
+            let (min, max) = (crate::logic::n(j, "/MinCapacity"), crate::logic::n(j, "/MaxCapacity"));
+            form.title = format!("{ns} {}", r.id);
+            form.fields = vec![Field { label: "Min", current: min, input: min.to_string() }, Field { label: "Max", current: max, input: max.to_string() }];
+            form.capacity = Some((ns.clone(), r.id.clone(), crate::logic::s(j, "/ScalableDimension"), min, max));
+            self.mode = Mode::Scale(form);
+            return;
+        }
+        let Some((cluster, service)) = self.service_of_view() else {
+            return self.flash("s scales a service, or a target in :scaling", true);
+        };
+        form.title = format!("service {cluster}/{service}");
+        form.service = Some((cluster.clone(), service.clone()));
+        form.loading = true;
+        self.mode = Mode::Scale(form);
+        let (aws, tx) = (self.aws.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let mut t = crate::views::Table::default();
+            let desired = crate::views::describe_services(&aws, &cluster, &[service.clone()], &mut t)
+                .and_then(|v| match t.notes.first() {
+                    Some(n) => Err(AwsError::Api(n.text.clone())),
+                    None => Ok(v.first().map(|x| crate::logic::n(x, "/desiredCount"))),
+                });
+            let resource = format!("service/{cluster}/{service}");
+            let capacity = aws
+                .call("application-autoscaling", "describe-scalable-targets", &["--service-namespace".into(), "ecs".into(), "--resource-ids".into(), resource])
+                .map(|v| {
+                    crate::logic::arr(&v, "/ScalableTargets").first().map(|x| {
+                        use crate::logic::{n, s};
+                        (s(x, "/ServiceNamespace"), s(x, "/ResourceId"), s(x, "/ScalableDimension"), n(x, "/MinCapacity"), n(x, "/MaxCapacity"))
+                    })
+                });
+            let _ = tx.send(Msg::ScaleInfo { desired, capacity });
+        });
+    }
+
+    fn scale_key(&mut self, mut form: ScaleForm, k: KeyEvent) {
+        if form.applying {
+            self.mode = Mode::Scale(form);
+            return;
+        }
+        let n = form.fields.len().max(1);
+        if form.confirm {
+            match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let changes = form.changes();
+                    form.applying = true;
+                    let (aws, tx) = (self.aws.clone(), self.tx.clone());
+                    std::thread::spawn(move || {
+                        let mut done = vec![];
+                        let mut result = Ok(());
+                        for c in changes.unwrap_or_default() {
+                            match aws.scale(&c) {
+                                Ok(_) => done.push(format!("{:?}", c.command().1)),
+                                Err(e) => {
+                                    result = Err(e.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = tx.send(Msg::Scaled(match result {
+                            Ok(()) => Ok(format!("scaled: {}", done.join(", ").replace('"', ""))),
+                            Err(e) if done.is_empty() => Err(format!("scale failed, nothing changed: {e}")),
+                            Err(e) => Err(format!("scale PARTIALLY applied ({} done), then failed: {e}", done.join(", ").replace('"', ""))),
+                        }));
+                    });
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    form.confirm = false;
+                }
+                _ => {}
+            }
+            self.mode = Mode::Scale(form);
+            return;
+        }
+        match k.code {
+            KeyCode::Esc => return,
+            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => form.focus = (form.focus + 1) % n,
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => form.focus = (form.focus + n - 1) % n,
+            KeyCode::Char(c @ '0'..='9') => {
+                if let Some(f) = form.fields.get_mut(form.focus) {
+                    f.input.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(f) = form.fields.get_mut(form.focus) {
+                    f.input.pop();
+                }
+            }
+            KeyCode::Char('+') | KeyCode::Char('-') => {
+                if let Some(f) = form.fields.get_mut(form.focus) {
+                    let v = f.input.parse::<i64>().unwrap_or(f.current) + if k.code == KeyCode::Char('+') { 1 } else { -1 };
+                    f.input = v.max(0).to_string();
+                }
+            }
+            KeyCode::Enter if !form.loading => match form.changes() {
+                Ok(_) => {
+                    form.error = None;
+                    form.confirm = true;
+                }
+                Err(e) => form.error = Some(e),
+            },
+            _ => {}
+        }
+        self.mode = Mode::Scale(form);
+    }
+
+    /// The command line that reopens this view, or the nearest view above it that the CLI can open.
+    pub fn launch_command(&self) -> (String, bool) {
+        let bin = std::env::args().next().map(|a| a.rsplit('/').next().unwrap_or(&a).to_string()).unwrap_or_else(|| "s9s".into());
+        let q = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
+        let ctx = &self.aws.ctx;
+        for (depth, fr) in self.stack.iter().rev().enumerate() {
+            let svc = |c: &str, s: &str, cmd: Option<&str>| (Some(c.to_string()), Some(s.to_string()), cmd.map(String::from));
+            let (cluster, service, command): (Option<String>, Option<String>, Option<String>) = match &fr.view {
+                View::Profiles => (None, None, Some("profile".into())),
+                View::Regions => (None, None, Some("region".into())),
+                View::Clusters => (None, None, None),
+                View::Services { cluster } => (Some(cluster.clone()), None, None),
+                View::Tasks { cluster, service: Some(s) } => svc(cluster, s, None),
+                View::Tasks { cluster, service: None } => (Some(cluster.clone()), None, Some("tasks".into())),
+                View::Events { cluster, service } => svc(cluster, service, Some("events")),
+                View::Rollout { cluster, service } => svc(cluster, service, Some("rollout")),
+                View::Failures { cluster, service: Some(s) } => svc(cluster, s, Some("failures")),
+                View::Failures { cluster, service: None } => (Some(cluster.clone()), None, Some("failures".into())),
+                View::TaskDefFamilies => (None, None, Some("taskdefs".into())),
+                View::LogGroups => (None, None, Some("logs".into())),
+                View::Logs { src: LogSrc::Group(g), pattern, .. } => (None, None, Some(format!("logs {g} {pattern}").trim_end().to_string())),
+                View::LoadBalancers => (None, None, Some("lb".into())),
+                View::TargetGroups { lb: None } => (None, None, Some("tg".into())),
+                View::ScalableTargets { ns } => (None, None, Some(format!("scaling {ns}"))),
+                View::ScalingPolicies { ns, resource: None } => (None, None, Some(format!("policies {ns}"))),
+                View::ScalingActivities { ns, resource: None } => (None, None, Some(format!("activities {ns}"))),
+                View::Ec2 => (None, None, Some("ec2".into())),
+                View::EcrRepos => (None, None, Some("ecr".into())),
+                View::Sqs => (None, None, Some("sqs".into())),
+                View::Rds => (None, None, Some("rds".into())),
+                View::Lambda => (None, None, Some("lambda".into())),
+                _ => continue,
+            };
+            let mut parts = vec![bin.clone()];
+            if !ctx.profile.is_empty() {
+                parts.extend(["-p".into(), q(&ctx.profile)]);
+            }
+            if !matches!(fr.view, View::Profiles | View::Regions) {
+                parts.extend(["-r".into(), q(&ctx.region)]);
+            }
+            if let Some(c) = cluster {
+                parts.extend(["--cluster".into(), q(&c)]);
+            }
+            if let Some(s) = service {
+                parts.extend(["-s".into(), q(&s)]);
+            }
+            if let Some(c) = command {
+                parts.extend(["-c".into(), q(&c)]);
+            }
+            return (parts.join(" "), depth == 0);
+        }
+        (bin, false)
+    }
+
+    fn copy_launch_command(&mut self) {
+        let (cmd, exact) = self.launch_command();
+        let note = if exact { String::new() } else { " (nearest view the command line can open)".into() };
+        match copy_to_clipboard(&cmd) {
+            Ok(()) => self.flash(format!("copied: {cmd}{note}"), false),
+            Err(e) => self.flash(format!("{cmd}{note}  (clipboard failed: {e})"), true),
+        }
+    }
+
+    fn step_interval(&mut self, d: isize) {
+        let i = INTERVALS.iter().position(|&x| x == self.interval).unwrap_or(2) as isize;
+        self.interval = INTERVALS[(i + d).clamp(0, INTERVALS.len() as isize - 1) as usize];
+        self.next_refresh = Instant::now() + Duration::from_secs(self.interval);
+        let msg = if self.interval == 0 { "auto-refresh off".into() } else { format!("auto-refresh every {}s", self.interval) };
+        self.flash(msg, false);
+    }
+
+    fn sort_by(&mut self, c: usize) {
+        let f = self.top_mut();
+        f.sort = Some(match f.sort {
+            Some((cc, d)) if cc == c => (c, !d),
+            _ => (c, false),
+        });
+    }
+
+    fn sort_step(&mut self, d: isize) {
+        let n = self.top().table.headers.len().max(1) as isize;
+        let f = self.top_mut();
+        let (c, desc) = f.sort.unwrap_or((if d > 0 { n as usize - 1 } else { 0 }, false));
+        f.sort = Some((((c as isize + d).rem_euclid(n)) as usize, desc));
+    }
+
+    fn enter(&mut self) {
+        let Some(row) = self.top().selected().cloned() else { return };
+        match &self.top().view {
+            View::Profiles => {
+                self.set_profile(row.id.clone());
+                return self.push(View::Regions);
+            }
+            View::Regions => {
+                self.set_region(&row.id);
+                return self.push(View::Clusters);
+            }
+            View::Clusters => self.cluster = Some(row.id.clone()),
+            View::Services { .. } => self.service = Some(row.id.clone()),
+            _ => {}
+        }
+        if let Some(v) = self.top().view.drill(&row) {
+            self.push(v);
+        }
+    }
+
+    fn describe(&mut self, raw: bool) {
+        let f = self.top();
+        if matches!(f.view, View::Detail { .. }) {
+            return;
+        }
+        let Some(row) = f.selected() else { return };
+        // Structured log lines: describe the parsed message.
+        let doc = match (&f.view, row.json.get("message").and_then(Value::as_str)) {
+            (View::Logs { .. }, Some(m)) => serde_json::from_str::<Value>(m).unwrap_or_else(|_| row.json.clone()),
+            _ if row.json.is_null() => {
+                Value::Object(f.table.headers.iter().cloned().zip(row.cells.iter().map(|c| Value::String(c.clone()))).collect())
+            }
+            _ => row.json.clone(),
+        };
+        let lines = if raw {
+            serde_json::to_string_pretty(&doc).unwrap_or_default().lines().map(String::from).collect()
+        } else {
+            crate::describe::describe(&f.view, row).unwrap_or_else(|| to_yaml(&doc))
+        };
+        // Name the page after what the row shows first (a name), not the ID buried in its ARN.
+        let name = row.cells.first().filter(|c| !c.is_empty()).cloned().unwrap_or_else(|| short(&row.id).to_string());
+        self.push(View::Detail { title: format!("{}({name})", if raw { "json" } else { "describe" }), lines });
+    }
+
+    fn open_logs(&mut self) {
+        let f = self.top();
+        match f.selected().and_then(|r| f.view.log_src(r)) {
+            Some(src) => self.push(View::Logs { src, pattern: String::new(), opts: LogOpts::default() }),
+            None => self.flash("no logs for this selection", true),
+        }
+    }
+
+    /// k9s's log-view keys: 0-6 where to start, a all containers, m mark, C clear, c copy.
+    fn log_key(&mut self, code: KeyCode) -> bool {
+        let View::Logs { src, pattern, opts } = self.top().view.clone() else { return false };
+        let KeyCode::Char(c) = code else { return false };
+        let since = match c {
+            '0' => Since::Tail,
+            '1' => Since::Head,
+            '2' => Since::Secs(60),
+            '3' => Since::Secs(300),
+            '4' => Since::Secs(900),
+            '5' => Since::Secs(1800),
+            '6' => Since::Secs(3600),
+            'a' if matches!(src, LogSrc::Service { .. }) => {
+                self.replace_top(View::Logs { src, pattern, opts: LogOpts { all: !opts.all, ..opts } });
+                return true;
+            }
+            'm' => {
+                let f = self.top_mut();
+                let at_end = f.sel + 1 >= f.visible().len();
+                let id = format!("mark-{}", f.table.rows.len());
+                let now = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+                f.table.rows.push(Row { id, cells: vec![now, String::new(), "-".repeat(40)], health: crate::logic::Health::None, json: Value::String(MARK.into()) });
+                if at_end {
+                    f.sel = f.visible().len().saturating_sub(1);
+                }
+                return true;
+            }
+            'C' => {
+                let f = self.top_mut();
+                f.table.rows.clear();
+                (f.sel, f.offset) = (0, 0);
+                return true;
+            }
+            'c' => {
+                let (text, n) = log_text(self.top());
+                match copy_to_clipboard(&text) {
+                    Ok(()) => self.flash(format!("copied {n} lines"), false),
+                    Err(e) => self.flash(e, true),
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.replace_top(View::Logs { src, pattern, opts: LogOpts { since, ..opts } });
+        true
+    }
+
+    /// Swaps the top view for another, stopping its tail (a log view reopened with new options).
+    fn replace_top(&mut self, view: View) {
+        self.top_mut().stop_tail();
+        self.stack.pop();
+        self.push(view);
+    }
+
+    fn toggle_tail(&mut self) {
+        let aws = self.aws.on_screen(self.top().id);
+        let tx = self.tx.clone();
+        let f = self.top_mut();
+        if f.tail.is_some() {
+            f.stop_tail();
+            self.flash("live tail stopped (f resumes)", false);
+            return;
+        }
+        let Some(sel) = f.table.tail.clone() else {
+            self.flash("live tail needs a loaded log view", true);
+            return;
+        };
+        // Resume after the newest line on screen, skipping lines already shown.
+        let mut seen: HashMap<String, i64> =
+            f.table.rows.iter().map(|r| (r.id.clone(), r.json["timestamp"].as_i64().unwrap_or(0))).collect();
+        let mut cursor = seen.values().copied().max().unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let run = Arc::new(AtomicBool::new(true));
+        let (seq, alive) = (f.seq, run.clone());
+        std::thread::spawn(move || {
+            while alive.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                match tail_poll(&aws, &sel, &mut cursor, &mut seen) {
+                    Ok((rows, skipped)) if alive.load(Ordering::Relaxed) => {
+                        if tx.send(Msg::Tail { seq, rows, skipped }).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => return,
+                    Err(e) => {
+                        let _ = tx.send(Msg::TailEnded { seq, err: e.to_string() });
+                        return;
+                    }
+                }
+                while alive.load(Ordering::Relaxed) && started.elapsed() < TAIL_EVERY {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        f.tail = Some(run);
+        f.sel = f.visible().len().saturating_sub(1);
+    }
+
+    /// Saves what is on screen (after filter and sort) to ~/Downloads. Logs, tailed lines included,
+    /// go out as a plain .log with full timestamps; tables as tab-separated text.
+    fn save(&mut self) {
+        let f = self.top();
+        let is_logs = matches!(f.view, View::Logs { .. });
+        let (out, n) = if is_logs {
+            log_text(f)
+        } else {
+            let mut out = String::new();
+            if !f.view.is_text() {
+                out.push_str(&f.table.headers.join("\t"));
+                out.push('\n');
+            }
+            let vis = f.visible();
+            for &i in &vis {
+                out.push_str(&f.table.rows[i].cells.join("\t"));
+                out.push('\n');
+            }
+            (out, vis.len())
+        };
+        let slug: String = f.view.title().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        let dir = format!("{}/Downloads", std::env::var("HOME").unwrap_or_default());
+        let ext = if is_logs { "log" } else { "txt" };
+        let path = format!("{dir}/s9s-{}-{}.{ext}", slug.trim_matches('-'), chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        let what = if is_logs { format!("{n} lines") } else { format!("{n} rows") };
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, out)) {
+            Ok(()) => self.flash(format!("saved {what} to {path}"), false),
+            Err(e) => self.flash(format!("save failed: {e}"), true),
+        }
+    }
+
+    pub fn exec(&mut self, line: &str) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(&cmd) = words.first() else { return };
+        let arg = words.get(1).map(|s| s.to_string());
+        let canon = canonical(cmd);
+        let need_cluster = |app: &mut App| -> Option<String> {
+            let c = arg.clone().or_else(|| app.cluster.clone());
+            if c.is_none() {
+                app.replace_root(View::Clusters);
+                app.flash("pick a cluster first (Enter)", true);
+            }
+            c
+        };
+        match canon {
+            Some("clusters") => self.replace_root(View::Clusters),
+            Some("services") => {
+                if let Some(cluster) = need_cluster(self) {
+                    self.cluster = Some(cluster.clone());
+                    self.replace_root(View::Services { cluster });
+                }
+            }
+            Some("tasks") => {
+                if let Some(cluster) = need_cluster(self) {
+                    self.cluster = Some(cluster.clone());
+                    self.replace_root(View::Tasks { cluster, service: None });
+                }
+            }
+            Some("events") => match (self.cluster.clone(), self.service.clone()) {
+                (Some(cluster), Some(service)) => self.replace_root(View::Events { cluster, service }),
+                _ => self.flash("open a service first, or press e on one", true),
+            },
+            Some("failures") => {
+                if let Some(cluster) = need_cluster(self) {
+                    self.cluster = Some(cluster.clone());
+                    self.replace_root(View::Failures { cluster, service: None });
+                }
+            }
+            Some("rollout") => match (self.cluster.clone(), self.service.clone()) {
+                (Some(cluster), Some(service)) => self.replace_root(View::Rollout { cluster, service }),
+                _ => self.flash("open a service first, or press R on one", true),
+            },
+            Some("taskdefs") => self.replace_root(View::TaskDefFamilies),
+            Some("logs") => match arg {
+                Some(g) => self.replace_root(View::Logs { src: LogSrc::Group(g), pattern: words[2..].join(" "), opts: LogOpts::default() }),
+                None => self.replace_root(View::LogGroups),
+            },
+            Some("lb") => self.replace_root(View::LoadBalancers),
+            Some("tg") => self.replace_root(View::TargetGroups { lb: None }),
+            Some("scaling") => self.replace_root(View::ScalableTargets { ns: arg.unwrap_or_else(|| "ecs".into()) }),
+            Some("policies") => self.replace_root(View::ScalingPolicies { ns: arg.unwrap_or_else(|| "ecs".into()), resource: None }),
+            Some("activities") => self.replace_root(View::ScalingActivities { ns: arg.unwrap_or_else(|| "ecs".into()), resource: None }),
+            Some("ec2") => self.replace_root(View::Ec2),
+            Some("ecr") => self.replace_root(View::EcrRepos),
+            Some("sqs") => self.replace_root(View::Sqs),
+            Some("rds") => self.replace_root(View::Rds),
+            Some("lambda") => self.replace_root(View::Lambda),
+            Some("profile") => match arg {
+                Some(p) => {
+                    self.set_profile(p);
+                    self.replace_root(View::Regions)
+                }
+                None => self.replace_root(View::Profiles),
+            },
+            Some("region") => match arg {
+                Some(r) => {
+                    self.set_region(&r);
+                    self.replace_root(View::Clusters)
+                }
+                None => self.replace_root(View::Regions),
+            },
+            Some("quit") => self.quit = true,
+            _ => self.flash(format!("unknown command: {cmd}"), true),
+        }
+    }
+}
+
+/// pbcopy, wl-copy or xclip, whichever exists.
+/// A mark row's json; drawn as a rule across the log view.
+pub const MARK: &str = "mark";
+
+/// The visible log lines (after the filter) as text: full date, task tag, message.
+fn log_text(f: &Frame) -> (String, usize) {
+    let vis = f.visible();
+    let mut out = String::new();
+    for &i in &vis {
+        let row = &f.table.rows[i];
+        let at = crate::logic::parse_ts(&row.json["timestamp"])
+            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+            .unwrap_or_else(|| row.cells[0].clone());
+        let task = if row.cells[1].is_empty() { String::new() } else { format!("{} ", row.cells[1]) };
+        out.push_str(&format!("{at} {task}{}\n", row.cells[2]));
+    }
+    (out, vis.len())
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let tools: [(&str, &[&str]); 3] = [("pbcopy", &[]), ("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+    for (bin, args) in tools {
+        let Ok(mut child) = std::process::Command::new(bin).args(args).stdin(std::process::Stdio::piped()).spawn() else { continue };
+        child.stdin.take().map(|mut s| s.write_all(text.as_bytes())).transpose().map_err(|e| e.to_string())?;
+        return child.wait().map_err(|e| e.to_string()).and_then(|st| if st.success() { Ok(()) } else { Err(format!("{bin} failed")) });
+    }
+    Err("no pbcopy, wl-copy or xclip".into())
+}
+
+/// Region for calls before one is chosen: the profile's configured region, then the environment, then us-east-1.
+fn default_region(profile: &str) -> String {
+    crate::aws::profiles()
+        .into_iter()
+        .find(|p| p.0 == profile || (profile.is_empty() && p.0 == "default"))
+        .and_then(|p| p.1)
+        .or_else(|| std::env::var("AWS_REGION").ok())
+        .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
+        .unwrap_or_else(|| "us-east-1".into())
+}
+
+/// Aliases starting with the typed word, canonical names first.
+pub fn completions(input: &str) -> Vec<&'static str> {
+    let w = input.trim_start();
+    if w.contains(' ') {
+        return vec![];
+    }
+    let mut out: Vec<&str> = COMMANDS.iter().flat_map(|(a, _)| a.iter().copied()).filter(|a| a.starts_with(w)).collect();
+    out.sort_by_key(|a| (a.len() != w.len(), !COMMANDS.iter().any(|(x, _)| x[0] == *a)));
+    out
+}

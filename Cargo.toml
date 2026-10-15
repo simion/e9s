@@ -1,0 +1,15 @@
+[package]
+name = "s9s"
+version = "0.1.0"
+edition = "2024"
+description = "A read-only, k9s-style terminal UI for AWS: ECS, CloudWatch Logs, load balancers, autoscaling"
+license = "MIT"
+readme = "README.md"
+keywords = ["aws", "ecs", "tui", "k9s", "cloudwatch"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+chrono = "0.4.45"
+ratatui = "0.30.2"
+regex = "1.13.1"
+serde_json = "1.0.154"

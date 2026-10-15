@@ -1,0 +1,208 @@
+# s9s
+
+A read-only, k9s-style terminal UI for AWS.
+Browse ECS clusters, services, tasks and containers, read and live-tail their CloudWatch logs, and watch a deployment roll, with the same keys as k9s.
+
+It cannot change anything.
+Every AWS call goes through one function (`Aws::call` in `src/aws.rs`) that only lets through `describe-*`, `list-*` and `get-*` operations on an allowlist of services, plus `logs filter-log-events`.
+Credential getters such as `ecr get-login-password` are refused too.
+Environment variable and secret values are stripped from every response before they are shown or saved, so only their names appear.
+
+## Requirements
+
+- AWS CLI v2 on `PATH` (calls run through `aws`, so SSO, profiles and credential processes work exactly as they do for the CLI).
+- A Rust toolchain to build.
+
+## Install
+
+```sh
+cargo install --path .     # builds a `s9s` binary into ~/.cargo/bin
+```
+
+Or, while working on the source:
+
+```sh
+./install.sh               # puts a `s9s` command in ~/.local/bin (BIN_DIR=/other/dir ./install.sh to choose)
+./install.sh --uninstall   # removes it
+```
+
+The installed command is a small launcher that runs this checkout's source.
+When any file under `src/`, `Cargo.toml` or `Cargo.lock` is newer than the built binary, it rebuilds first (a few seconds); otherwise it starts straight away.
+So editing the source and running `s9s` again is all a change needs.
+
+## Run
+
+```sh
+s9s                                                    # pick a profile, then a region, then drill in
+s9s -p prod                                            # skip the profile picker
+s9s -p prod -r us-west-1                               # straight to clusters
+s9s -p prod -r us-west-1 --cluster web                 # that cluster's services
+s9s -p prod -r us-west-1 --cluster web -s api          # that service's tasks
+s9s -p prod -r us-west-1 --cluster web -s api -c rollout   # its rollout watch
+s9s -p prod -r us-west-1 -c 'logs /ecs/api ERROR'      # a log group, filtered
+```
+
+Every screen you can reach with the arrows and Enter can be opened from the command line, the way k9s takes `--context`, `-n` and `-c`.
+The screens in between are stacked behind it, so Esc walks back up as if you had navigated there.
+Press `c` on any screen to copy the command that reopens it (or the nearest screen the command line can open, such as the task list above a container).
+
+| Flag | Meaning |
+|---|---|
+| `-p`, `--profile NAME` | AWS profile (default: `AWS_PROFILE`, the only configured profile, or a picker) |
+| `-a`, `--account ID` | The profile whose `sso_account_id` is `ID`; refuses and lists them if several match |
+| `-r`, `--region REGION` | Region (default: the region scan). A cluster or command without a region uses the profile's region |
+| `--cluster NAME` | Open this ECS cluster's services |
+| `-s`, `--service NAME` | Open this service's tasks (needs `--cluster`) |
+| `-c`, `--command CMD` | Open a view as if `:CMD` were typed inside: `-c rollout`, `-c tasks`, `-c 'logs <group> [pattern]'`, `-c sqs` |
+| `--refresh SECONDS` | Auto-refresh interval; `0` turns it off (default 10) |
+| `--headless` / `--logoless` / `--crumbsless` | Hide the header / the logo / the breadcrumbs |
+| `-h`, `--help` | Usage |
+
+Startup follows k9s: choose where you are, then navigate.
+
+1. **Profile.** `--profile`, else `AWS_PROFILE`, else the only configured profile, else a picker over `~/.aws/config` and `~/.aws/credentials`. With no profiles at all it uses the default credential chain.
+2. **Identity.** The header shows the profile, region, account and role. A role whose name does not read as read-only is shown in yellow, as a reminder; s9s still only reads.
+3. **Region.** Without `--region` it scans every enabled region in parallel and lists ECS clusters, services and running tasks per region, regions with resources first. Enter opens one.
+
+If the SSO session has expired, the header says so and names the command (`aws sso login --profile <name>`); log in and press `r`.
+
+## Keys
+
+| Key | Action |
+|---|---|
+| `:` | Command mode. Tab completes; suggestions show as you type |
+| `/` | Filter rows live: regex, case-insensitive. `!re` inverts. Enter keeps it, Esc clears it. In logs, matches are highlighted and the view stays at the newest line |
+| `Esc` | Clear the filter, else go back one level |
+| `q` | Back one level; quits at the root |
+| `ctrl-c` | Quit |
+| `Enter` | Drill into the selected row |
+| `j` `k` / `↑` `↓` | Move |
+| `g` `G` / `Home` `End` | Top / bottom |
+| `ctrl-d` `ctrl-u` / `PgDn` `PgUp` (also `ctrl-f` `ctrl-b`) | Page down / up |
+| `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; anything else shows as YAML, and a structured log line is parsed first |
+| `y` | Raw JSON of the selection |
+| `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
+| `f` | Logs follow new lines by default; in a log view `f` pauses and resumes. On a resource it opens its logs, like `l` |
+| `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected |
+| `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
+| `w` | Wrap long lines in logs and describe on or off (on by default) |
+| `t` | Logs: show or hide timestamps |
+| `0` `1` `2`-`6` | Logs, as in k9s: start from the newest lines (tail, the default), from the first lines (head, not followed), or 1m, 5m, 15m, 30m, 1h back. A window reads up to 5000 lines per 100 streams and says when it was cut |
+| `a` | Service logs: every container of each task that logs to the same group, tagged `container/task` |
+| `m` / `C` / `c` | Logs: draw a mark line across the view / clear the screen (following continues) / copy the lines shown (after the filter) |
+| `s` / `ctrl-s` | Save the current view (after filter and sort) to `~/Downloads`. Logs save as a `.log` with full timestamps and task ids, including every line tailed so far (the view keeps the last 50,000) |
+| `R` | Rollout watch for the selected service (see below) |
+| `e` | Events of the selected service, newest first, untruncated |
+| `m` | CloudWatch metrics for the selected service, load balancer or target group |
+| `r` / `ctrl-r` | Refresh now (also re-checks identity after an SSO login) |
+| `c` | Copy the command line that reopens this view (pbcopy, wl-copy or xclip). In logs, `c` copies the lines instead, as in k9s |
+| `+` `-` | Auto-refresh interval: off, 5, 10, 15, 30, 60 seconds. The header shows the countdown |
+| `<` `>` | Sort by the previous / next column |
+| `o` | Reverse the sort |
+| `N` `A` | Sort by name / by the AGE column (press again to reverse) |
+| `0`-`9` | Quick views: 1 clusters, 2 services, 3 tasks, 4 log groups, 5 load balancers, 6 target groups, 7 scaling, 8 ECR, 9 SQS, 0 RDS |
+| `?` | Help overlay: what the current screen is in AWS terms and its Kubernetes equivalent, then every key and command. Scroll with `↑` `↓` / `j` `k`, page with `PgUp` `PgDn` / `space`, close with `Esc`, `q` or `?` |
+| `H` | Command log for this screen: every AWS CLI call it made, running first, then newest first, with how long ago it started, how long it took, and a tick or a cross for its result. While a screen loads, finished calls stay listed under the running ones |
+
+## Commands
+
+| Command | View |
+|---|---|
+| `:clusters` `:cl` `:ecs` | ECS clusters |
+| `:services` `:svc` `[cluster]` | Services of a cluster (default: the one you last opened) |
+| `:tasks` `:task` `:po` `[cluster]` | All tasks of a cluster, running and recently stopped |
+| `:events` `:ev` | Events of the current service |
+| `:rollout` `:ro` | Rollout watch of the current service |
+| `:failures` `:fail` | Failed tasks and problem service events of the last hour, whole cluster (`-c failures` with `-s` for one service) |
+| `:taskdefs` `:td` | Task definition families, then revisions, then containers |
+| `:logs` `:lg` | Log groups; `:logs <group> [filter pattern]` opens events directly |
+| `:lb` `:alb` `:elb` | Load balancers, then target groups, then targets |
+| `:tg` `:targetgroups` | All target groups |
+| `:scaling` `:as` `[namespace]` | Application Auto Scaling targets (default namespace `ecs`) |
+| `:policies` `:pol` `[namespace]` | Scaling policies |
+| `:activities` `:act` `[namespace]` | Scaling activities |
+| `:ec2` | EC2 instances |
+| `:ecr` | ECR repositories, then images |
+| `:sqs` | SQS queues with depth, in-flight, oldest message age and DLQ |
+| `:rds` | RDS clusters and instances, with writer / reader roles |
+| `:lambda` `:fn` | Lambda functions |
+| `:profile` `:ctx` `[name]` | Profile picker, or switch to a profile |
+| `:region` `:regions` `[name]` | Region scan, or switch to a region |
+| `:quit` `:q` | Quit |
+
+## The drill-down chain
+
+The k9s path from deployments to pods to containers to logs maps to:
+
+`regions` › `clusters` › `services` › `tasks` › `containers` › `l` logs
+
+- **Services** tag each service with `FAILED 1H`: its failed task stops (failed health check, failed start, crash) and problem service events of the last hour. A tagged service is red; `F` lists what failed.
+- **Services** split each service by deployment generation. `NEW` is new-generation running tasks over the service's `desiredCount`; `OLD` is what the old generation still runs. `RUN(ALL)` is ECS's `runningCount`, the sum of both generations, so it is never rollout progress.
+- **Tasks** list RUNNING and STOPPED tasks together. Each shows its generation (`new` / `old`), task definition revision, AZ, reserved CPU/memory, start, stop and age, its target group state, and a `REASON` column built from the task's `stopCode` and `stoppedReason`, each container's exit code, reason and health, the target's health reason, and the matching "is unhealthy in target-group" service event.
+- ECS keeps stopped tasks for only about an hour; the view says so instead of showing an empty list as if nothing failed.
+
+Colours follow k9s: green steady, yellow transitioning, red failed, grey finished normally.
+A stopped task is classified by why it stopped. An old-generation task drained by the scheduler ("Scaling activity initiated by deployment ...") is a normal drain and is grey, even with exit code 137 or 143. A failed ELB health check, a failed start, or a non-zero exit outside a drain is red.
+
+## Rollout watch (`R`)
+
+For one service, refreshing on the interval:
+
+- **Progress**: new-generation running over the service `desiredCount`, as a count and a percentage. The PRIMARY deployment's own `desiredCount` is shown separately, since ECS ramps it during the roll.
+- **Generations**: PRIMARY (new) and every ACTIVE (old) with running, desired, pending, `failedTasks`, `rolloutState` and its reason.
+- **Target groups**: healthy, unhealthy, draining and initial counts, so a fleet that reads short because tasks are draining is visible as such.
+- **Churn**: tasks started and stopped since the PRIMARY deployment was created, with stops broken down, for example `48 drained (old gen), 1 failed health check`. A roll that keeps replacing tasks looks different from one waiting on a long deregistration delay.
+- **Elapsed** time since the PRIMARY deployment was created.
+- **Tasks**: every PRIMARY task and every task stopped since the rollout began, failures first.
+- **Events**: the service's event stream in its own pane, newest first, never truncated.
+
+## Loading
+
+Every view fetches in the background.
+A spinner in a fixed slot (the `Status:` row and the table title) turns while anything loads, so nothing on screen shifts.
+An empty view lists its AWS calls as they run, with their elapsed time, for example `aws ecs list-clusters --region us-west-1  0.8s`; finished calls stay listed below the running ones with a tick or a cross, and `H` shows the screen's whole command log.
+A refresh over rows already on screen names the call in flight at the bottom.
+Long argument lists are shortened for display only (`--tasks 1a2b… (+99)`, ARNs to their last segment, JSON to `<json>`).
+
+## Failures are loud
+
+A failed call never renders as an empty or healthy list.
+
+- A failed refresh shows `REFRESH FAILED` above the table, and says when the rows below are from the last successful refresh.
+- When one batch of a multi-call fetch fails, the rows that did load are shown under a red "list INCOMPLETE" note naming the call and the error.
+- `failures[]` returned inside successful ECS responses are surfaced the same way.
+- Truncated results (log streams, scaling activities, log events over the cap) say so.
+- Table cells, notes and events wrap instead of being cut.
+
+## Logs
+
+`l` resolves the CloudWatch target from the task definition's `awslogs` configuration: the stream `<prefix>/<container>/<task-id>` for a task or container.
+For a service it names the stream of every running task, so lines from all tasks are merged by time and each is tagged with its task id in its own colour, as k9s does for pods.
+Streams go 100 to a `filter-log-events` call (the API's limit), and the calls run in parallel.
+The service's stream prefix alone would also match every stream it ever had (10,000 for a busy service), which made each read take about 18 s instead of about 2.5 s.
+
+It opens on the newest lines: one stream reads its tail directly; several streams take one call to measure the rate, then fetch the last few seconds' worth (about 1000 lines).
+Then it follows: every 2 s it reads what arrived since the newest line shown, re-reading 5 s back for lines CloudWatch ingests late and dropping ones already shown.
+If more lines arrive between two reads than one read returns (10,000 per batch), it says so and jumps to now.
+`f` pauses and resumes.
+This polls `filter-log-events` instead of using StartLiveTail, because the CLI's live tail prints messages without the stream they came from, and Live Tail is billed per minute.
+
+## Development
+
+```sh
+cargo test        # guard, 10-service and 100-task chunking, 100-stream log batches, failure surfacing, generation split, redaction
+```
+
+`--script "<tokens>"` drives the real app on an in-memory screen and prints it, for checks without a terminal:
+
+```sh
+s9s -p prod -r us-west-1 --cluster my-cluster --script "@wait @snap"
+```
+
+Tokens: `@wait` (until the view has loaded; prints the load time to stderr), `@sleep` (2 s), `@snap` (print the screen), `@cmd` (print the launch command `c` would copy), `<Enter>` `<Esc>` `<Tab>` `<Space>` `<C-x>`; anything else is typed as keys.
+
+Layout: `src/aws.rs` is the read-only guard and CLI transport, `src/views.rs` every resource view (fetch, columns, health, drill-down), `src/logic.rs` pure helpers (deployment split, redaction, sorting, time), `src/app.rs` state and keys, `src/ui.rs` rendering.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

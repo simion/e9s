@@ -116,20 +116,20 @@ If the SSO session has expired, the header says so and names the command (`aws s
 
 | Command | View |
 |---|---|
-| `:clusters` `:cl` `:ecs` | ECS clusters |
-| `:services` `:svc` `[cluster]` | Services of a cluster (default: the one you last opened) |
+| `:clusters` `:cl` `:ecs` `:ns` | ECS clusters |
+| `:services` `:svc` `:deploy` `:dp` `[cluster]` | Services of a cluster (default: the one you last opened) |
 | `:tasks` `:task` `:po` `[cluster]` | All tasks of a cluster, running and recently stopped |
 | `:events` `:ev` | Events of the current service |
 | `:rollout` `:ro` | Rollout watch of the current service |
 | `:failures` `:fail` | Failed tasks and problem service events of the last hour, whole cluster (`-c failures` with `-s` for one service) |
 | `:taskdefs` `:td` | Task definition families, then revisions, then containers |
 | `:logs` `:lg` | Log groups; `:logs <group> [filter pattern]` opens events directly |
-| `:lb` `:alb` `:elb` | Load balancers, then target groups, then targets |
+| `:lb` `:alb` `:elb` `:ing` | Load balancers, then target groups, then targets |
 | `:tg` `:targetgroups` | All target groups |
-| `:scaling` `:as` `[namespace]` | Application Auto Scaling targets (default namespace `ecs`) |
+| `:scaling` `:as` `:hpa` `[namespace]` | Application Auto Scaling targets (default namespace `ecs`) |
 | `:policies` `:pol` `[namespace]` | Scaling policies |
 | `:activities` `:act` `[namespace]` | Scaling activities |
-| `:ec2` | EC2 instances |
+| `:ec2` `:no` `:nodes` | EC2 instances |
 | `:ecr` | ECR repositories, then images |
 | `:sqs` | SQS queues with depth, in-flight, oldest message age and DLQ |
 | `:rds` | RDS clusters and instances, with writer / reader roles |
@@ -137,6 +137,9 @@ If the SSO session has expired, the header says so and names the command (`aws s
 | `:profile` `:ctx` `[name]` | Profile picker, or switch to a profile |
 | `:region` `:regions` `[name]` | Region scan, or switch to a region |
 | `:quit` `:q` | Quit |
+
+The Kubernetes aliases (`:ns`, `:deploy`, `:po`, `:hpa`, `:no`, `:ing`) open the nearest AWS view, so k9s habits land somewhere sensible.
+`:svc` stays ECS services, not load balancers.
 
 ## The drill-down chain
 

@@ -56,6 +56,7 @@ macOS has no `timeout`; run long checks in the background and kill them.
 - The tail follows the tasks running when the view opened; tasks started mid-rollout do not appear until the view is reopened.
 - The services view lists STOPPED tasks for its `FAILED 1H` column, which costs a second or two per refresh.
 - The `H` command log shows the short display form of each command; long ones are cut at the window edge.
+- Below about 120 columns the services and tasks tables wrap names; k9s would drop the rightmost columns instead.
 
 ## Open decisions
 
@@ -63,6 +64,8 @@ macOS has no `timeout`; run long checks in the background and kill them.
 - **Transport.** It shells out to the AWS CLI v2 (SSO and profiles work as for the CLI). The Rust AWS SDK would remove the process per call but adds a large dependency tree.
 - **Region scan.** It counts ECS clusters, services and tasks per region; EC2, Lambda and RDS are not counted.
 - **Copy in `H`.** Copying the full, runnable command of a selected call is not built.
+- **k9s history keys.** k9s binds `[` `]` to command history and `-` to the last view (`internal/view/app.go`); s9s spends `+` `-` on the refresh interval, which k9s only takes as a flag. Following k9s means moving the interval keys.
+- **k9s keys left out.** `ctrl-w` (wide columns: s9s has no narrow/wide column sets) and `Space` marks (nothing acts on several rows in a read-only tool).
 - **Publishing.** No remote yet; CI (`.github/workflows/ci.yml`) runs once it is on GitHub. Real screenshots for the README should come from an account with nothing sensitive in it.
 
 ## Ideas from taws (huseyinbabal/taws, MIT), not built yet

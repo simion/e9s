@@ -59,7 +59,8 @@ So editing the source and running `e9s` again is all a change needs.
 ## Upgrade
 
 At startup e9s asks GitHub for the latest release, as k9s does, in the background.
-When there is a newer one, the header shows it next to `Rev:`, and quitting prints the command that upgrades your install: `brew upgrade e9s`, `cargo install e9s`, or the shell installer again.
+When there is a newer one, the header shows `⚡ vX.Y.Z available` under the logo and, on the row below, the command that upgrades your install: `brew upgrade e9s`, `cargo install e9s`, or the shell installer again.
+Quitting prints that command too. With the logo hidden (`--logoless`, or a terminal under 120 columns) the new version shows next to `Rev:` instead.
 e9s never installs anything itself.
 `E9S_NO_UPGRADE_CHECK=1` turns the check off; builds from a checkout skip it.
 

@@ -31,7 +31,13 @@ fn newer(latest: &str, current: &str) -> bool {
 }
 
 /// How to upgrade, by where this binary lives. None for a build from a checkout (`make install`, `cargo run`).
+/// Worked out once: the header asks on every frame.
 pub fn command() -> Option<String> {
+    static CMD: OnceLock<Option<String>> = OnceLock::new();
+    CMD.get_or_init(find_command).clone()
+}
+
+fn find_command() -> Option<String> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let path = exe.to_string_lossy();
     if path.contains("/Cellar/") {

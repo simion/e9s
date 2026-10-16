@@ -1,7 +1,7 @@
 use crate::app::{completions, filter_re, App, Mode, COMMANDS, KEYS, QUICK};
 use crate::logic::Health;
 use crate::views::View;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Wrap};
@@ -278,8 +278,8 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!("{} ", busy_slot(top.loading || top.tail.is_some())), Style::new().fg(ORANGE).bold()),
             val(refresh),
         ]),
-        // k9s shows a newer release next to the running one.
-        Line::from(match crate::upgrade::NEWER.get() {
+        // k9s shows a newer release next to the running one; with the logo shown it goes under the logo instead.
+        Line::from(match crate::upgrade::NEWER.get().filter(|_| app.chrome.logoless) {
             Some(v) => vec![key("Rev:"), val(format!("v{} ", env!("CARGO_PKG_VERSION"))), Span::styled(format!("⚡v{v}"), Style::new().fg(AQUA).bold())],
             None => vec![key("Rev:"), val(format!("v{}", env!("CARGO_PKG_VERSION")))],
         }),
@@ -317,7 +317,27 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), b);
     if logo_w > 0 && c.width >= logo_w {
         f.render_widget(Paragraph::new(LOGO.iter().map(|l| Line::styled(*l, Style::new().fg(ORANGE).bold())).collect::<Vec<_>>()), c);
+        upgrade_notice(f, area, c);
     }
+}
+
+/// A newer release: "⚡ v0.2.0 available" under the logo, and the command that upgrades this install
+/// right-aligned on the header's last row, which is empty across the whole width.
+fn upgrade_notice(f: &mut ratatui::Frame, area: Rect, logo: Rect) {
+    let (Some(v), Some(cmd)) = (crate::upgrade::NEWER.get(), crate::upgrade::command()) else { return };
+    if area.height < HEADER_H {
+        return;
+    }
+    let row = |y: u16, x: u16| Rect { x, y: area.y + y, width: area.right().saturating_sub(x).saturating_sub(1), height: 1 };
+    let avail = Line::styled(format!("⚡ v{v} available"), Style::new().fg(AQUA).bold());
+    f.render_widget(Paragraph::new(avail).alignment(Alignment::Center), Rect { width: logo.width, ..row(LOGO.len() as u16 - 1, logo.x) });
+    let last = row(HEADER_H - 1, area.x);
+    let line = if cmd.chars().count() + 10 <= last.width as usize {
+        Line::from(vec![Span::styled("upgrade: ", Style::new().fg(GRAY)), Span::styled(cmd, Style::new().fg(AQUA).bold())])
+    } else {
+        Line::styled("the upgrade command is printed when e9s quits", Style::new().fg(GRAY))
+    };
+    f.render_widget(Paragraph::new(line).alignment(Alignment::Right), last);
 }
 
 /// An SSO role `AWSReservedSSO_<permission set>_<16 hex>` reads as its permission set.

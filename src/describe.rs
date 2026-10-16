@@ -329,3 +329,155 @@ mod tests {
         assert!(at("Execution stopped") < at("Stopping") && at("Stopping") < at("Stopped:"), "timeline in time order: {page}");
     }
 }
+
+/// RDS instance or cluster: what it is now, what is changing, and its events of the last day (newest last).
+/// RDS reports no percentage for a modification; its steps arrive as events, so those are the progress.
+pub fn rds(v: &Value, events: &[Value]) -> Vec<String> {
+    let mut p = Page(vec![]);
+    let cluster = v.get("DBClusterIdentifier").is_some() && v.get("DBInstanceIdentifier").is_none();
+    let status = if cluster { s(v, "/Status") } else { s(v, "/DBInstanceStatus") };
+    p.kv(0, "Name", if cluster { s(v, "/DBClusterIdentifier") } else { s(v, "/DBInstanceIdentifier") });
+    p.kv(0, "Kind", if cluster { "cluster" } else { "instance" });
+    p.kv(0, "Status", match rds_status(&status) {
+        "" => status.clone(),
+        m => format!("{status}  ({m})"),
+    });
+    p.kv(0, "Engine", format!("{} {}", s(v, "/Engine"), s(v, "/EngineVersion")).trim());
+    p.kv(0, "Class", if cluster { s(v, "/DBClusterInstanceClass") } else { s(v, "/DBInstanceClass") });
+    if !cluster {
+        let mut st = format!("{} GiB {}", s(v, "/AllocatedStorage"), s(v, "/StorageType"));
+        if v.get("Iops").is_some() {
+            st += &format!(", {} IOPS", s(v, "/Iops"));
+        }
+        if v.get("StorageThroughput").is_some() {
+            st += &format!(", {} MiB/s", s(v, "/StorageThroughput"));
+        }
+        if v.get("MaxAllocatedStorage").is_some() {
+            st += &format!(", autoscales to {} GiB", s(v, "/MaxAllocatedStorage"));
+        }
+        p.kv(0, "Storage", st);
+        p.kv(0, "Availability zone", s(v, "/AvailabilityZone"));
+    }
+    p.kv(0, "Multi-AZ", s(v, "/MultiAZ"));
+    p.kv(0, "Endpoint", if cluster {
+        s(v, "/Endpoint")
+    } else {
+        format!("{}:{}", s(v, "/Endpoint/Address"), s(v, "/Endpoint/Port")).trim_matches(':').to_string()
+    });
+    p.kv(0, "Reader endpoint", s(v, "/ReaderEndpoint"));
+    p.kv(0, "Created", when(v, if cluster { "/ClusterCreateTime" } else { "/InstanceCreateTime" }));
+
+    let pending = crate::views::pending(v);
+    p.section("Pending changes");
+    if pending.is_empty() {
+        p.line(2, "none");
+    } else {
+        for c in &pending {
+            p.line(2, c);
+        }
+        let mw = s(v, "/PreferredMaintenanceWindow");
+        p.line(2, if status == "available" {
+            format!("(queued: applied in the maintenance window {mw} UTC, or on the next modify with apply-immediately)")
+        } else {
+            "(being applied now; each leaves this list when done. A Single-AZ class change restarts the database)".into()
+        });
+    }
+
+    // The newest "Applying ..." event with no "Finished ..." after it: how long the change has been running.
+    let started = events.iter().rposition(|e| s(e, "/Message").starts_with("Applying"));
+    let finished = started.is_some_and(|i| events[i + 1..].iter().any(|e| s(e, "/Message").starts_with("Finished applying")));
+    if let (Some(i), false) = (started, finished) {
+        p.kv(0, "Applying since", when(&events[i], "/Date"));
+    }
+
+    p.section("Maintenance and backups");
+    p.kv(2, "Maintenance window", s(v, "/PreferredMaintenanceWindow"));
+    p.kv(2, "Backup window", s(v, "/PreferredBackupWindow"));
+    p.kv(2, "Backup retention", if v.get("BackupRetentionPeriod").is_some() { format!("{} days", s(v, "/BackupRetentionPeriod")) } else { String::new() });
+    p.kv(2, "Latest restorable", when(v, "/LatestRestorableTime"));
+    p.kv(2, "Auto minor upgrade", s(v, "/AutoMinorVersionUpgrade"));
+    p.kv(2, "CA certificate", s(v, "/CACertificateIdentifier"));
+
+    p.section("Security");
+    p.kv(2, "Deletion protection", s(v, "/DeletionProtection"));
+    p.kv(2, "Publicly accessible", s(v, "/PubliclyAccessible"));
+    p.kv(2, "Storage encrypted", s(v, "/StorageEncrypted"));
+    p.kv(2, "Performance Insights", s(v, "/PerformanceInsightsEnabled"));
+
+    p.section("Events, last 24h (refreshes with the page)");
+    if events.is_empty() {
+        p.line(2, "none");
+    }
+    for e in events {
+        let at = e.pointer("/Date").and_then(parse_ts).map(|t| t.with_timezone(&Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+        p.line(2, format!("{at}  {:>8}  {}", age_at(e, "/Date"), s(e, "/Message")));
+    }
+    p.kv(0, "ARN", if cluster { s(v, "/DBClusterArn") } else { s(v, "/DBInstanceArn") });
+    p.line(0, "");
+    p.line(0, "(y shows these fields as YAML)");
+    p.0
+}
+
+/// What an RDS status means while it lasts, for the ones that are not plain.
+fn rds_status(s: &str) -> &'static str {
+    match s {
+        "modifying" => "a change is being applied; see Pending changes and Events",
+        "storage-optimization" => "storage was resized and is being optimized in the background; usable, no further storage change for up to 6h",
+        "rebooting" => "restarting; connections drop",
+        "upgrading" => "engine version upgrade; unavailable during it",
+        "backing-up" => "snapshot in progress; usable",
+        "maintenance" => "AWS maintenance is being applied",
+        "configuring-enhanced-monitoring" | "configuring-log-exports" | "configuring-iam-database-auth" => "a setting is being applied; usable",
+        _ => "",
+    }
+}
+
+/// Lambda function from get-function-configuration: what it runs, and whether its last change has settled.
+pub fn lambda(c: &Value) -> Vec<String> {
+    let mut p = Page(vec![]);
+    let (_, status) = crate::views::lambda_status(c);
+    p.kv(0, "Name", s(c, "/FunctionName"));
+    p.kv(0, "Status", match status.as_str() {
+        "updating" => "updating  (a code or configuration change is being applied; invocations still run the previous version)".into(),
+        "pending" => "pending  (being created; it cannot be invoked yet)".into(),
+        "inactive" => "inactive  (idle for weeks; the first invocation wakes it and may fail while it does)".into(),
+        _ => status.clone(),
+    });
+    p.kv(0, "State", format!("{} {}", s(c, "/State"), s(c, "/StateReasonCode")).trim());
+    p.kv(0, "State reason", s(c, "/StateReason"));
+    p.kv(0, "Last update", format!("{} {}", s(c, "/LastUpdateStatus"), s(c, "/LastUpdateStatusReasonCode")).trim());
+    p.kv(0, "Last update reason", s(c, "/LastUpdateStatusReason"));
+    p.kv(0, "Last modified", when(c, "/LastModified"));
+    p.kv(0, "Description", s(c, "/Description"));
+
+    p.section("Code");
+    p.kv(2, "Package", s(c, "/PackageType"));
+    p.kv(2, "Runtime", s(c, "/Runtime"));
+    p.kv(2, "Handler", s(c, "/Handler"));
+    p.kv(2, "Architectures", arr(c, "/Architectures").iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+    p.kv(2, "Size", format!("{:.1} MB", n(c, "/CodeSize") as f64 / 1e6));
+    p.kv(2, "SHA-256", s(c, "/CodeSha256"));
+    p.kv(2, "Version", s(c, "/Version"));
+    p.kv(2, "Revision", s(c, "/RevisionId"));
+    for l in arr(c, "/Layers") {
+        p.kv(2, "Layer", short(&s(l, "/Arn")));
+    }
+
+    p.section("Limits");
+    p.kv(2, "Memory", format!("{} MB", s(c, "/MemorySize")));
+    p.kv(2, "Timeout", format!("{}s", s(c, "/Timeout")));
+    p.kv(2, "Ephemeral storage", if c.pointer("/EphemeralStorage/Size").is_some() { format!("{} MB", s(c, "/EphemeralStorage/Size")) } else { String::new() });
+
+    if c.get("VpcConfig").is_some() {
+        p.section("Network");
+        p.kv(2, "VPC", s(c, "/VpcConfig/VpcId"));
+        p.kv(2, "Subnets", arr(c, "/VpcConfig/SubnetIds").iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+        p.kv(2, "Security groups", arr(c, "/VpcConfig/SecurityGroupIds").iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "));
+    }
+    p.kv(0, "Role", s(c, "/Role"));
+    p.kv(0, "Log group", s(c, "/LoggingConfig/LogGroup"));
+    p.kv(0, "ARN", s(c, "/FunctionArn"));
+    p.line(0, "");
+    p.line(0, "(refreshes with the page; y shows these fields as YAML)");
+    p.0
+}

@@ -943,6 +943,16 @@ impl App {
             return;
         }
         let Some(row) = f.selected() else { return };
+        // RDS and Lambda: a live page that refetches this one resource, to follow a change as it applies.
+        if !raw && matches!(f.view, View::Rds | View::Lambda) {
+            let (kind, id) = match f.view {
+                View::Rds => (row.cells[0].clone(), row.cells[1].clone()),
+                _ => ("lambda".into(), row.cells[0].clone()),
+            };
+            let lines = if kind == "lambda" { crate::describe::lambda(&row.json) } else { vec![] };
+            self.push(View::Detail { title: format!("describe({id})"), lines, live: Some((kind, id)) });
+            return;
+        }
         // Structured log lines: describe the parsed message.
         let doc = match (&f.view, row.json.get("message").and_then(Value::as_str)) {
             (View::Logs { .. }, Some(m)) => serde_json::from_str::<Value>(m).unwrap_or_else(|_| row.json.clone()),
@@ -958,7 +968,7 @@ impl App {
         };
         // Name the page after what the row shows first (a name), not the ID buried in its ARN.
         let name = row.cells.first().filter(|c| !c.is_empty()).cloned().unwrap_or_else(|| short(&row.id).to_string());
-        self.push(View::Detail { title: format!("{}({name})", if raw { "yaml" } else { "describe" }), lines });
+        self.push(View::Detail { title: format!("{}({name})", if raw { "yaml" } else { "describe" }), lines, live: None });
     }
 
     fn open_logs(&mut self) {
@@ -1270,7 +1280,7 @@ mod tests {
         assert!(!inv && re.is_match("my-task-runner") && !re.is_match("runner-task-my"));
         assert!(filter_re("!-f api").unwrap().1);
 
-        let mut f = Frame::new(View::Detail { title: "t".into(), lines: vec![] });
+        let mut f = Frame::new(View::Detail { title: "t".into(), lines: vec![], live: None });
         f.table = Table::text(["a: 1", "b: x", "c: 2", "d: x"].map(String::from).to_vec());
         f.filter = "x".into();
         assert_eq!(f.visible().len(), 4, "describe keeps every line");

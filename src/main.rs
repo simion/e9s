@@ -1,3 +1,6 @@
+// The RDS instance object in sdk.rs is one json! literal, deeper than the default 128.
+#![recursion_limit = "256"]
+
 mod app;
 mod aws;
 mod demo;

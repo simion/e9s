@@ -205,7 +205,8 @@ pub enum View {
     Sqs,
     Rds,
     Lambda,
-    Detail { title: String, lines: Vec<String> },
+    /// `live`: an RDS ("instance" or "cluster", id) or ("lambda", name) page fetched again on every refresh, to follow a change as it applies.
+    Detail { title: String, lines: Vec<String>, live: Option<(String, String)> },
 }
 
 pub const REGIONS: &[&str] = &[
@@ -275,7 +276,7 @@ impl View {
     }
 
     pub fn auto_refresh(&self) -> bool {
-        !matches!(self, View::Logs { .. } | View::Detail { .. } | View::Profiles | View::Regions | View::Aliases)
+        !matches!(self, View::Logs { .. } | View::Detail { live: None, .. } | View::Profiles | View::Regions | View::Aliases)
     }
 
     /// Where Enter goes.
@@ -388,6 +389,8 @@ impl View {
                 Ok(t)
             }
             View::Regions => regions(aws),
+            View::Detail { live: Some((kind, id)), lines, .. } if kind == "lambda" => lambda_detail(aws, id, lines),
+            View::Detail { live: Some((kind, id)), .. } => rds_detail(aws, kind, id),
             View::Detail { lines, .. } => Ok(Table::text(lines.clone())),
             View::Clusters => clusters(aws),
             View::Services { cluster } => services(aws, cluster),
@@ -1889,7 +1892,7 @@ fn sqs(aws: &Aws) -> Result<Table, AwsError> {
 fn rds(aws: &Aws) -> Result<Table, AwsError> {
     let clusters = aws.call("rds", "describe-db-clusters", &[])?;
     let instances = aws.call("rds", "describe-db-instances", &[])?;
-    let mut t = Table::new(&["KIND", "ID", "ENGINE", "CLASS", "STATUS", "ROLE", "AZ", "AGE"]);
+    let mut t = Table::new(&["KIND", "ID", "ENGINE", "CLASS", "STATUS", "PENDING", "ROLE", "AZ", "AGE"]);
     let mut writer: HashMap<String, bool> = HashMap::new();
     for c in arr(&clusters, "/DBClusters") {
         for m in arr(c, "/DBClusterMembers") {
@@ -1902,6 +1905,7 @@ fn rds(aws: &Aws) -> Result<Table, AwsError> {
             format!("{} {}", s(c, "/Engine"), s(c, "/EngineVersion")),
             s(c, "/DBClusterInstanceClass"),
             st,
+            pending(c).join(", "),
             format!("{} members", arr(c, "/DBClusterMembers").len()),
             if c["MultiAZ"].as_bool() == Some(true) { "multi-az".into() } else { String::new() },
             age_at(c, "/ClusterCreateTime"),
@@ -1922,6 +1926,7 @@ fn rds(aws: &Aws) -> Result<Table, AwsError> {
             format!("{} {}", s(i, "/Engine"), s(i, "/EngineVersion")),
             s(i, "/DBInstanceClass"),
             st,
+            pending(i).join(", "),
             role,
             s(i, "/AvailabilityZone"),
             age_at(i, "/InstanceCreateTime"),
@@ -1930,23 +1935,117 @@ fn rds(aws: &Aws) -> Result<Table, AwsError> {
     Ok(t)
 }
 
+/// Queued or applying changes, "class db.t4g.micro -> db.t4g.small": AWS lists only the new value, the current one is beside it.
+pub fn pending(v: &Value) -> Vec<String> {
+    let Some(p) = v["PendingModifiedValues"].as_object() else { return vec![] };
+    let mut out: Vec<String> = p
+        .iter()
+        // AWS repeats IOPS and throughput unchanged alongside a storage change.
+        .filter(|(k, new)| v.get(k.as_str()) != Some(new))
+        .map(|(k, new)| {
+            let new = new.as_str().map(String::from).unwrap_or_else(|| new.to_string());
+            let cur = match k.as_str() {
+                "DBInstanceClass" => s(v, "/DBInstanceClass"),
+                "CertificateDetails" => s(v, "/CACertificateIdentifier"),
+                _ => s(v, &format!("/{k}")),
+            };
+            let name = match k.as_str() {
+                "DBInstanceClass" => "class",
+                "AllocatedStorage" => "storage GiB",
+                "StorageThroughput" => "throughput MiB/s",
+                "EngineVersion" => "version",
+                "MultiAZ" => "multi-az",
+                "Iops" => "IOPS",
+                k => k,
+            };
+            if cur.is_empty() || cur == "(changing)" { format!("{name} {new}") } else { format!("{name} {cur} -> {new}") }
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `d` on an RDS row: this one instance or cluster and its last day of events, fetched on every refresh.
+fn rds_detail(aws: &Aws, kind: &str, id: &str) -> Result<Table, AwsError> {
+    let (op, flag, key, src) = match kind {
+        "cluster" => ("describe-db-clusters", "--db-cluster-identifier", "/DBClusters/0", "db-cluster"),
+        _ => ("describe-db-instances", "--db-instance-identifier", "/DBInstances/0", "db-instance"),
+    };
+    let v = aws.call("rds", op, &[flag.into(), id.into()])?;
+    let Some(item) = v.pointer(key) else { return Err(AwsError::Api(format!("{kind} {id} not found"))) };
+    let args = ["--source-type", src, "--source-identifier", id, "--duration", "1440"].map(String::from);
+    let (events, err) = match aws.call("rds", "describe-events", &args) {
+        Ok(e) => (arr(&e, "/Events").to_vec(), None),
+        Err(e) => (vec![], Some(e)),
+    };
+    let mut t = Table::text(crate::describe::rds(item, &events));
+    if let Some(e) = err {
+        t.bad(format!("events not loaded: {e}"));
+    }
+    Ok(t)
+}
+
 fn lambda(aws: &Aws) -> Result<Table, AwsError> {
     let mut v = aws.call("lambda", "list-functions", &[])?;
     redact(&mut v);
-    let mut t = Table::new(&["NAME", "RUNTIME", "MEM", "TIMEOUT", "ARCH", "CODE MB", "MODIFIED"]);
+    let mut t = Table::new(&["NAME", "RUNTIME", "MEM", "TIMEOUT", "ARCH", "CODE MB", "STATUS", "MODIFIED"]);
     for f in arr(&v, "/Functions") {
         let name = s(f, "/FunctionName");
-        t.row(name.clone(), Health::None, f.clone(), vec![
+        // list-functions leaves out State and LastUpdateStatus, so only functions changed in the last 15m are asked:
+        // an update settles in seconds to minutes, and asking all of them would be one call per function per refresh.
+        let recent = f.pointer("/LastModified").and_then(parse_ts).is_some_and(|m| Utc::now() - m < chrono::Duration::minutes(15));
+        let (health, status) = match recent.then(|| aws.call("lambda", "get-function-configuration", &["--function-name".into(), name.clone()])) {
+            Some(Ok(c)) => lambda_status(&c),
+            Some(Err(e)) => {
+                if t.notes.is_empty() {
+                    t.bad(format!("STATUS ? : get-function-configuration failed: {e}"));
+                }
+                (Health::Bad, "?".into())
+            }
+            None => (Health::None, String::new()),
+        };
+        t.row(name.clone(), health, f.clone(), vec![
             name,
             s(f, "/Runtime"),
             s(f, "/MemorySize"),
             format!("{}s", s(f, "/Timeout")),
             strs(f, "/Architectures").join(","),
             format!("{:.1}", n(f, "/CodeSize") as f64 / 1e6),
+            status,
             age_at(f, "/LastModified"),
         ]);
     }
     Ok(t)
+}
+
+/// "updating", "update failed", "pending", "inactive", "failed" or "ready", from State and LastUpdateStatus.
+pub fn lambda_status(c: &Value) -> (Health, String) {
+    match (s(c, "/State").as_str(), s(c, "/LastUpdateStatus").as_str()) {
+        ("Failed", _) => (Health::Bad, "failed".into()),
+        (_, "Failed") => (Health::Bad, "update failed".into()),
+        ("Pending", _) => (Health::Warn, "pending".into()),
+        (_, "InProgress") => (Health::Warn, "updating".into()),
+        ("Inactive", _) => (Health::Dim, "inactive".into()),
+        ("Active", _) => (Health::Ok, "ready".into()),
+        (st, u) => (Health::None, format!("{st} {u}").trim().to_string()),
+    }
+}
+
+/// `d` on a function: its configuration and update state, fetched on every refresh.
+/// `listed` is the page from the list-functions row, shown when this call is denied (it has no state).
+fn lambda_detail(aws: &Aws, name: &str, listed: &[String]) -> Result<Table, AwsError> {
+    match aws.call("lambda", "get-function-configuration", &["--function-name".into(), name.into()]) {
+        Ok(mut c) => {
+            redact(&mut c);
+            Ok(Table::text(crate::describe::lambda(&c)))
+        }
+        Err(e @ AwsError::SsoExpired(_)) => Err(e),
+        Err(e) => {
+            let mut t = Table::text(listed.to_vec());
+            t.bad(format!("status not loaded, showing the list's fields: {e}"));
+            Ok(t)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2110,6 +2209,28 @@ mod tests {
         let drained = json!({"lastStatus": "STOPPED", "stopCode": "ServiceSchedulerInitiated",
             "stoppedReason": "Scaling activity initiated by (deployment ecs-svc/123)", "containers": [{"exitCode": 143}]});
         assert_eq!(task_health(&drained), Health::Dim);
+    }
+
+    #[test]
+    fn rds_modification_shows_old_to_new_and_how_long() {
+        let i = json!({"DBInstanceIdentifier": "db", "DBInstanceClass": "db.t4g.micro", "AllocatedStorage": 20, "DBInstanceStatus": "modifying",
+            "Iops": 3000,
+            "PendingModifiedValues": {"DBInstanceClass": "db.t4g.small", "AllocatedStorage": 50, "Iops": 3000, "MasterUserPassword": "(changing)"}});
+        assert_eq!(pending(&i), ["MasterUserPassword (changing)", "class db.t4g.micro -> db.t4g.small", "storage GiB 20 -> 50"]);
+        let e = |m: &str| json!({"Message": m, "Date": "2026-10-16T06:05:23.686Z"});
+        let page = crate::describe::rds(&i, &[e("Applying modification to database instance class")]).join("\n");
+        assert!(page.contains("Applying since:") && page.contains("being applied now"), "{page}");
+        let done = crate::describe::rds(&i, &[e("Applying modification to database instance class"), e("Finished applying modification to DB instance class")]);
+        assert!(!done.join("\n").contains("Applying since:"));
+    }
+
+    #[test]
+    fn lambda_status_reads_state_then_update() {
+        let st = |state: &str, upd: &str| lambda_status(&json!({"State": state, "LastUpdateStatus": upd}));
+        assert_eq!(st("Active", "InProgress"), (Health::Warn, "updating".into()));
+        assert_eq!(st("Active", "Failed"), (Health::Bad, "update failed".into()));
+        assert_eq!(st("Failed", "Successful"), (Health::Bad, "failed".into()));
+        assert_eq!(st("Active", "Successful"), (Health::Ok, "ready".into()));
     }
 
     #[test]

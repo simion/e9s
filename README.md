@@ -121,7 +121,7 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `g` `G` / `Home` `End` | Top / bottom |
 | `ctrl-f` `ctrl-b` / `PgDn` `PgUp` (also `ctrl-u`) | Page down / up |
 | `ctrl-d` `ctrl-k` | Delete and kill in k9s; here they only say e9s is read-only |
-| `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; anything else shows as YAML, and a structured log line is parsed first |
+| `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; an RDS instance or cluster gets a live page (refreshed like a table) with pending changes as old -> new, how long the current change has been applying, and the last 24h of RDS events, to follow a modification step by step; a Lambda function gets a live page too, with its state and last update (updating, failed and why); anything else shows as YAML, and a structured log line is parsed first |
 | `y` | YAML of the selection: the fields e9s reads from AWS, under their API names |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
 | `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says e9s is read-only |
@@ -170,8 +170,8 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `:ec2` `:no` `:nodes` | EC2 instances |
 | `:ecr` | ECR repositories, then images |
 | `:sqs` | SQS queues with depth, in-flight, oldest message age and DLQ |
-| `:rds` | RDS clusters and instances, with writer / reader roles |
-| `:lambda` `:fn` | Lambda functions |
+| `:rds` | RDS clusters and instances, with writer / reader roles and a PENDING column (queued or applying changes, old -> new) |
+| `:lambda` `:fn` | Lambda functions, with STATUS (updating, ready, failed) for those changed in the last 15 minutes |
 | `:profile` `:ctx` `[name]` | Profile picker, or switch to a profile |
 | `:region` `:regions` `[name]` | Region scan, or switch to a region |
 | `:quit` `:q` | Quit |

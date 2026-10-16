@@ -232,7 +232,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             // The role, not the whole ARN: assumed-role/<role>/<session>.
             let who = arn.split_once(":assumed-role/").or_else(|| arn.split_once(":user/")).map(|x| x.1).unwrap_or(arn);
             let role = sso_role(who.split('/').next().unwrap_or(who));
-            if app.read_only_role() { val(role) } else { Span::styled(format!("{role} (may write; tool only reads)"), Style::new().fg(Color::Indexed(220)).bold()) }
+            if app.read_only_role() { val(format!("{role} (RO)")) } else { Span::styled(format!("{role} (RW)"), Style::new().fg(Color::Indexed(220)).bold()) }
         }
         (None, Some(e)) => Span::styled(e.clone(), Style::new().fg(Color::Indexed(202))),
         (None, None) if ctx.profile.is_empty() && matches!(top.view, View::Profiles) => val("-".into()),

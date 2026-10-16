@@ -635,10 +635,11 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
         // ---------- RDS ----------
         ("rds", "describe-db-clusters") => {
             let c = aws_sdk_rds::Client::new(&cfg);
+            let id = a.one("--db-cluster-identifier");
             listed("DBClusters", pages(max, |t| {
-                let c = c.clone();
+                let (c, id) = (c.clone(), id.clone());
                 async move {
-                    let r = c.describe_db_clusters().set_marker(t).send().await.map_err(e!())?;
+                    let r = c.describe_db_clusters().set_db_cluster_identifier(id).set_marker(t).send().await.map_err(e!())?;
                     let x = r
                         .db_clusters()
                         .iter()
@@ -646,7 +647,15 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                             "DBClusterIdentifier": x.db_cluster_identifier(), "DBClusterArn": x.db_cluster_arn(), "Engine": x.engine(),
                             "EngineVersion": x.engine_version(), "DBClusterInstanceClass": x.db_cluster_instance_class(), "Status": x.status(),
                             "MultiAZ": x.multi_az(), "ClusterCreateTime": ts(x.cluster_create_time()), "Endpoint": x.endpoint(),
-                            "ReaderEndpoint": x.reader_endpoint(),
+                            "ReaderEndpoint": x.reader_endpoint(), "PreferredMaintenanceWindow": x.preferred_maintenance_window(),
+                            "BackupRetentionPeriod": x.backup_retention_period(), "DeletionProtection": x.deletion_protection(),
+                            "PendingModifiedValues": x.pending_modified_values().map(|p| json!({
+                                "DBClusterIdentifier": p.db_cluster_identifier(), "EngineVersion": p.engine_version(),
+                                "BackupRetentionPeriod": p.backup_retention_period(), "AllocatedStorage": p.allocated_storage(),
+                                "Iops": p.iops(), "StorageType": p.storage_type(), "CertificateDetails": p.certificate_details().and_then(|c| c.ca_identifier()),
+                                "IAMDatabaseAuthenticationEnabled": p.iam_database_authentication_enabled(),
+                                "MasterUserPassword": p.master_user_password().map(|_| "(changing)"),
+                            })),
                             "DBClusterMembers": x.db_cluster_members().iter().map(|m| json!({
                                 "DBInstanceIdentifier": m.db_instance_identifier(), "IsClusterWriter": m.is_cluster_writer(),
                             })).collect::<Vec<_>>(),
@@ -658,10 +667,11 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
         }
         ("rds", "describe-db-instances") => {
             let c = aws_sdk_rds::Client::new(&cfg);
+            let id = a.one("--db-instance-identifier");
             listed("DBInstances", pages(max, |t| {
-                let c = c.clone();
+                let (c, id) = (c.clone(), id.clone());
                 async move {
-                    let r = c.describe_db_instances().set_marker(t).send().await.map_err(e!())?;
+                    let r = c.describe_db_instances().set_db_instance_identifier(id).set_marker(t).send().await.map_err(e!())?;
                     let x = r
                         .db_instances()
                         .iter()
@@ -671,6 +681,53 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                             "AvailabilityZone": x.availability_zone(), "InstanceCreateTime": ts(x.instance_create_time()),
                             "DBClusterIdentifier": x.db_cluster_identifier(),
                             "ReadReplicaSourceDBInstanceIdentifier": x.read_replica_source_db_instance_identifier(), "MultiAZ": x.multi_az(),
+                            "AllocatedStorage": x.allocated_storage(), "MaxAllocatedStorage": x.max_allocated_storage(), "StorageType": x.storage_type(),
+                            "Iops": x.iops(), "StorageThroughput": x.storage_throughput(), "StorageEncrypted": x.storage_encrypted(),
+                            "Endpoint": x.endpoint().map(|e| json!({"Address": e.address(), "Port": e.port()})),
+                            "PreferredMaintenanceWindow": x.preferred_maintenance_window(), "PreferredBackupWindow": x.preferred_backup_window(),
+                            "BackupRetentionPeriod": x.backup_retention_period(), "LatestRestorableTime": ts(x.latest_restorable_time()),
+                            "AutoMinorVersionUpgrade": x.auto_minor_version_upgrade(), "DeletionProtection": x.deletion_protection(),
+                            "PubliclyAccessible": x.publicly_accessible(), "PerformanceInsightsEnabled": x.performance_insights_enabled(),
+                            "CACertificateIdentifier": x.ca_certificate_identifier(),
+                            "PendingModifiedValues": x.pending_modified_values().map(|p| json!({
+                                "DBInstanceClass": p.db_instance_class(), "AllocatedStorage": p.allocated_storage(), "Port": p.port(),
+                                "BackupRetentionPeriod": p.backup_retention_period(), "MultiAZ": p.multi_az(), "Engine": p.engine(),
+                                "EngineVersion": p.engine_version(), "LicenseModel": p.license_model(), "Iops": p.iops(),
+                                "StorageThroughput": p.storage_throughput(), "DBInstanceIdentifier": p.db_instance_identifier(),
+                                "StorageType": p.storage_type(), "CACertificateIdentifier": p.ca_certificate_identifier(),
+                                "DBSubnetGroupName": p.db_subnet_group_name(), "IAMDatabaseAuthenticationEnabled": p.iam_database_authentication_enabled(),
+                                "DedicatedLogVolume": p.dedicated_log_volume(), "MultiTenant": p.multi_tenant(),
+                                // Only that a new password is queued: the value is never shown (AWS masks it anyway).
+                                "MasterUserPassword": p.master_user_password().map(|_| "(changing)"),
+                            })),
+                        }))
+                        .collect();
+                    Ok((x, r.marker().map(String::from)))
+                }
+            }).await?)
+        }
+
+        ("rds", "describe-events") => {
+            let c = aws_sdk_rds::Client::new(&cfg);
+            let (duration, kind, id) = (a.one("--duration").and_then(|d| d.parse().ok()), a.one("--source-type"), a.one("--source-identifier"));
+            listed("Events", pages(max, |t| {
+                let (c, kind, id) = (c.clone(), kind.clone(), id.clone());
+                async move {
+                    let r = c
+                        .describe_events()
+                        .set_duration(duration)
+                        .set_source_type(kind.map(|k| aws_sdk_rds::types::SourceType::from(k.as_str())))
+                        .set_source_identifier(id)
+                        .set_marker(t)
+                        .send()
+                        .await
+                        .map_err(e!())?;
+                    let x = r
+                        .events()
+                        .iter()
+                        .map(|x| json!({
+                            "SourceIdentifier": x.source_identifier(), "SourceType": x.source_type().map(|k| k.as_str()),
+                            "Message": x.message(), "EventCategories": x.event_categories(), "Date": ts(x.date()), "SourceArn": x.source_arn(),
                         }))
                         .collect();
                     Ok((x, r.marker().map(String::from)))
@@ -699,6 +756,27 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                     Ok((x, r.next_marker().map(String::from)))
                 }
             }).await?)
+        }
+
+        ("lambda", "get-function-configuration") => {
+            let f = aws_sdk_lambda::Client::new(&cfg).get_function_configuration().set_function_name(a.one("--function-name")).send().await.map_err(e!())?;
+            // Environment variables are left out: their values are never shown.
+            json!({
+                "FunctionName": f.function_name(), "FunctionArn": f.function_arn(), "Runtime": f.runtime().map(|x| x.as_str()),
+                "Role": f.role(), "Handler": f.handler(), "CodeSize": f.code_size(), "Description": f.description(), "Timeout": f.timeout(),
+                "MemorySize": f.memory_size(), "LastModified": f.last_modified(), "CodeSha256": f.code_sha256(), "Version": f.version(),
+                "RevisionId": f.revision_id(), "PackageType": f.package_type().map(|x| x.as_str()),
+                "Architectures": f.architectures().iter().map(|x| x.as_str()).collect::<Vec<_>>(),
+                "EphemeralStorage": f.ephemeral_storage().map(|e| json!({"Size": e.size()})),
+                "Layers": f.layers().iter().map(|l| json!({"Arn": l.arn(), "CodeSize": l.code_size()})).collect::<Vec<_>>(),
+                "VpcConfig": f.vpc_config().filter(|v| v.vpc_id().is_some_and(|x| !x.is_empty())).map(|v| json!({
+                    "VpcId": v.vpc_id(), "SubnetIds": v.subnet_ids(), "SecurityGroupIds": v.security_group_ids(),
+                })),
+                "State": f.state().map(|x| x.as_str()), "StateReason": f.state_reason(), "StateReasonCode": f.state_reason_code().map(|x| x.as_str()),
+                "LastUpdateStatus": f.last_update_status().map(|x| x.as_str()), "LastUpdateStatusReason": f.last_update_status_reason(),
+                "LastUpdateStatusReasonCode": f.last_update_status_reason_code().map(|x| x.as_str()),
+                "LoggingConfig": f.logging_config().map(|l| json!({"LogGroup": l.log_group()})),
+            })
         }
 
         _ => return Err(AwsError::Api(format!("e9s does not call aws {service} {op}"))),

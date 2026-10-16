@@ -310,20 +310,62 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
                 "DBInstanceClass": class, "DBInstanceStatus": "available", "AvailabilityZone": format!("{r}{az}"),
                 "InstanceCreateTime": ago(Duration::days(300)), "DBClusterIdentifier": cl, "MultiAZ": false,
             });
-            json!({"DBInstances": [i("shop-db-1", "db.r6g.xlarge", "a", Some("shop-db"), "aurora-postgresql"), i("shop-db-2", "db.r6g.xlarge", "b", Some("shop-db"), "aurora-postgresql"), i("analytics", "db.t4g.large", "c", None, "postgres")]})
+            let mut analytics = i("analytics", "db.t4g.large", "c", None, "postgres");
+            // A class and storage change being applied, for the PENDING column and its live `d` page.
+            analytics["DBInstanceStatus"] = json!("modifying");
+            analytics["AllocatedStorage"] = json!(100);
+            analytics["StorageType"] = json!("gp3");
+            analytics["Endpoint"] = json!({"Address": format!("analytics.c0demo.{r}.rds.amazonaws.com"), "Port": 5432});
+            analytics["PreferredMaintenanceWindow"] = json!("sun:03:00-sun:03:30");
+            analytics["PendingModifiedValues"] = json!({"DBInstanceClass": "db.t4g.xlarge", "AllocatedStorage": 200});
+            let all = [i("shop-db-1", "db.r6g.xlarge", "a", Some("shop-db"), "aurora-postgresql"), i("shop-db-2", "db.r6g.xlarge", "b", Some("shop-db"), "aurora-postgresql"), analytics];
+            let all: Vec<Value> = all.into_iter().filter(|x| a.one("--db-instance-identifier").is_none_or(|id| x["DBInstanceIdentifier"] == json!(id))).collect();
+            json!({"DBInstances": all})
+        }
+        ("rds", "describe-events") => {
+            let id = a.one("--source-identifier").unwrap_or_default();
+            let e = |m: u32, msg: &str| json!({"SourceIdentifier": id, "SourceType": "db-instance", "Message": msg, "Date": ago(Duration::minutes(m.into()))});
+            json!({"Events": if id == "analytics" {
+                vec![e(600, "Backing up DB instance"), e(597, "Finished DB Instance backup"), e(7, "Applying modification to database instance class"), e(5, "DB instance shutdown")]
+            } else {
+                vec![e(600, "Backing up DB instance"), e(597, "Finished DB Instance backup")]
+            }})
         }
 
-        ("lambda", "list-functions") => {
-            let f = |n: &str, rt: &str, mem: u32, t: u32| json!({
-                "FunctionName": n, "FunctionArn": format!("arn:aws:lambda:{r}:{ACCT}:function:{n}"), "Runtime": rt, "MemorySize": mem, "Timeout": t,
-                "CodeSize": 4_200_000, "LastModified": ago(Duration::days(12)), "Architectures": ["arm64"], "Handler": "index.handler",
-                "LoggingConfig": {"LogGroup": format!("/aws/lambda/{n}")},
-            });
-            json!({"Functions": [f("thumbnail-generator", "nodejs22.x", 1024, 30), f("stripe-webhook", "python3.13", 256, 10), f("nightly-export", "python3.13", 2048, 900)]})
+        ("lambda", "list-functions") => json!({"Functions": functions(r)}),
+        ("lambda", "get-function-configuration") => {
+            let name = a.one("--function-name").unwrap_or_default();
+            let mut f = functions(r).into_iter().find(|f| f["FunctionName"] == json!(name)).ok_or_else(|| AwsError::Api(format!("function {name} not found")))?;
+            // stripe-webhook is mid-deploy, for the STATUS column and its live `d` page.
+            let updating = name == "stripe-webhook";
+            f["State"] = json!("Active");
+            f["LastUpdateStatus"] = json!(if updating { "InProgress" } else { "Successful" });
+            if updating {
+                f["LastUpdateStatusReason"] = json!("The function is being created.");
+                f["LastUpdateStatusReasonCode"] = json!("Creating");
+            }
+            f["CodeSha256"] = json!(hex(&name, 43));
+            f["Version"] = json!("$LATEST");
+            f["PackageType"] = json!("Zip");
+            f["Role"] = json!(format!("arn:aws:iam::{ACCT}:role/{name}-role"));
+            f
         }
 
         _ => return Err(AwsError::Api(format!("e9s does not call aws {service} {op}"))),
     })
+}
+
+fn functions(r: &str) -> Vec<Value> {
+    let f = |n: &str, rt: &str, mem: u32, t: u32, age: Duration| json!({
+        "FunctionName": n, "FunctionArn": format!("arn:aws:lambda:{r}:{ACCT}:function:{n}"), "Runtime": rt, "MemorySize": mem, "Timeout": t,
+        "CodeSize": 4_200_000, "LastModified": ago(age), "Architectures": ["arm64"], "Handler": "index.handler",
+        "LoggingConfig": {"LogGroup": format!("/aws/lambda/{n}")},
+    });
+    vec![
+        f("thumbnail-generator", "nodejs22.x", 1024, 30, Duration::days(12)),
+        f("stripe-webhook", "python3.13", 256, 10, Duration::minutes(2)),
+        f("nightly-export", "python3.13", 2048, 900, Duration::days(12)),
+    ]
 }
 
 struct Args<'a>(&'a [String]);

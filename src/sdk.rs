@@ -61,6 +61,10 @@ impl Args<'_> {
     fn one(&self, flag: &str) -> Option<String> {
         self.all(flag).into_iter().next()
     }
+    /// The argument right after `flag`, even one starting with "--" (a secret value can).
+    fn raw(&self, flag: &str) -> Option<String> {
+        self.0.iter().skip_while(|a| *a != flag).nth(1).cloned()
+    }
     fn has(&self, flag: &str) -> bool {
         self.0.iter().any(|a| a == flag)
     }
@@ -214,6 +218,19 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                 .await
                 .map_err(e!())?;
             json!({"services": r.services().iter().map(ecs_service).collect::<Vec<_>>(), "failures": ecs_failures(r.failures())})
+        }
+        // --write only (aws.rs), and only the desired count or a restart: no other update-service argument is sent.
+        ("ecs", "update-service") => {
+            let r = aws_sdk_ecs::Client::new(&cfg)
+                .update_service()
+                .set_cluster(a.one("--cluster"))
+                .set_service(a.one("--service"))
+                .set_desired_count(a.one("--desired-count").and_then(|v| v.parse().ok()))
+                .set_force_new_deployment(a.has("--force-new-deployment").then_some(true))
+                .send()
+                .await
+                .map_err(e!())?;
+            json!({"service": r.service().map(ecs_service)})
         }
         ("ecs", "list-tasks") => {
             let c = aws_sdk_ecs::Client::new(&cfg);
@@ -466,6 +483,66 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                     Ok((x, r.next_token().map(String::from)))
                 }
             }).await?)
+        }
+        ("application-autoscaling", "describe-scheduled-actions") => {
+            let c = aws_sdk_applicationautoscaling::Client::new(&cfg);
+            let ns = a.one("--service-namespace");
+            listed("ScheduledActions", pages(max, |t| {
+                let (c, ns) = (c.clone(), ns.clone());
+                async move {
+                    let r = c.describe_scheduled_actions().set_service_namespace(ns.map(|n| n.as_str().into())).set_next_token(t).send().await.map_err(e!())?;
+                    let x = r
+                        .scheduled_actions()
+                        .iter()
+                        .map(|x| json!({
+                            "ScheduledActionName": x.scheduled_action_name(), "ResourceId": x.resource_id(),
+                            "ScalableDimension": x.scalable_dimension().map(|d| d.as_str()), "Schedule": x.schedule(),
+                            "ScalableTargetAction": x.scalable_target_action().map(|a| json!({"MinCapacity": a.min_capacity(), "MaxCapacity": a.max_capacity()})),
+                        }))
+                        .collect();
+                    Ok((x, r.next_token().map(String::from)))
+                }
+            }).await?)
+        }
+        // --write only (aws.rs).
+        ("application-autoscaling", "register-scalable-target") => {
+            aws_sdk_applicationautoscaling::Client::new(&cfg)
+                .register_scalable_target()
+                .set_service_namespace(a.one("--service-namespace").map(|n| n.as_str().into()))
+                .set_resource_id(a.one("--resource-id"))
+                .set_scalable_dimension(a.one("--scalable-dimension").map(|d| d.as_str().into()))
+                .set_min_capacity(a.one("--min-capacity").and_then(|v| v.parse().ok()))
+                .set_max_capacity(a.one("--max-capacity").and_then(|v| v.parse().ok()))
+                .send()
+                .await
+                .map_err(e!())?;
+            json!({})
+        }
+        // --write only. `--scalable-target-action MinCapacity=2,MaxCapacity=10`, the CLI's shorthand.
+        ("application-autoscaling", "put-scheduled-action") => {
+            let act: HashMap<String, i32> = a
+                .one("--scalable-target-action")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|kv| kv.split_once('=').and_then(|(k, v)| Some((k.to_string(), v.parse().ok()?))))
+                .collect();
+            aws_sdk_applicationautoscaling::Client::new(&cfg)
+                .put_scheduled_action()
+                .set_service_namespace(a.one("--service-namespace").map(|n| n.as_str().into()))
+                .set_scheduled_action_name(a.one("--scheduled-action-name"))
+                .set_resource_id(a.one("--resource-id"))
+                .set_scalable_dimension(a.one("--scalable-dimension").map(|d| d.as_str().into()))
+                .set_schedule(a.one("--schedule"))
+                .scalable_target_action(
+                    aws_sdk_applicationautoscaling::types::ScalableTargetAction::builder()
+                        .set_min_capacity(act.get("MinCapacity").copied())
+                        .set_max_capacity(act.get("MaxCapacity").copied())
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(e!())?;
+            json!({})
         }
         ("application-autoscaling", "describe-scaling-policies") => {
             let c = aws_sdk_applicationautoscaling::Client::new(&cfg);
@@ -886,6 +963,48 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                 "LastUpdateStatusReasonCode": f.last_update_status_reason_code().map(|x| x.as_str()),
                 "LoggingConfig": f.logging_config().map(|l| json!({"LogGroup": l.log_group()})),
             })
+        }
+
+        // ---------- Secrets Manager ----------
+        ("secretsmanager", "list-secrets") => {
+            let c = aws_sdk_secretsmanager::Client::new(&cfg);
+            listed("SecretList", pages(max, |t| {
+                let c = c.clone();
+                async move {
+                    let r = c.list_secrets().set_next_token(t).send().await.map_err(e!())?;
+                    let x = r
+                        .secret_list()
+                        .iter()
+                        .map(|x| json!({
+                            "Name": x.name(), "ARN": x.arn(), "Description": x.description(), "KmsKeyId": x.kms_key_id(),
+                            "RotationEnabled": x.rotation_enabled(), "LastRotatedDate": ts(x.last_rotated_date()),
+                            "NextRotationDate": ts(x.next_rotation_date()), "LastChangedDate": ts(x.last_changed_date()),
+                            "LastAccessedDate": ts(x.last_accessed_date()), "CreatedDate": ts(x.created_date()),
+                            "OwningService": x.owning_service(), "PrimaryRegion": x.primary_region(),
+                            "Tags": x.tags().iter().map(|t| json!({"Key": t.key(), "Value": t.value()})).collect::<Vec<_>>(),
+                        }))
+                        .collect();
+                    Ok((x, r.next_token().map(String::from)))
+                }
+            }).await?)
+        }
+        // --write only (aws.rs). The value comes back as is: e9s shows it only when asked (x).
+        ("secretsmanager", "get-secret-value") => {
+            let r = aws_sdk_secretsmanager::Client::new(&cfg).get_secret_value().set_secret_id(a.one("--secret-id")).send().await.map_err(e!())?;
+            json!({
+                "Name": r.name(), "ARN": r.arn(), "VersionId": r.version_id(), "SecretString": r.secret_string(),
+                "SecretBinary": r.secret_binary().map(|b| format!("<{} bytes of binary>", b.as_ref().len())), "CreatedDate": ts(r.created_date()),
+            })
+        }
+        ("secretsmanager", "put-secret-value") => {
+            let r = aws_sdk_secretsmanager::Client::new(&cfg)
+                .put_secret_value()
+                .set_secret_id(a.one("--secret-id"))
+                .set_secret_string(a.raw("--secret-string"))
+                .send()
+                .await
+                .map_err(e!())?;
+            json!({"Name": r.name(), "ARN": r.arn(), "VersionId": r.version_id()})
         }
 
         _ => return Err(AwsError::Api(format!("e9s does not call aws {service} {op}"))),

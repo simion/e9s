@@ -50,7 +50,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let width = f.area().width.saturating_sub(1) as usize;
     let notes: Vec<(Health, String)> = notes.into_iter().flat_map(|(h, t)| wrap(&format!(" {t}"), width).into_iter().map(move |l| (h, l))).collect();
     let note_h = notes.len().min(12) as u16;
-    let prompt_h = if matches!(app.mode, Mode::Command(_) | Mode::Filter(_) | Mode::Pattern(_)) { 3 } else { 0 };
+    let prompt_h = if matches!(app.mode, Mode::Command(_) | Mode::Filter(_) | Mode::Pattern(_) | Mode::Value(_)) { 3 } else { 0 };
     let [head, prompt_area, note_area, body, foot] = Layout::vertical([
         Constraint::Length(header_height(app, f.area())),
         Constraint::Length(prompt_h),
@@ -95,6 +95,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Mode::OfferLogin(l) = &app.mode {
         offer_login(f, &app.aws.ctx.profile, l);
+    }
+    if let Mode::Confirm(w, ok) = &app.mode {
+        confirm_write(f, w, *ok);
     }
     if let Mode::Calls(off) = app.mode {
         let max = calls(f, app.top().id, off);
@@ -213,10 +216,18 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
         View::Pulse => vec![("<enter>", "Open")],
         _ => vec![],
     };
+    let write = crate::aws::WRITE.load(std::sync::atomic::Ordering::Relaxed);
+    match view {
+        View::Services { .. } if write => v.extend([("<r>", "Restart"), ("<s>", "Scale")]),
+        View::ScalableTargets { .. } if write => v.push(("<s>", "Min/max")),
+        View::SecretValue { .. } => v.extend([("<x>", "Show/hide"), ("<c>", "Copy"), ("<e>", "Edit"), ("<E>", "$EDITOR")]),
+        _ => {}
+    }
     if !matches!(view, View::Detail { .. }) {
         v.extend([("<d>", "Describe"), ("<y>", "YAML")]);
     }
-    v.extend([("<r>", "Refresh"), ("<esc>", "Back"), ("<?>", "Help")]);
+    let refresh = if write && matches!(view, View::Services { .. }) { "<ctrl-r>" } else { "<r>" };
+    v.extend([(refresh, "Refresh"), ("<esc>", "Back"), ("<?>", "Help")]);
     v
 }
 
@@ -237,7 +248,13 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             // The role, not the whole ARN: assumed-role/<role>/<session>.
             let who = arn.split_once(":assumed-role/").or_else(|| arn.split_once(":user/")).map(|x| x.1).unwrap_or(arn);
             let role = sso_role(who.split('/').next().unwrap_or(who));
-            if app.read_only_role() { val(format!("{role} (RO)")) } else { Span::styled(format!("{role} (RW)"), Style::new().fg(Color::Indexed(220)).bold()) }
+            if crate::aws::WRITE.load(std::sync::atomic::Ordering::Relaxed) {
+                Span::styled(format!("{role} (--write)"), Style::new().fg(Color::White).bg(Color::Indexed(160)).bold())
+            } else if app.read_only_role() {
+                val(format!("{role} (RO)"))
+            } else {
+                Span::styled(format!("{role} (RW)"), Style::new().fg(Color::Indexed(220)).bold())
+            }
         }
         (None, Some(e)) => Span::styled(e.clone(), Style::new().fg(Color::Indexed(202))),
         (None, None) if ctx.profile.is_empty() && matches!(top.view, View::Profiles) => val("-".into()),
@@ -773,6 +790,14 @@ fn prompt(f: &mut Frame, app: &App, area: Rect) {
         }
         Mode::Filter(s) => ("/", s.clone(), String::new()),
         Mode::Pattern(s) => ("pattern: ", s.clone(), String::new()),
+        Mode::Value(s) => {
+            let label = match app.editing {
+                Some(crate::app::Editing::Range(_)) => "min max [for 2h]: ",
+                Some(crate::app::Editing::Desired { .. }) => "desired tasks: ",
+                _ => "new value: ",
+            };
+            (label, s.clone(), "  (Enter, then y applies · Esc cancels)".into())
+        }
         _ => return,
     };
     let line = Line::from(vec![
@@ -867,6 +892,31 @@ fn offer_login(f: &mut Frame, profile: &str, l: &crate::app::Login) {
         .borders(Borders::ALL)
         .border_style(Style::new().fg(ORANGE))
         .title(Line::styled(" Login expired ", Style::new().fg(ORANGE).bold()).centered());
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(lines).block(block), r);
+}
+
+/// Before a write, k9s style (`internal/ui/dialog/confirm.go`): what changes (names and numbers, never a secret's value),
+/// what to expect, and Cancel / OK buttons with Cancel focused first.
+fn confirm_write(f: &mut Frame, w: &crate::app::Pending, ok: bool) {
+    let mut lines = vec![Line::raw(""), Line::styled(format!("  {}", w.title), Style::new().fg(Color::White).bold()), Line::raw("")];
+    lines.extend(w.changes.iter().map(|c| Line::styled(format!("    {c}"), Style::new().fg(ORANGE).bold())));
+    lines.push(Line::raw(""));
+    lines.extend(wrap(&w.note, 90).into_iter().map(|l| Line::styled(format!("  {l}"), Style::new().fg(GRAY))));
+    // k9s dialog colours: buttons darkslateblue, the focused one dodgerblue, black labels.
+    let button = |label: &str, focus: bool| {
+        Span::styled(format!("  {label}  "), Style::new().fg(INK).bg(if focus { DODGER } else { Color::Rgb(72, 61, 139) }).bold())
+    };
+    lines.extend([Line::raw(""), Line::from(vec![button("Cancel", !ok), Span::raw("    "), button("OK", ok)]).centered()]);
+    let area = f.area();
+    let w = (lines.iter().map(|l| l.width()).max().unwrap_or(40) as u16 + 4).min(area.width);
+    let h = (lines.len() as u16 + 3).min(area.height);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Indexed(160)))
+        .title(Line::styled(" Write to AWS ", Style::new().fg(Color::Indexed(160)).bold()).centered())
+        .style(Style::new().bg(INK));
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).block(block), r);
 }

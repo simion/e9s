@@ -209,6 +209,13 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
                 .collect();
             json!({"ScalableTargets": x})
         }
+        // checkout was raised for a sale with `s 4 20 for 3h`; it goes back to 2-12.
+        ("application-autoscaling", "describe-scheduled-actions") => json!({"ScheduledActions": [{
+            "ScheduledActionName": "e9s-restore", "ResourceId": format!("service/{CLUSTER}/checkout"), "ScalableDimension": "ecs:service:DesiredCount",
+            "Schedule": format!("at({})", (Utc::now() + Duration::hours(3)).format("%Y-%m-%dT%H:%M:%S")), "ScalableTargetAction": {"MinCapacity": 2, "MaxCapacity": 12},
+        }]}),
+        ("application-autoscaling", "register-scalable-target") | ("application-autoscaling", "put-scheduled-action") => json!({}),
+        ("ecs", "update-service") => json!({"service": {"serviceName": a.one("--service"), "desiredCount": a.one("--desired-count")}}),
         ("application-autoscaling", "describe-scaling-policies") => {
             let res = a.one("--resource-id");
             let x: Vec<Value> = scaled()
@@ -280,6 +287,31 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
             json!({"imageDetails": x})
         }
 
+        ("secretsmanager", "list-secrets") => {
+            let sec = |name: &str, desc: &str, changed: i64, read: i64, rotation: bool| json!({
+                "Name": name, "ARN": format!("arn:aws:secretsmanager:{r}:{ACCT}:secret:{name}-AbCdEf"), "Description": desc,
+                "RotationEnabled": rotation, "LastChangedDate": ago(Duration::days(changed)), "LastAccessedDate": ago(Duration::days(read)),
+                "CreatedDate": ago(Duration::days(400)),
+            });
+            json!({"SecretList": [
+                sec("prod/checkout/stripe", "Stripe API keys for checkout", 30, 0, false),
+                sec("prod/shop/db", "Postgres credentials for shop-prod", 2, 0, true),
+                sec("prod/api/jwt-signing-key", "Private key that signs session tokens", 90, 1, false),
+                sec("staging/shop/db", "Postgres credentials for staging", 12, 3, true),
+            ]})
+        }
+        ("secretsmanager", "get-secret-value") => {
+            let name = a.one("--secret-id").unwrap_or_default();
+            let value = if name.contains("jwt") {
+                "-----BEGIN PRIVATE KEY-----\nMIIEdemoNotARealKey\n-----END PRIVATE KEY-----".to_string()
+            } else if name.contains("stripe") {
+                json!({"STRIPE_API_KEY": "sk_demo_123", "STRIPE_WEBHOOK_SECRET": "whsec_demo_456"}).to_string()
+            } else {
+                json!({"username": "shop", "password": "demo-password", "host": "shop-prod.cluster-demo.rds.amazonaws.com", "port": 5432}).to_string()
+            };
+            json!({"Name": name, "VersionId": "a1b2c3d4-demo", "SecretString": value})
+        }
+        ("secretsmanager", "put-secret-value") => json!({"Name": a.one("--secret-id"), "VersionId": "e5f6a7b8-demo"}),
         ("sqs", "list-queues") => {
             let q: Vec<String> = ["orders", "orders-dlq", "emails", "image-jobs", "search-reindex"].iter().map(|q| format!("https://sqs.{r}.amazonaws.com/{ACCT}/{q}")).collect();
             json!({"QueueUrls": q})

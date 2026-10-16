@@ -1,12 +1,16 @@
 # e9s
 
-A read-only, k9s-style terminal UI for AWS.
+A k9s-style terminal UI for AWS, read-only unless started with `--write`.
 Browse ECS clusters, services, tasks and containers, read and live-tail their CloudWatch logs, and watch a deployment roll, with the same keys as k9s.
 
-It cannot change anything.
+By default it cannot change anything.
 Every AWS call goes through one function (`Aws::call` in `src/aws.rs`) that only lets through `describe-*`, `list-*` and `get-*` operations on an allowlist of services, plus `logs filter-log-events` and `cloudtrail lookup-events`.
 Credential getters such as `ecr get-login-password` are refused too.
 Environment variable and secret values are stripped from every response before they are shown or saved, so only their names appear.
+
+`--write` (or `--rw`) opens five more calls and nothing else:
+Secrets Manager values (`get-secret-value`, `put-secret-value`), a service's desired count or a restart (`ecs update-service`, only `--desired-count` or `--force-new-deployment` is ever sent), and a scaling target's range (`register-scalable-target`, plus `put-scheduled-action` to put the old range back later).
+Every write asks y/n and says what changes; secret values stay masked until `x`, the dialog names keys, never values, and a secret that changed since e9s read it is left alone.
 
 ![e9s: services, a rollout, live logs, metrics, failures and the AWS call log](docs/demo.gif)
 
@@ -90,7 +94,8 @@ Press `c` on any screen to copy the command that reopens it (or the nearest scre
 | `-c`, `--command CMD` | Open a view as if `:CMD` were typed inside: `-c rollout`, `-c tasks`, `-c 'logs <group> [pattern]'`, `-c sqs` |
 | `--refresh SECONDS` | Auto-refresh interval; `0` turns it off (default 10) |
 | `--headless` / `--logoless` / `--crumbsless` | Hide the header / the logo / the breadcrumbs |
-| `--readonly` | Accepted so k9s habits and aliases work; e9s is always read-only. `--write` is refused |
+| `--readonly` | Accepted so k9s habits and aliases work; e9s is read-only already |
+| `--write`, `--rw` | Allow the writes above: Secrets Manager values (`x` `c` `e` `E`), a service's desired count and a scaling range (`s`), restarting a service (`r`). The header says `--write` in red |
 | `-h`, `--help` | Usage |
 
 Startup follows k9s: choose where you are, then navigate.
@@ -125,7 +130,7 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; an RDS instance or cluster gets a live page (refreshed like a table) with pending changes as old -> new, how long the current change has been applying, pending maintenance, the last 24h of RDS events and the last 7 days of CloudTrail changes, to follow a modification step by step; a Lambda function gets a live page too, with its state, last update (updating, failed and why) and recent changes; anything else shows as YAML, and a structured log line is parsed first |
 | `y` | YAML of the selection: the fields e9s reads from AWS, under their API names |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
-| `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says e9s is read-only |
+| `s` | Logs: autoscroll (follow new lines) on / off, on by default. With `--write`, on a service: set its desired count (the dialog says whether autoscaling will move it back); on a scaling target (`:scaling`): set min and max, as `4 20`, or `4 20 for 2h` to go back to the old range after 2h (`m`, `h`, `d`). The way back is an Application Auto Scaling scheduled action named `e9s-restore`, so it happens even if e9s is closed, and the RESTORE column shows it. Elsewhere `s` (shell in k9s) says e9s is read-only |
 | `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs |
 | `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected |
 | `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
@@ -136,10 +141,11 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `m` / `C` / `c` | Logs: draw a mark line across the view / clear the screen (following continues) / copy the lines shown (after the filter) |
 | `ctrl-s` | Save the current view (after filter and sort) to `~/Downloads`. Logs save as a `.log` with full timestamps and task ids, including every line tailed so far (the view keeps the last 50,000) |
 | `R` | Rollout watch for the selected service (see below) |
-| `e` | Events of the selected service, newest first, untruncated |
+| `e` | Events of the selected service, newest first, untruncated. On a secret (`--write`): edit the selected value, then OK in the dialog saves |
+| `E` `x` | On a secret (`--write`): edit the whole secret in `$VISUAL` or `$EDITOR` (JSON one key per line, in a 0600 temp file deleted after), show or hide values |
 | `m` | CloudWatch metrics for the selected service, load balancer, target group, RDS instance or cluster (CPU, connections, free storage and memory, latency) or Lambda function (invocations, errors, throttles, duration p95, concurrency) |
 | `T` | Who changed it: CloudTrail write events of the selected RDS, Lambda or EC2 resource, last 7 days. Also from their `d` page |
-| `r` / `ctrl-r` | Refresh now (also re-checks identity after an SSO login) |
+| `r` / `ctrl-r` | Refresh now (also re-checks identity after an SSO login). With `--write`, `r` on a service restarts it as in k9s: a new deployment of the same task definition, so tasks start again and read changed secrets; the rollout watch opens after OK. `ctrl-r` still refreshes there |
 | `c` | Copy the command line that reopens this view (pbcopy, wl-copy or xclip). In logs `c` copies the lines instead, and in describe and YAML the page, as in k9s |
 | `+` | Auto-refresh interval: off, 5, 10, 15, 30, 60 seconds, then off again. The header shows the countdown |
 | `[` `]` `-` | As in k9s: back and forward through the commands typed after `:`, and back to the one before |
@@ -177,6 +183,7 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `:pulse` `:pu` `:overview` | Everything not healthy on one screen: alarms firing, ECS services (every cluster) failing or rolling, RDS not available or changing, Lambda failing, updating or throttled. Enter opens it |
 | `:alarms` `:al` | CloudWatch alarms, firing first, with condition, actions and why. Target-tracking scaling alarms are dimmed at the bottom (their ALARM drives scale-in). Enter opens the resource the alarm watches |
 | `:trail` `:ct` `[name]` | CloudTrail write events of the last 24h: who, what, which resource, and the error if it failed; `d` shows the call with secrets redacted. With a name, that resource's last 7 days |
+| `:secrets` `:sm` `[name]` | Secrets Manager: name, description, last changed, last read, rotation. Enter (or a name) opens one secret's keys, which needs `--write`; without it only the list is readable |
 | `:access` `:can` | Each read e9s makes, tried once with this profile: allowed or denied, and which view it feeds |
 | `:profile` `:ctx` `[name]` | Profile picker, or switch to a profile |
 | `:region` `:regions` `[name]` | Region scan, or switch to a region |
@@ -191,7 +198,7 @@ The k9s path from deployments to pods to containers to logs maps to:
 
 `regions` › `clusters` › `services` › `tasks` › `containers` › `l` logs
 
-- **Services** tag each service with `FAILED 1H`: its failed task stops (failed health check, failed start, crash) and problem service events of the last hour. A tagged service is red; `F` lists what failed.
+- **Services** tag each service with `FAILED 1H`: its failed task stops (failed health check, failed start, crash) and problem service events of the last hour. It is red while its current deployment fails, and yellow with `before deploy` when every failure came before the latest deployment (a fix or restart that has not failed yet); `F` lists what failed in the same colours.
 - **Services** split each service by deployment generation. `NEW` is new-generation running tasks over the service's `desiredCount`; `OLD` is what the old generation still runs. `RUN(ALL)` is ECS's `runningCount`, the sum of both generations, so it is never rollout progress.
 - **Tasks** list RUNNING and STOPPED tasks together. Each shows its generation (`new` / `old`), task definition revision, AZ, reserved CPU/memory, start, stop and age, its target group state, and a `REASON` column built from the task's `stopCode` and `stoppedReason`, each container's exit code, reason and health, the target's health reason, and the matching "is unhealthy in target-group" service event.
 - ECS keeps stopped tasks for only about an hour; the view says so instead of showing an empty list as if nothing failed.

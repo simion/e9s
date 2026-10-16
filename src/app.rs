@@ -29,6 +29,36 @@ pub enum Mode {
     Calls(u16),
     /// The login expired: offer to run the login command for this profile.
     OfferLogin(Login),
+    /// `e` on a secret's key, `s` on a service or scaling target: the new value being typed.
+    Value(String),
+    /// A write waiting for y.
+    /// The bool: OK has focus (k9s starts on Cancel).
+    Confirm(Pending, bool),
+}
+
+/// What the value prompt is taking.
+pub enum Editing {
+    SecretKey(Secret, Option<String>),
+    /// A scaling target's row: its JSON and the RESTORE cell.
+    Range(Row),
+    Desired { cluster: String, service: String, now: i64 },
+}
+
+/// A write staged until y: what the dialog says, and what it does.
+pub struct Pending {
+    pub title: String,
+    /// Names and numbers only, never a secret's value.
+    pub changes: Vec<String>,
+    pub note: String,
+    write: Write,
+    /// Where to go once it is done (a restart: its rollout watch).
+    then: Option<View>,
+}
+
+enum Write {
+    Secret { read: Secret, text: String },
+    /// Calls run in order, stopping at the first failure.
+    Calls(Vec<(&'static str, &'static str, Vec<String>)>),
 }
 
 /// A login to run: the profile to log in and the `aws` arguments that do it.
@@ -61,6 +91,7 @@ pub const COMMANDS: &[(&[&str], &str)] = &[
     (&["alarms", "alarm", "al"], "CloudWatch alarms, firing first"),
     (&["trail", "ct", "changes"], "CloudTrail write events of the last 24h, or :trail <resource name> for its last 7 days"),
     (&["access", "can", "perms"], "which reads this profile may make"),
+    (&["secrets", "secret", "sm"], "Secrets Manager secrets; :secrets <name> opens one (values need --write)"),
     (&["profile", "ctx"], "pick a profile, or :profile <name>"),
     (&["region", "regions"], "regions with resource counts, or :region <name>"),
     (&["quit", "q"], "quit"),
@@ -86,7 +117,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("d", "describe: full detail of the selection"),
     ("y", "YAML of the selection: the fields e9s reads, under their API names"),
     ("l", "logs for the selection"),
-    ("s", "logs: autoscroll (follow new lines) on / off; on by default"),
+    ("s", "logs: autoscroll (follow new lines) on / off · services: desired count · scaling: min and max, `4 20 for 2h` puts the old ones back after 2h (--write)"),
     ("f", "logs, describe: fullscreen"),
     ("t", "logs: show or hide timestamps"),
     ("0-6", "logs: start from the tail, the head, or 1m 5m 15m 30m 1h back (elsewhere 0-9 are quick views)"),
@@ -97,10 +128,11 @@ pub const KEYS: &[(&str, &str)] = &[
     ("w", "wrap lines (logs, describe)"),
     ("ctrl-s", "save the current view to ~/Downloads (logs: every line so far, as .log)"),
     ("R", "rollout watch of the selected service"),
-    ("e", "events of the selected service"),
+    ("e", "events of the selected service · secret: edit the selected value (--write)"),
+    ("E x", "secret: edit the whole secret in $EDITOR, show or hide values (--write)"),
     ("m", "metrics (services, load balancers, target groups, RDS, Lambda)"),
     ("T", "who changed it: CloudTrail events of the selected RDS, Lambda or EC2 resource"),
-    ("r ctrl-r", "refresh now"),
+    ("r ctrl-r", "refresh now · with --write, r on a service restarts it (new tasks, same task definition) and ctrl-r refreshes, as in k9s"),
     ("L", "log in (aws sso login or aws login): the selected profile in :profile, else the current one; a role logs in its source profile"),
     ("c", "copy the command that reopens this view (logs: the lines shown; describe: the page)"),
     ("+", "auto-refresh interval: off, 5s, 10s, 15s, 30s, 60s, then off again"),
@@ -259,6 +291,10 @@ pub struct App {
     offered: bool,
     /// When credentials expired: the login that would renew them, for the header (None: nothing to run).
     pub expired_login: Option<Login>,
+    /// `E`: a secret to edit in $EDITOR; the main loop hands the terminal over.
+    pub editor: Option<Secret>,
+    /// What the value prompt (`Mode::Value`) is for.
+    pub editing: Option<Editing>,
     cluster: Option<String>,
     service: Option<String>,
     tx: Sender<Msg>,
@@ -280,7 +316,7 @@ impl App {
         let mut app = App {
             chrome: Default::default(), aws: Arc::new(Aws::new(Ctx { profile, region: home })), arn: None, account: None, ident_err: None, sso_expired: false,
             stack: vec![], mode: Mode::Normal, pick: None, history: vec![], hist_at: 0, hist_last: 0, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
-            quit: false, login: None, offered: false, expired_login: None, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
+            quit: false, login: None, offered: false, expired_login: None, editor: None, editing: None, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
         };
         if pick_profile {
             app.replace_root(View::Profiles);
@@ -544,6 +580,17 @@ impl App {
                 _ => self.mode = Mode::OfferLogin(l),
             },
             Mode::Calls(off) => self.mode = self.scroll(k, off).map_or(Mode::Normal, Mode::Calls),
+            // k9s: Cancel has focus first, arrows or Tab move it, Enter presses it.
+            Mode::Confirm(w, ok) => match k.code {
+                KeyCode::Enter if ok => self.apply(w),
+                KeyCode::Char('y') => self.apply(w),
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.flash("nothing written", false),
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Char('l') => self.mode = Mode::Confirm(w, !ok),
+                _ => self.mode = Mode::Confirm(w, ok),
+            },
+            // Tab is text here, not completion.
+            Mode::Value(s) if k.code == KeyCode::Tab => self.mode = Mode::Value(s),
+            Mode::Value(s) => self.mode = self.edit(s, k, Mode::Value, |app, s| app.submit(s)),
             Mode::Normal => self.normal_key(k),
             Mode::Command(s) if matches!(k.code, KeyCode::Up | KeyCode::Down) => {
                 // k9s: Up/Down walk the suggestions for what was typed.
@@ -630,6 +677,12 @@ impl App {
         }
         let page = self.page.max(1) as isize;
         match k.code {
+            KeyCode::Char('x') if matches!(self.top().view, View::SecretValue { .. }) => {
+                if let View::SecretValue { name, reveal } = self.top().view.clone() {
+                    self.replace_top(View::SecretValue { name, reveal: !reveal });
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('e') | KeyCode::Char('E') if !ctrl && matches!(self.top().view, View::SecretValue { .. }) => self.secret_key(k.code),
             KeyCode::Char(':') => self.mode = Mode::Command(String::new()),
             KeyCode::Char('/') => self.mode = Mode::Filter(self.top().filter.clone()),
             KeyCode::Char('?') => self.mode = Mode::Help(0),
@@ -656,6 +709,7 @@ impl App {
             KeyCode::Char('u') if ctrl => self.move_sel(-page),
             KeyCode::Char('f') if ctrl => self.move_sel(page),
             KeyCode::Char('b') if ctrl => self.move_sel(-page),
+            KeyCode::Char('r') if !ctrl && crate::aws::WRITE.load(Ordering::Relaxed) && matches!(self.top().view, View::Services { .. }) => self.stage_restart(),
             KeyCode::Char('r') => {
                 if self.sso_expired {
                     crate::sdk::reset(); // read the login again, in case it was renewed outside e9s
@@ -708,6 +762,7 @@ impl App {
                 f.wrap = !f.wrap;
             }
             KeyCode::Char('s') if ctrl => self.save(),
+            KeyCode::Char('s') if matches!(self.top().view, View::Services { .. } | View::ScalableTargets { .. }) => self.scale(),
             KeyCode::Char('s') => self.flash("e9s is read-only: no shell (ctrl-s saves this view)", true),
             KeyCode::Char('e') => match self.service_of_view() {
                 Some((cluster, service)) => self.push(View::Events { cluster, service }),
@@ -768,6 +823,203 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `c` `e` `E` on a secret: read it fresh (the screen may be minutes old), then copy, edit a key, or hand it to $EDITOR.
+    fn secret_key(&mut self, code: KeyCode) {
+        let View::SecretValue { name, .. } = self.top().view.clone() else { return };
+        let key = self.top().selected().and_then(|r| r.json["key"].as_str().map(String::from));
+        let sec = match read_secret(&self.aws.on_screen(self.top().id), &name) {
+            Ok(s) => s,
+            Err(e) => return self.flash(e.to_string(), true),
+        };
+        let value = match &key {
+            Some(k) => secret_keys(&sec.text).and_then(|kv| kv.into_iter().find(|(x, _)| x == k)).map(|(_, v)| v).unwrap_or_default(),
+            None => sec.text.clone(),
+        };
+        match code {
+            KeyCode::Char('c') => match copy_to_clipboard(&value) {
+                Ok(()) => self.flash(format!("copied the value of {}", key.as_deref().unwrap_or(&name)), false),
+                Err(e) => self.flash(e, true),
+            },
+            KeyCode::Char('e') => {
+                self.editing = Some(Editing::SecretKey(sec, key));
+                self.mode = Mode::Value(value);
+            }
+            _ => self.editor = Some(sec),
+        }
+    }
+
+    /// `s`: the desired count of a service, or the range of a scaling target.
+    fn scale(&mut self) {
+        if !crate::aws::WRITE.load(Ordering::Relaxed) {
+            return self.flash("s changes scaling only when e9s is started with --write", true);
+        }
+        let Some(row) = self.top().selected().cloned() else { return };
+        let num = |p: &str| crate::logic::n(&row.json, p);
+        if let View::Services { cluster } = self.top().view.clone() {
+            let now = num("/desiredCount");
+            self.mode = Mode::Value(now.to_string());
+            self.editing = Some(Editing::Desired { cluster, service: row.id.clone(), now });
+        } else {
+            self.mode = Mode::Value(format!("{} {}", num("/MinCapacity"), num("/MaxCapacity")));
+            self.editing = Some(Editing::Range(row));
+        }
+    }
+
+    /// Enter in the value prompt: stage what was typed for y.
+    fn submit(&mut self, input: String) {
+        match self.editing.take() {
+            Some(Editing::SecretKey(sec, key)) => {
+                let text = set_key(&sec.text, key.as_deref(), &input);
+                self.stage_secret(sec, text);
+            }
+            Some(Editing::Range(row)) => self.stage_range(&row, &input),
+            Some(Editing::Desired { cluster, service, now }) => self.stage_desired(cluster, service, now, &input),
+            None => {}
+        }
+    }
+
+    /// After $EDITOR: JSON goes back compact, as the console stores it; the newline an editor adds is dropped.
+    pub fn edited(&mut self, sec: Secret, result: Result<String, String>) {
+        match result {
+            Ok(text) => {
+                let text = match serde_json::from_str::<Value>(&text) {
+                    Ok(v @ Value::Object(_)) => v.to_string(),
+                    _ if !sec.text.ends_with('\n') => text.strip_suffix('\n').unwrap_or(&text).to_string(),
+                    _ => text,
+                };
+                self.stage_secret(sec, text);
+            }
+            Err(e) => self.flash(format!("editor: {e}; nothing written"), true),
+        }
+    }
+
+    fn stage_secret(&mut self, read: Secret, text: String) {
+        let changes = secret_change(&read.text, &text);
+        if changes.is_empty() {
+            return self.flash("no change, nothing written", false);
+        }
+        self.mode = Mode::Confirm(Pending {
+            title: format!("Save a new version of {}?", read.name),
+            changes,
+            note: "The current value stays as AWSPREVIOUS. Refused if the secret changed since e9s read it.".into(),
+            write: Write::Secret { read, text },
+            then: None,
+        }, false);
+    }
+
+    fn stage_range(&mut self, row: &Row, input: &str) {
+        let (min, max, secs) = match parse_scale(input) {
+            Ok(x) => x,
+            Err(e) => return self.flash(e, true),
+        };
+        let g = |p: &str| crate::logic::s(&row.json, p);
+        let (old_min, old_max) = (crate::logic::n(&row.json, "/MinCapacity"), crate::logic::n(&row.json, "/MaxCapacity"));
+        let (ns, id, dim) = (g("/ServiceNamespace"), g("/ResourceId"), g("/ScalableDimension"));
+        let mut changes: Vec<String> = [("min", old_min, min), ("max", old_max, max)].iter().filter(|(_, a, b)| a != b).map(|(k, a, b)| format!("{k} {a} -> {b}")).collect();
+        if changes.is_empty() && secs.is_none() {
+            return self.flash("no change, nothing written", false);
+        }
+        let target = |extra: &[String]| -> Vec<String> {
+            let mut a: Vec<String> = ["--service-namespace", &ns, "--resource-id", &id, "--scalable-dimension", &dim].map(String::from).to_vec();
+            a.extend_from_slice(extra);
+            a
+        };
+        let mut calls = vec![("application-autoscaling", "register-scalable-target", target(&["--min-capacity".into(), min.to_string(), "--max-capacity".into(), max.to_string()]))];
+        let mut note = "Autoscaling moves the count into the new range right away.".to_string();
+        match (secs, row.cells.get(5).filter(|c| !c.is_empty())) {
+            (Some(secs), _) => {
+                let at = (chrono::Utc::now() + chrono::Duration::seconds(secs)).format("%Y-%m-%dT%H:%M:%S").to_string();
+                changes.push(format!("back to {old_min}-{old_max} at {}", local_hm(&at)));
+                note += &format!(" The way back is an Application Auto Scaling scheduled action ({RESTORE_ACTION}), so it runs without e9s; RESTORE shows it.");
+                calls.push(("application-autoscaling", "put-scheduled-action", target(&[
+                    "--scheduled-action-name".into(), RESTORE_ACTION.into(), "--schedule".into(), format!("at({at})"),
+                    "--scalable-target-action".into(), format!("MinCapacity={old_min},MaxCapacity={old_max}"),
+                ])));
+            }
+            (None, Some(pending)) => note += &format!(" The restore already scheduled ({pending}) still runs."),
+            _ => {}
+        }
+        self.mode = Mode::Confirm(Pending { title: format!("Change the scaling range of {}?", id.trim_start_matches("service/")), changes, note, write: Write::Calls(calls), then: None }, false);
+    }
+
+    fn stage_desired(&mut self, cluster: String, service: String, now: i64, input: &str) {
+        let Some(count) = input.trim().parse::<i64>().ok().filter(|c| *c >= 0) else { return self.flash("type a task count, like 4", true) };
+        if count == now {
+            return self.flash("no change, nothing written", false);
+        }
+        // Autoscaling, if the service has it, can undo the change: say so before y.
+        let aws = self.aws.on_screen(self.top().id);
+        let id = format!("service/{cluster}/{service}");
+        let target = aws.call("application-autoscaling", "describe-scalable-targets", &["--service-namespace".into(), "ecs".into(), "--resource-ids".into(), id.clone()]);
+        let mine = |v: &Value| v["ScalableTargets"].as_array().and_then(|ts| ts.iter().find(|t| t["ResourceId"] == id.as_str()).cloned());
+        let note = match target.as_ref().map(mine) {
+            Ok(Some(t)) => {
+                let (lo, hi) = (crate::logic::n(&t, "/MinCapacity"), crate::logic::n(&t, "/MaxCapacity"));
+                if count < lo || count > hi {
+                    format!("Autoscaling keeps it between {lo} and {hi}, so it goes back into that range on its next scaling action. s in :scaling changes the range.")
+                } else {
+                    format!("Autoscaling (min {lo}, max {hi}) can change it again on its next scaling action.")
+                }
+            }
+            Ok(None) => "No autoscaling on this service: the count stays until someone changes it.".into(),
+            Err(e) => format!("Its autoscaling could not be read ({e}); autoscaling may change the count again."),
+        };
+        let args = ["--cluster", &cluster, "--service", &service, "--desired-count", &count.to_string()].map(String::from).to_vec();
+        self.mode = Mode::Confirm(Pending { title: format!("Change the desired count of {service}?"), changes: vec![format!("desired {now} -> {count}")], note, write: Write::Calls(vec![("ecs", "update-service", args)]), then: None }, false);
+    }
+
+    /// `r` on a service (--write): a new deployment of the same task definition, so tasks start
+    /// again and read secrets and parameters afresh. k9s `r` on a deployment.
+    fn stage_restart(&mut self) {
+        let View::Services { cluster } = self.top().view.clone() else { return };
+        let Some(row) = self.top().selected().cloned() else { return };
+        let j = &row.json;
+        let (desired, td) = (crate::logic::n(j, "/desiredCount"), crate::logic::s(j, "/taskDefinition"));
+        let dc = &j["deploymentConfiguration"];
+        let (lo, hi) = (crate::logic::s(dc, "/minimumHealthyPercent"), crate::logic::s(dc, "/maximumPercent"));
+        let service = row.id.clone();
+        let args = ["--cluster", &cluster, "--service", &service, "--force-new-deployment"].map(String::from).to_vec();
+        self.mode = Mode::Confirm(Pending {
+            title: format!("Restart {service}?"),
+            changes: vec![format!("new deployment: {desired} task(s) replaced, same task definition ({})", crate::logic::taskdef(&td))],
+            note: format!(
+                "ECS starts new tasks and stops the old ones as the new ones pass health checks (keeps at least {lo}% running, at most {hi}%). New tasks read secrets when they start, so a changed secret takes effect. The rollout watch opens next."
+            ),
+            write: Write::Calls(vec![("ecs", "update-service", args)]),
+            then: Some(View::Rollout { cluster, service }),
+        }, false);
+    }
+
+    /// y: do the staged write. A secret is read again first and left alone if it changed since.
+    fn apply(&mut self, p: Pending) {
+        let aws = self.aws.on_screen(self.top().id);
+        let r = match p.write {
+            Write::Secret { read, text } => read_secret(&aws, &read.name).and_then(|now| {
+                if now.version != read.version {
+                    return Err(AwsError::Api(format!("{} changed since e9s read it: nothing written, r reads it again", read.name)));
+                }
+                aws.call("secretsmanager", "put-secret-value", &["--secret-id".into(), read.name.clone(), "--secret-string".into(), text]).map(|_| ())
+            }),
+            Write::Calls(calls) => {
+                let mut done = vec![];
+                calls.iter().try_for_each(|(svc, op, args)| aws.call(svc, op, args).map(|_| done.push(*op))).map_err(|e| match done.is_empty() {
+                    true => e,
+                    false => AwsError::Api(format!("{e} · already done: {}", done.join(", "))),
+                })
+            }
+        };
+        match r {
+            Ok(()) => {
+                self.flash(format!("done: {}", p.changes.join(", ")), false);
+                match p.then {
+                    Some(v) => self.push(v),
+                    None => self.load(),
+                }
+            }
+            Err(e) => self.flash(e.to_string(), true),
         }
     }
 
@@ -871,6 +1123,8 @@ impl App {
                 View::Alarms => (None, None, Some("alarms".into())),
                 View::Trail { resource } => (None, None, Some(format!("trail {}", resource.as_deref().unwrap_or_default()).trim_end().to_string())),
                 View::Access => (None, None, Some("access".into())),
+                View::Secrets => (None, None, Some("secrets".into())),
+                View::SecretValue { name, .. } => (None, None, Some(format!("secrets {name}"))),
                 _ => continue,
             };
             let mut parts = vec![bin.clone()];
@@ -1201,6 +1455,10 @@ impl App {
             Some("alarms") => self.replace_root(View::Alarms),
             Some("trail") => self.replace_root(View::Trail { resource: arg }),
             Some("access") => self.replace_root(View::Access),
+            Some("secrets") => match arg {
+                Some(name) => self.replace_root(View::SecretValue { name, reveal: false }),
+                None => self.replace_root(View::Secrets),
+            },
             Some("profile") => match arg {
                 Some(p) => {
                     self.set_profile(p);
@@ -1271,6 +1529,7 @@ fn parents_of(view: &View) -> Vec<View> {
             vec![View::Clusters, View::Services { cluster: cluster.clone() }]
         }
         View::Logs { src: LogSrc::Group(_), .. } => vec![View::LogGroups],
+        View::SecretValue { .. } => vec![View::Secrets],
         View::ScalingPolicies { ns, .. } | View::ScalingActivities { ns, .. } => vec![View::ScalableTargets { ns: ns.clone() }],
         _ => vec![],
     }

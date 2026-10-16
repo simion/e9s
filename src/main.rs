@@ -38,7 +38,10 @@ HOW
       --headless         hide the header
       --logoless         hide the logo
       --crumbsless       hide the breadcrumbs
-      --readonly         accepted for k9s habits; e9s is always read-only
+      --readonly         accepted for k9s habits; e9s is read-only unless --write
+      --write, --rw      allow a few writes, each asked y/n: Secrets Manager values (x c e E), a service's
+                         desired count and a scaling target's min/max, optionally for a while (s),
+                         restarting a service (r, a new deployment)
   -h, --help             this help
 
 Press c inside to copy the command that reopens the view you are on, and ? for every key.";
@@ -69,9 +72,9 @@ fn main() -> std::io::Result<()> {
             "--logoless" => chrome.logoless = true,
             "--crumbsless" => chrome.crumbsless = true,
             "--script" => script = Some(value("--script")),
-            // k9s flag; e9s is always read-only, so it changes nothing.
+            // k9s flag; e9s is read-only already, so it changes nothing.
             "--readonly" => {}
-            "--write" => fail("e9s is read-only and has no --write mode"),
+            "--write" | "--rw" => aws::WRITE.store(true, std::sync::atomic::Ordering::Relaxed),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -122,6 +125,13 @@ fn main() -> std::io::Result<()> {
                 ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All))?;
                 app.logged_in(&l, result);
             }
+            if let Some(sec) = app.editor.take() {
+                ratatui::restore();
+                let result = edit_in_editor(&sec.text);
+                terminal = ratatui::init();
+                ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All))?;
+                app.edited(sec, result);
+            }
             while let Ok(m) = rx.try_recv() {
                 app.on_msg(m);
             }
@@ -145,6 +155,34 @@ fn run_login(l: &app::Login) -> Result<(), String> {
         Ok(st) => Err(format!("exited with {st}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("the aws CLI is not installed; logging in needs it".into()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The secret in a private temp file (0600), opened in $VISUAL or $EDITOR (vi), read back and deleted.
+/// JSON is laid out one key per line for editing.
+fn edit_in_editor(text: &str) -> Result<String, String> {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("e9s-secret-{}-{nanos}.txt", std::process::id()));
+    let body = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| text.to_string());
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(&path).and_then(|mut f| f.write_all(body.as_bytes())).map_err(|e| e.to_string())?;
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    // Through sh, so an editor with flags (`code -w`) works.
+    let status = std::process::Command::new("sh").arg("-c").arg(format!("{editor} \"$1\"")).arg("sh").arg(&path).status();
+    let out = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(st) if st.success() => out.map_err(|e| e.to_string()),
+        Ok(st) => Err(format!("{editor} exited with {st}")),
+        Err(e) => Err(format!("{editor}: {e}")),
     }
 }
 
@@ -212,6 +250,9 @@ fn run_script(app: &mut App, rx: &mpsc::Receiver<Msg>, script: &str) -> std::io:
         // No browser here: report the login that would run.
         if let Some(l) = app.login.take() {
             println!("login: aws {}", l.args.join(" "));
+        }
+        if let Some(sec) = app.editor.take() {
+            println!("editor: {}", sec.name);
         }
         let _ = term.draw(|f| ui::draw(f, app));
     }

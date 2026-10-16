@@ -143,6 +143,12 @@ pub fn about(view: &View) -> (&'static str, &'static [&'static str]) {
             "Each read e9s makes, tried once with this profile. Kubernetes: kubectl auth can-i.",
             "A denied read leaves its view or section empty with a red note; this screen says which ones up front.",
         ]),
+        View::Secrets | View::SecretValue { .. } => ("Secrets Manager", &[
+            "Secrets Manager stores passwords, API keys and certificates, versioned and optionally rotated by a Lambda. Kubernetes: a Secret, or External Secrets.",
+            "The list is names and details only. Values need e9s started with --write: x shows them, c copies one, e edits a key, E edits the whole secret in $EDITOR.",
+            "Every change asks y/n first, names only the keys it touches, and is refused if the secret changed since e9s read it. Each save is a new version (AWSCURRENT); the old one stays as AWSPREVIOUS.",
+            "Running tasks keep the value they started with: r on a service (with --write) restarts it so new tasks read the new value.",
+        ]),
         View::Detail { .. } => ("Describe", &[
             "The full object as AWS returned it. Kubernetes: kubectl get -o yaml / kubectl describe.",
         ]),

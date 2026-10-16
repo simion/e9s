@@ -8,7 +8,7 @@ The README is the user guide; this file is for whoever changes the code.
 ```sh
 make                          # list the targets
 make run ARGS="-p <profile>"  # build and launch
-make test                     # 26 tests, no AWS access needed
+make test                     # 33 tests, no AWS access needed
 make install                  # ./install.sh: a `e9s` launcher in ~/.local/bin that rebuilds when src/ changes
 e9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```
@@ -39,8 +39,9 @@ macOS has no `timeout`; run long checks in the background and kill them.
 
 ## Rules the code keeps
 
-- **Read-only.** Every call goes through `Aws::call`, which runs `check_read_only` first. Do not add a second path to the runner. `logs filter-log-events` and `cloudtrail lookup-events` are the only non-prefix reads allowed.
-- **Never show secrets.** Environment variable and secret values are redacted from every response (`logic.rs`, tested), including CloudTrail request parameters (keys naming a password, secret or token).
+- **Read-only.** Every call goes through `Aws::call`, which runs `check` first. Do not add a second path to the runner. `logs filter-log-events` and `cloudtrail lookup-events` are the only non-prefix reads allowed.
+- **`--write` opens `WRITES` only** (`aws.rs`): secret values, `ecs update-service` (`sdk.rs` sends only `--desired-count` or `--force-new-deployment`, the `r` restart), `register-scalable-target` and `put-scheduled-action` (the `e9s-restore` action behind `s ... for 2h`). Every write is staged as `app::Pending` and runs from a k9s-style dialog (Cancel focused first; arrows or Tab move to OK, Enter presses, `y` is a shortcut). A secret write reads it again and refuses if its version moved; the dialog names keys, never values. `H` shows `--secret-string` as `<redacted>`.
+- **Never show secrets** (except Secrets Manager values under `--write`, masked until `x`). Environment variable and secret values are redacted from every response (`logic.rs`, tested), including CloudTrail request parameters (keys naming a password, secret or token).
 - **Failures are loud.** A failed or partial fetch shows a note; it never renders as an empty or healthy list.
 - **k9s parity.** Keys and screens follow k9s. When adding log or table behaviour, read the k9s source first (github.com/derailed/k9s, `internal/view/log.go`, `log_indicator.go`) and match its keys.
 - **Measure before claiming speed.** The log design came from timing real calls (see below); keep doing that.

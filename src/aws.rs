@@ -1,5 +1,5 @@
 //! The only door to AWS. Every API call goes through `Aws::call`, which refuses
-//! anything that is not a read on an allowlisted service.
+//! anything that is not a read on an allowlisted service, except the secret reads and writes `--write` opens.
 
 use serde_json::Value;
 
@@ -28,12 +28,31 @@ impl std::fmt::Display for AwsError {
 }
 
 const SERVICES: &[&str] = &[
-    "ecs", "logs", "elbv2", "application-autoscaling", "ec2", "ecr", "sqs", "rds", "lambda", "cloudwatch", "sts", "cloudtrail",
+    "ecs", "logs", "elbv2", "application-autoscaling", "ec2", "ecr", "sqs", "rds", "lambda", "cloudwatch", "sts", "cloudtrail", "secretsmanager",
 ];
 const READ_PREFIXES: &[&str] = &["describe-", "list-", "get-"];
 const READ_EXACT: &[&str] = &["filter-log-events", "lookup-events"];
 // Reads that hand out credentials. Not mutations, but nothing here needs them.
-const DENIED: &[&str] = &["get-login-password", "get-authorization-token", "get-session-token", "get-federation-token", "get-password-data"];
+const DENIED: &[&str] = &["get-login-password", "get-authorization-token", "get-session-token", "get-federation-token", "get-password-data", "get-secret-value"];
+/// What `--write` opens, and nothing else: secret values, a service's desired count or a restart (sdk.rs sends
+/// only `--desired-count` or `--force-new-deployment` with update-service), a scaling range, and the scheduled action that restores it.
+const WRITES: &[(&str, &str)] = &[
+    ("secretsmanager", "get-secret-value"),
+    ("secretsmanager", "put-secret-value"),
+    ("ecs", "update-service"),
+    ("application-autoscaling", "register-scalable-target"),
+    ("application-autoscaling", "put-scheduled-action"),
+];
+/// Set once by `--write`, before the first call.
+pub static WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn check(service: &str, op: &str, write: bool) -> Result<(), AwsError> {
+    match (WRITES.contains(&(service, op)), write) {
+        (true, true) => Ok(()),
+        (true, false) => Err(AwsError::Api(format!("refused by read-only guard: aws {service} {op} needs e9s started with --write"))),
+        _ => check_read_only(service, op),
+    }
+}
 
 pub fn check_read_only(service: &str, op: &str) -> Result<(), AwsError> {
     let ok = SERVICES.contains(&service)
@@ -74,7 +93,7 @@ impl Aws {
     }
 
     pub fn call(&self, service: &str, op: &str, args: &[String]) -> Result<Value, AwsError> {
-        check_read_only(service, op)?;
+        check(service, op, WRITE.load(std::sync::atomic::Ordering::Relaxed))?;
         let mut shown = Call::start(self.screen, display_cmd(&self.ctx.region, service, op, args));
         let r = (self.runner)(&self.ctx, service, op, args);
         shown.ok = r.is_ok();
@@ -146,7 +165,11 @@ pub fn display_cmd(region: &str, service: &str, op: &str, args: &[String]) -> St
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        if a.starts_with("--") {
+        // A secret value can start with "--" (a PEM key), so its flag takes the next argument whatever it is.
+        if a == "--secret-string" {
+            out.push(format!("{a} {}", crate::logic::REDACTED));
+            i += 2;
+        } else if a.starts_with("--") {
             let vals: Vec<&String> = args[i + 1..].iter().take_while(|v| !v.starts_with("--")).collect();
             let shown = vals.first().map(|v| {
                 let v = if v.starts_with('[') || v.starts_with('{') {
@@ -450,5 +473,20 @@ mod tests {
             shown,
             "aws ecs describe-tasks --cluster prod --tasks 00000000000000000000000000000000 (+99) --metric-data-queries <json> --region us-west-1"
         );
+        let put = ["--secret-id", "db", "--secret-string", "-----BEGIN PRIVATE KEY-----"].map(String::from);
+        assert_eq!(display_cmd("r", "secretsmanager", "put-secret-value", &put), "aws secretsmanager put-secret-value --secret-id db --secret-string <redacted> --region r");
+    }
+
+    #[test]
+    fn write_opens_only_its_list() {
+        for (svc, op) in WRITES {
+            assert!(check(svc, op, false).is_err(), "{svc} {op} without --write");
+            assert!(check(svc, op, true).is_ok(), "{svc} {op} with --write");
+        }
+        for (svc, op) in [("secretsmanager", "delete-secret"), ("secretsmanager", "update-secret"), ("ecs", "delete-service"), ("ecs", "stop-task"),
+            ("application-autoscaling", "delete-scheduled-action"), ("application-autoscaling", "deregister-scalable-target")] {
+            assert!(check(svc, op, true).is_err(), "{svc} {op} allowed by --write");
+        }
+        assert!(check("secretsmanager", "list-secrets", false).is_ok());
     }
 }

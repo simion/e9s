@@ -216,6 +216,10 @@ pub enum View {
     Pulse,
     /// Which reads this profile may make, tried one by one.
     Access,
+    /// Secrets Manager: names and details, never values.
+    Secrets,
+    /// One secret's keys, values masked until `x` (`reveal`). Reading it needs `--write`.
+    SecretValue { name: String, reveal: bool },
     /// `live`: an RDS ("instance" or "cluster", id) or ("lambda", name) page fetched again on every refresh, to follow a change as it applies.
     Detail { title: String, lines: Vec<String>, live: Option<(String, String)> },
 }
@@ -284,6 +288,8 @@ impl View {
             View::Trail { resource: Some(r) } => format!("trail({r})"),
             View::Pulse => "pulse".into(),
             View::Access => "access".into(),
+            View::Secrets => "secrets".into(),
+            View::SecretValue { name, .. } => format!("secret({name})"),
             View::Detail { title, .. } => title.clone(),
         }
     }
@@ -294,7 +300,8 @@ impl View {
     }
 
     pub fn auto_refresh(&self) -> bool {
-        !matches!(self, View::Logs { .. } | View::Detail { live: None, .. } | View::Profiles | View::Regions | View::Aliases)
+        // A secret's value is read when asked for, not every few seconds.
+        !matches!(self, View::Logs { .. } | View::Detail { live: None, .. } | View::Profiles | View::Regions | View::Aliases | View::SecretValue { .. })
     }
 
     /// Where Enter goes.
@@ -318,6 +325,7 @@ impl View {
             },
             View::ScalableTargets { ns } => View::ScalingActivities { ns: ns.clone(), resource: Some(r.id.clone()) },
             View::EcrRepos => View::EcrImages { repo: r.id.clone() },
+            View::Secrets => View::SecretValue { name: r.id.clone(), reveal: false },
             View::Alarms => return alarm_target(j),
             View::Pulse => match s(j, "/kind").as_str() {
                 "alarm" => alarm_target(j).unwrap_or(View::Alarms),
@@ -480,6 +488,8 @@ impl View {
             View::Trail { resource } => trail(aws, resource.as_deref()),
             View::Pulse => pulse(aws),
             View::Access => access(aws),
+            View::Secrets => secrets(aws),
+            View::SecretValue { name, reveal } => secret_value(aws, name, *reveal),
         }
     }
 }
@@ -604,17 +614,28 @@ fn services(aws: &Aws, cluster: &str) -> Result<Table, AwsError> {
     svcs.sort_by_key(|v| s(v, "/serviceName"));
     for v in svcs {
         let name = s(&v, "/serviceName");
-        let (tasks, evs) = (failed_stops(&stopped, &name).len(), problem_events(&v).len());
-        let failed = match (tasks, evs) {
+        let sp = split_deployments(&v);
+        let (stops, evs) = (failed_stops(&stopped, &name), problem_events(&v));
+        let (tasks, evs_n) = (stops.len(), evs.len());
+        // Red only while the current deployment fails; failures that all came before it are yellow.
+        let now = stops.iter().any(|x| failed_now(&sp, x, "stoppedAt", true)) || evs.iter().any(|e| failed_now(&sp, e, "createdAt", false));
+        let failed = match (tasks, evs_n) {
             (0, 0) => "-".to_string(),
             (k, 0) => format!("{k} tasks"),
             (0, e) => format!("{e} events"),
             (k, e) => format!("{k} tasks, {e} events"),
-        };
-        let sp = split_deployments(&v);
+        } + if tasks + evs_n > 0 && !now { ", before deploy" } else { "" };
         let p = sp.primary.clone();
         let old = if sp.old.is_empty() { "-".to_string() } else { format!("{} ({}x)", sp.old_running(), sp.old.len()) };
-        let health = if tasks + evs > 0 { Health::Bad } else { sp.health(&s(&v, "/status")) };
+        let health = match (tasks + evs_n > 0, now) {
+            (true, true) => Health::Bad,
+            // A rollout in trouble stays red.
+            (true, false) => match sp.health(&s(&v, "/status")) {
+                Health::Bad => Health::Bad,
+                _ => Health::Warn,
+            },
+            _ => sp.health(&s(&v, "/status")),
+        };
         t.row(name.clone(), health, v.clone(), vec![
             name,
             s(&v, "/status"),
@@ -796,7 +817,9 @@ pub fn list_tasks(aws: &Aws, cluster: &str, service: Option<&str>, t: &mut Table
 fn list_tasks_in(aws: &Aws, cluster: &str, service: Option<&str>, statuses: &[&str], t: &mut Table) -> Result<Vec<Value>, AwsError> {
     let lists = par_map(statuses, |st| {
         let mut a = args!["--cluster", cluster, "--desired-status", st];
-        if let Some(sv) = service {
+        // --service-name misses stopped tasks of a deployment the service no longer lists (the old one,
+        // right after a rollout or restart), so stopped tasks are listed cluster-wide and matched by group below.
+        if let Some(sv) = service.filter(|_| *st != "STOPPED") {
             a.extend(args!["--service-name", sv]);
         }
         aws.call("ecs", "list-tasks", &a)
@@ -815,7 +838,8 @@ fn list_tasks_in(aws: &Aws, cluster: &str, service: Option<&str>, statuses: &[&s
     for (c, r) in chunks.iter().zip(results) {
         if let Some(mut v) = t.soft(r, &format!("describe-tasks ({} of {} tasks)", c.len(), arns.len()))? {
             redact(&mut v);
-            all.extend(arr(&v, "/tasks").iter().cloned());
+            let group = service.map(|sv| format!("service:{sv}"));
+            all.extend(arr(&v, "/tasks").iter().filter(|x| group.as_ref().is_none_or(|g| s(x, "/group") == *g)).cloned());
         }
     }
     all.sort_by_key(|x| (s(x, "/lastStatus") == "STOPPED", std::cmp::Reverse(parse_ts(&x["createdAt"]))));
@@ -924,6 +948,19 @@ fn failed_stops<'a>(stopped: &'a [Value], service: &str) -> Vec<&'a Value> {
     stopped.iter().filter(|x| s(x, "/group") == group && task_health(x) == Health::Bad).collect()
 }
 
+/// Whether a failure belongs to the current deployment: a task it started (`task`), or an event since it was created.
+/// Without a deployment to compare with, it counts as current.
+fn failed_now(sp: &Split, x: &Value, at: &str, task: bool) -> bool {
+    let Some(p) = &sp.primary else { return true };
+    if task {
+        return s(x, "/startedBy") == p.id;
+    }
+    match (parse_ts(&x[at]), parse_ts(&Value::String(p.created.clone()))) {
+        (Some(t), Some(c)) => t >= c,
+        _ => true,
+    }
+}
+
 /// A service's problem events (event_health red) of the last hour.
 fn problem_events(svc: &Value) -> Vec<&Value> {
     let since = Utc::now() - chrono::Duration::hours(1);
@@ -952,21 +989,23 @@ fn failures(aws: &Aws, cluster: &str, service: Option<&str>) -> Result<Table, Aw
             let reason = scratch.rows.pop().and_then(|r| r.cells.last().cloned()).unwrap_or_default();
             let kind = stop_kind(x, cx.split.as_ref().unwrap());
             let arn = s(x, "/taskArn");
+            let health = if failed_now(cx.split.as_ref().unwrap(), x, "stoppedAt", true) { Health::Bad } else { Health::Warn };
             rows.push((parse_ts(&x["stoppedAt"]), Row {
-                id: arn.clone(), health: Health::Bad, json: x.clone(),
+                id: arn.clone(), health, json: x.clone(),
                 cells: vec![age_at(x, "/stoppedAt"), name.clone(), kind.into(), short(&arn).chars().take(12).collect(), reason],
             }));
         }
         for e in problem_events(svc) {
+            let health = if failed_now(cx.split.as_ref().unwrap(), e, "createdAt", false) { Health::Bad } else { Health::Warn };
             rows.push((parse_ts(&e["createdAt"]), Row {
-                id: s(e, "/id"), health: Health::Bad, json: e.clone(),
+                id: s(e, "/id"), health, json: e.clone(),
                 cells: vec![age_at(e, "/createdAt"), name.clone(), "service event".into(), String::new(), short_event(&s(e, "/message"))],
             }));
         }
     }
     rows.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     t.rows = rows.into_iter().map(|(_, r)| r).collect();
-    t.info("last hour: ECS keeps stopped tasks about an hour and each service's last 100 events · Enter opens a task's containers or a service's events · l logs · d describe");
+    t.info("last hour, red: the current deployment, yellow: before it · ECS keeps stopped tasks about an hour and each service's last 100 events · Enter opens a task's containers or a service's events · l logs · d describe");
     t.empty = Some("nothing failed in the last hour: no failed task stops and no problem service events".into());
     Ok(t)
 }
@@ -1636,9 +1675,20 @@ fn targets(aws: &Aws, arn: &str) -> Result<Table, AwsError> {
 
 fn scalable_targets(aws: &Aws, ns: &str) -> Result<Table, AwsError> {
     let v = aws.call("application-autoscaling", "describe-scalable-targets", &args!["--service-namespace", ns])?;
-    let mut t = Table::new(&["RESOURCE", "SCALES", "MIN", "MAX", "SUSPENDED", "AGE"]);
-    t.info("autoscaling keeps each resource between MIN and MAX (Kubernetes: an HPA) · Enter: what it did · p: its rules");
+    let mut t = Table::new(&["RESOURCE", "SCALES", "MIN", "MAX", "SUSPENDED", "RESTORE", "AGE"]);
+    t.info("autoscaling keeps each resource between MIN and MAX (Kubernetes: an HPA) · Enter: what it did · p: its rules · s: change MIN and MAX (--write)");
+    let actions = t.soft(aws.call("application-autoscaling", "describe-scheduled-actions", &args!["--service-namespace", ns]), "describe-scheduled-actions")?.unwrap_or_default();
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     for x in arr(&v, "/ScalableTargets") {
+        // A range e9s set for a while: when it goes back, and to what.
+        let restore = arr(&actions, "/ScheduledActions")
+            .iter()
+            .find(|a| s(a, "/ScheduledActionName") == RESTORE_ACTION && s(a, "/ResourceId") == s(x, "/ResourceId"))
+            .and_then(|a| {
+                let at = s(a, "/Schedule").strip_prefix("at(")?.strip_suffix(')')?.to_string();
+                (at > now).then(|| format!("{}-{} at {}", s(a, "/ScalableTargetAction/MinCapacity"), s(a, "/ScalableTargetAction/MaxCapacity"), local_hm(&at)))
+            })
+            .unwrap_or_default();
         let susp: Vec<&str> = x
             .get("SuspendedState")
             .and_then(Value::as_object)
@@ -1650,10 +1700,55 @@ fn scalable_targets(aws: &Aws, ns: &str) -> Result<Table, AwsError> {
             s(x, "/MinCapacity"),
             s(x, "/MaxCapacity"),
             susp.join(","),
+            restore,
             age_at(x, "/CreationTime"),
         ]);
     }
     Ok(t)
+}
+
+/// The scheduled action that puts a range back after `s ... for 2h`; one per target, a new one replaces it.
+pub const RESTORE_ACTION: &str = "e9s-restore";
+
+/// A UTC `at()` time as local HH:MM, with the date when it is not today.
+pub fn local_hm(at: &str) -> String {
+    let Ok(t) = chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S") else { return at.to_string() };
+    let t = t.and_utc().with_timezone(&Local);
+    if t.date_naive() == Local::now().date_naive() { t.format("%H:%M").to_string() } else { t.format("%b %d %H:%M").to_string() }
+}
+
+/// `s` on a scaling target: "4 20", or "4 20 for 2h" to go back to the old range after that long (m, h, d).
+pub fn parse_scale(input: &str) -> Result<(i64, i64, Option<i64>), String> {
+    let mut w: Vec<&str> = input.split_whitespace().collect();
+    if w.get(2) == Some(&"for") {
+        if w.len() == 3 {
+            return Err("for how long? like 4 20 for 2h".into());
+        }
+        w.remove(2);
+    }
+    let num = |i: usize| w.get(i).and_then(|x| x.parse::<i64>().ok()).filter(|n| *n >= 0);
+    let (Some(min), Some(max)) = (num(0), num(1)) else { return Err("type min and max, like 4 20, or 4 20 for 2h".into()) };
+    if min > max {
+        return Err(format!("min {min} is above max {max}"));
+    }
+    let secs = match w.get(2) {
+        None => None,
+        Some(d) => {
+            let unit = d.chars().last().unwrap_or(' ');
+            let n = &d[..d.len() - unit.len_utf8()];
+            let mul = match unit {
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86400,
+                _ => 0,
+            };
+            match n.parse::<i64>() {
+                Ok(n) if n > 0 && mul > 0 && w.len() == 3 => Some(n * mul),
+                _ => return Err(format!("{d}: how long, like 30m, 2h or 1d")),
+            }
+        }
+    };
+    Ok((min, max, secs))
 }
 
 fn scaling_policies(aws: &Aws, ns: &str, resource: Option<&str>) -> Result<Table, AwsError> {
@@ -1917,6 +2012,111 @@ fn ecr_images(aws: &Aws, repo: &str) -> Result<Table, AwsError> {
             age_at(&i, "/lastRecordedPullTime"),
         ]);
     }
+    Ok(t)
+}
+
+// ---------- Secrets Manager ----------
+
+fn secrets(aws: &Aws) -> Result<Table, AwsError> {
+    let v = aws.call("secretsmanager", "list-secrets", &[])?;
+    let mut t = Table::new(&["NAME", "DESCRIPTION", "CHANGED", "LAST READ", "ROTATION", "OWNER"]);
+    t.info(if crate::aws::WRITE.load(std::sync::atomic::Ordering::Relaxed) {
+        "Enter opens a secret's keys (values masked until x) · e edits a key, E the whole secret in $EDITOR"
+    } else {
+        "names and details only · values need e9s started with --write"
+    });
+    t.trunc(&v, "list-secrets");
+    for x in arr(&v, "/SecretList") {
+        let name = s(x, "/Name");
+        let next = s(x, "/NextRotationDate");
+        let rotation = match (x["RotationEnabled"].as_bool() == Some(true), next.get(..10)) {
+            (true, Some(d)) => format!("on, next {d}"),
+            (true, None) => "on".into(),
+            _ => "off".into(),
+        };
+        t.row(name.clone(), Health::None, x.clone(), vec![
+            name,
+            s(x, "/Description"),
+            age_at(x, "/LastChangedDate"),
+            // AWS keeps only the day of the last read.
+            s(x, "/LastAccessedDate").get(..10).unwrap_or("never").to_string(),
+            rotation,
+            s(x, "/OwningService"),
+        ]);
+    }
+    t.empty = Some("no secrets in this region".into());
+    Ok(t)
+}
+
+/// A secret as read before a change: the version read, to refuse a write over a newer one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Secret {
+    pub name: String,
+    pub version: String,
+    pub text: String,
+}
+
+pub fn read_secret(aws: &Aws, name: &str) -> Result<Secret, AwsError> {
+    let v = aws.call("secretsmanager", "get-secret-value", &args!["--secret-id", name])?;
+    if v.get("SecretString").is_none() {
+        return Err(AwsError::Api(format!("{name} holds binary data; e9s reads and edits text secrets only")));
+    }
+    Ok(Secret { name: name.into(), version: s(&v, "/VersionId"), text: s(&v, "/SecretString") })
+}
+
+/// A JSON object secret as (key, value) pairs, values as text; None for any other secret.
+pub fn secret_keys(text: &str) -> Option<Vec<(String, String)>> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(m)) => Some(m.into_iter().map(|(k, v)| (k, v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect()),
+        _ => None,
+    }
+}
+
+/// The secret with one key set; without a key (a plain text secret) the whole value is replaced.
+/// A key that held a number or bool keeps it when the new text parses as JSON.
+pub fn set_key(text: &str, key: Option<&str>, new: &str) -> String {
+    let (Some(k), Ok(Value::Object(mut m))) = (key, serde_json::from_str::<Value>(text)) else { return new.to_string() };
+    let v = match m.get(k) {
+        Some(Value::String(_)) | None => Value::String(new.into()),
+        _ => serde_json::from_str(new).unwrap_or_else(|_| Value::String(new.into())),
+    };
+    m.insert(k.into(), v);
+    Value::Object(m).to_string()
+}
+
+/// What a new value changes, by key name only (never a value), for the confirm prompt. Empty: nothing.
+pub fn secret_change(old: &str, new: &str) -> Vec<String> {
+    let obj = |t: &str| match serde_json::from_str::<Value>(t) {
+        Ok(Value::Object(m)) => Some(m),
+        _ => None,
+    };
+    match (obj(old), obj(new)) {
+        (Some(a), Some(b)) => {
+            let mut out: Vec<String> = b.iter().filter(|(k, v)| a.get(*k) != Some(v)).map(|(k, _)| format!("{} {k}", if a.contains_key(k) { "change" } else { "add" })).collect();
+            out.extend(a.keys().filter(|k| !b.contains_key(*k)).map(|k| format!("remove {k}")));
+            out
+        }
+        (Some(_), None) => vec!["replace the JSON object with plain text".into()],
+        _ if old != new => vec!["change the value".into()],
+        _ => vec![],
+    }
+}
+
+fn secret_value(aws: &Aws, name: &str, reveal: bool) -> Result<Table, AwsError> {
+    let sec = read_secret(aws, name)?;
+    let mut t = Table::new(&["KEY", "VALUE"]);
+    let shown = |v: &str| if reveal { v.to_string() } else { "••••••••".into() };
+    t.info(format!(
+        "version {} · x {} values · c copies the selected value · e edits it · E edits the whole secret in $EDITOR · r reads it again",
+        sec.version.get(..8).unwrap_or(&sec.version),
+        if reveal { "hides" } else { "shows" }
+    ));
+    // The row keeps only the key: d and y never show a value.
+    match secret_keys(&sec.text) {
+        Some(kv) => kv.into_iter().for_each(|(k, v)| t.row(k.clone(), Health::None, json!({ "key": k }), vec![k, shown(&v)])),
+        None => t.row("", Health::None, json!({}), vec!["(plain text)".into(), shown(&sec.text)]),
+    }
+    t.empty = Some("the secret is an empty JSON object; E adds keys".into());
     Ok(t)
 }
 
@@ -2385,6 +2585,7 @@ fn access(aws: &Aws) -> Result<Table, AwsError> {
         ("rds", "describe-events", args!["--duration", 60], "rds d: events"),
         ("rds", "describe-pending-maintenance-actions", vec![], "rds d: maintenance"),
         ("lambda", "list-functions", args!["--max-items", 1], "lambda"),
+        ("secretsmanager", "list-secrets", vec![], "secrets (names only)"),
         ("cloudwatch", "describe-alarms", vec![], "alarms, pulse"),
         ("cloudtrail", "lookup-events", args!["--max-items", 1, "--start-time", five_min_ago], "trail, recent changes in d"),
     ];
@@ -2689,6 +2890,16 @@ mod tests {
     }
 
     #[test]
+    fn failures_before_the_current_deployment_are_history() {
+        let sp = split_deployments(&json!({"desiredCount": 2, "deployments": [
+            {"id": "ecs-svc/new", "status": "PRIMARY", "createdAt": "2026-10-16T13:26:10Z"}]}));
+        assert!(failed_now(&sp, &json!({"startedBy": "ecs-svc/new"}), "stoppedAt", true));
+        assert!(!failed_now(&sp, &json!({"startedBy": "ecs-svc/old"}), "stoppedAt", true), "a crash of the restarted generation");
+        assert!(failed_now(&sp, &json!({"createdAt": "2026-10-16T13:30:00Z"}), "createdAt", false));
+        assert!(!failed_now(&sp, &json!({"createdAt": "2026-10-16T13:00:00Z"}), "createdAt", false));
+    }
+
+    #[test]
     fn scheduler_scale_in_is_not_a_failure() {
         let drained = json!({"lastStatus": "STOPPED", "stopCode": "ServiceSchedulerInitiated",
             "stoppedReason": "Scaling activity initiated by (deployment ecs-svc/123)", "containers": [{"exitCode": 143}]});
@@ -2732,6 +2943,33 @@ mod tests {
         assert_eq!(alarm_target(&svc), Some(View::Events { cluster: "prod".into(), service: "api".into() }));
         assert_eq!(alarm_target(&dims(json!([{"Name": "DBInstanceIdentifier", "Value": "db"}]))), Some(View::Rds));
         assert_eq!(alarm_target(&json!({"AlarmRule": "ALARM(x)"})), None);
+    }
+
+    #[test]
+    fn secret_edits_change_only_what_was_asked() {
+        let old = r#"{"user":"app","password":"old","port":5432}"#;
+        let new = set_key(old, Some("password"), "new");
+        assert_eq!(secret_keys(&new).unwrap(), [("password", "new"), ("port", "5432"), ("user", "app")].map(|(k, v)| (k.to_string(), v.to_string())));
+        assert_eq!(set_key(old, Some("port"), "6432"), r#"{"password":"old","port":6432,"user":"app"}"#, "a number stays a number");
+        assert_eq!(set_key("plain", None, "other"), "other");
+        assert_eq!(secret_change(old, &new), ["change password"]);
+        assert_eq!(secret_change(old, r#"{"user":"app","port":5432,"host":"h"}"#), ["add host", "remove password"]);
+        assert!(secret_change(old, r#"{ "port": 5432, "user": "app", "password": "old" }"#).is_empty(), "formatting is no change");
+        assert_eq!(secret_change(old, "x"), ["replace the JSON object with plain text"]);
+        assert!(secret_change("a", "a").is_empty());
+        for c in secret_change(old, r#"{"user":"root","password":"hunter2"}"#) {
+            assert!(!c.contains("root") && !c.contains("hunter2"), "values never in the summary: {c}");
+        }
+    }
+
+    #[test]
+    fn scale_input() {
+        assert_eq!(parse_scale("4 20"), Ok((4, 20, None)));
+        assert_eq!(parse_scale(" 4 20 for 2h "), Ok((4, 20, Some(7200))));
+        assert_eq!(parse_scale("0 0 30m"), Ok((0, 0, Some(1800))));
+        for bad in ["", "4", "20 4", "4 20 2é", "-1 4", "4 20 for", "4 20 for 2x", "4 20 for 0h", "4 20 2h extra", "a b"] {
+            assert!(parse_scale(bad).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ macOS has no `timeout`; run long checks in the background and kill them.
 - **Never show secrets** (except Secrets Manager values under `--write`, masked until `x`). Environment variable and secret values are redacted from every response (`logic.rs`, tested), including CloudTrail request parameters (keys naming a password, secret or token).
 - **Failures are loud.** A failed or partial fetch shows a note; it never renders as an empty or healthy list.
 - **k9s parity.** Keys and screens follow k9s. When adding log or table behaviour, read the k9s source first (github.com/derailed/k9s, `internal/view/log.go`, `log_indicator.go`) and match its keys.
+- **Copy k9s behaviour, not its background.** k9s paints its whole screen black; e9s draws on the terminal's own background. A k9s colour copied as a background (`bg(INK)` on a dialog) shows as a black box on a dark gray terminal. Overlays use `Clear` and no background; only small marks (buttons, the selected row, crumbs) get one.
 - **Measure before claiming speed.** The log design came from timing real calls (see below); keep doing that.
 
 ## Log design, and why

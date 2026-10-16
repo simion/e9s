@@ -915,8 +915,7 @@ fn confirm_write(f: &mut Frame, w: &crate::app::Pending, ok: bool) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Indexed(160)))
-        .title(Line::styled(" Write to AWS ", Style::new().fg(Color::Indexed(160)).bold()).centered())
-        .style(Style::new().bg(INK));
+        .title(Line::styled(" Write to AWS ", Style::new().fg(Color::Indexed(160)).bold()).centered());
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).block(block), r);
 }

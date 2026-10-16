@@ -1,6 +1,6 @@
 [package]
 name = "e9s"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A read-only, k9s-style terminal UI for AWS: ECS, CloudWatch Logs, load balancers, autoscaling"
 license = "MIT"

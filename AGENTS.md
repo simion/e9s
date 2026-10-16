@@ -86,7 +86,7 @@ Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an exp
 Steps: `.claude/skills/release/SKILL.md` (`/release`).
 - Public at github.com/simion/e9s. CI (`.github/workflows/ci.yml`) runs tests on every push.
 - A `vX.Y.Z` tag runs `.github/workflows/release.yml` (cargo-dist, config in `dist-workspace.toml`, regenerate with `dist generate`): binaries for macOS and Linux, a GitHub release, and `Formula/e9s.rb` pushed to github.com/simion/homebrew-tap with the `HOMEBREW_TAP_TOKEN` secret. About 25 minutes, mostly the macOS builds.
-- crates.io is separate: `cargo publish`, run by Simion (the token is in `~/.cargo/credentials.toml`).
+- crates.io: `cargo publish`, run by the release skill from the main checkout (the token is in `~/.cargo/credentials.toml`, set by `cargo login`).
 - github.com/simion/homebrew-tap also holds a copy of Termic's cask; github.com/simion/homebrew-termic stays as it is.
 - README images come from `E9S_DEMO=1` only, never from a real account.
 

@@ -57,6 +57,10 @@ pub const COMMANDS: &[(&[&str], &str)] = &[
     (&["sqs"], "SQS queues"),
     (&["rds"], "RDS clusters and instances"),
     (&["lambda", "fn"], "Lambda functions"),
+    (&["pulse", "pu", "overview"], "everything not healthy: alarms, ECS services, RDS, Lambda"),
+    (&["alarms", "alarm", "al"], "CloudWatch alarms, firing first"),
+    (&["trail", "ct", "changes"], "CloudTrail write events of the last 24h, or :trail <resource name> for its last 7 days"),
+    (&["access", "can", "perms"], "which reads this profile may make"),
     (&["profile", "ctx"], "pick a profile, or :profile <name>"),
     (&["region", "regions"], "regions with resource counts, or :region <name>"),
     (&["quit", "q"], "quit"),
@@ -94,7 +98,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("ctrl-s", "save the current view to ~/Downloads (logs: every line so far, as .log)"),
     ("R", "rollout watch of the selected service"),
     ("e", "events of the selected service"),
-    ("m", "metrics (services, load balancers, target groups)"),
+    ("m", "metrics (services, load balancers, target groups, RDS, Lambda)"),
+    ("T", "who changed it: CloudTrail events of the selected RDS, Lambda or EC2 resource"),
     ("r ctrl-r", "refresh now"),
     ("L", "log in (aws sso login or aws login): the selected profile in :profile, else the current one; a role logs in its source profile"),
     ("c", "copy the command that reopens this view (logs: the lines shown; describe: the page)"),
@@ -712,6 +717,10 @@ impl App {
                 Some(target) => self.push(View::Metrics { target }),
                 None => self.flash("no metrics for this view", true),
             },
+            KeyCode::Char('T') => match self.top().selected().and_then(|r| self.top().view.trail_name(r)) {
+                Some(name) => self.push(View::Trail { resource: Some(name) }),
+                None => self.flash("T (who changed it) works on RDS, Lambda and EC2 rows; :trail lists every change", true),
+            },
             KeyCode::Char('p') => match (&self.top().view, self.top().selected()) {
                 (View::Logs { pattern, .. }, _) => self.mode = Mode::Pattern(pattern.clone()),
                 (View::ScalableTargets { ns }, Some(r)) => {
@@ -858,6 +867,10 @@ impl App {
                 View::Sqs => (None, None, Some("sqs".into())),
                 View::Rds => (None, None, Some("rds".into())),
                 View::Lambda => (None, None, Some("lambda".into())),
+                View::Pulse => (None, None, Some("pulse".into())),
+                View::Alarms => (None, None, Some("alarms".into())),
+                View::Trail { resource } => (None, None, Some(format!("trail {}", resource.as_deref().unwrap_or_default()).trim_end().to_string())),
+                View::Access => (None, None, Some("access".into())),
                 _ => continue,
             };
             let mut parts = vec![bin.clone()];
@@ -1184,6 +1197,10 @@ impl App {
             Some("sqs") => self.replace_root(View::Sqs),
             Some("rds") => self.replace_root(View::Rds),
             Some("lambda") => self.replace_root(View::Lambda),
+            Some("pulse") => self.replace_root(View::Pulse),
+            Some("alarms") => self.replace_root(View::Alarms),
+            Some("trail") => self.replace_root(View::Trail { resource: arg }),
+            Some("access") => self.replace_root(View::Access),
             Some("profile") => match arg {
                 Some(p) => {
                     self.set_profile(p);

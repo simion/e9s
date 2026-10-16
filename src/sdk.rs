@@ -735,6 +735,115 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
             }).await?)
         }
 
+        ("rds", "describe-pending-maintenance-actions") => {
+            let c = aws_sdk_rds::Client::new(&cfg);
+            let arn = a.one("--resource-identifier");
+            listed("PendingMaintenanceActions", pages(max, |t| {
+                let (c, arn) = (c.clone(), arn.clone());
+                async move {
+                    let r = c.describe_pending_maintenance_actions().set_resource_identifier(arn).set_marker(t).send().await.map_err(e!())?;
+                    let x = r
+                        .pending_maintenance_actions()
+                        .iter()
+                        .map(|x| json!({
+                            "ResourceIdentifier": x.resource_identifier(),
+                            "PendingMaintenanceActionDetails": x.pending_maintenance_action_details().iter().map(|d| json!({
+                                "Action": d.action(), "Description": d.description(), "OptInStatus": d.opt_in_status(),
+                                "AutoAppliedAfterDate": ts(d.auto_applied_after_date()), "ForcedApplyDate": ts(d.forced_apply_date()),
+                                "CurrentApplyDate": ts(d.current_apply_date()),
+                            })).collect::<Vec<_>>(),
+                        }))
+                        .collect();
+                    Ok((x, r.marker().map(String::from)))
+                }
+            }).await?)
+        }
+
+        // ---------- CloudWatch alarms ----------
+        ("cloudwatch", "describe-alarms") => {
+            use aws_sdk_cloudwatch::types::AlarmType;
+            let c = aws_sdk_cloudwatch::Client::new(&cfg);
+            let (mut metric, mut composite, mut token) = (vec![], vec![], None);
+            loop {
+                let r = c
+                    .describe_alarms()
+                    .set_alarm_types(Some(vec![AlarmType::MetricAlarm, AlarmType::CompositeAlarm]))
+                    .set_next_token(token)
+                    .send()
+                    .await
+                    .map_err(e!())?;
+                metric.extend(r.metric_alarms().iter().map(|x| json!({
+                    "AlarmName": x.alarm_name(), "AlarmArn": x.alarm_arn(), "AlarmDescription": x.alarm_description(),
+                    "StateValue": x.state_value().map(|v| v.as_str()), "StateReason": x.state_reason(),
+                    "StateUpdatedTimestamp": ts(x.state_updated_timestamp()), "StateTransitionedTimestamp": ts(x.state_transitioned_timestamp()),
+                    "MetricName": x.metric_name(), "Namespace": x.namespace(),
+                    "Dimensions": x.dimensions().iter().map(|d| json!({"Name": d.name(), "Value": d.value()})).collect::<Vec<_>>(),
+                    "Statistic": x.statistic().map(|v| v.as_str()), "ExtendedStatistic": x.extended_statistic(), "Period": x.period(),
+                    "EvaluationPeriods": x.evaluation_periods(), "DatapointsToAlarm": x.datapoints_to_alarm(), "Threshold": x.threshold(),
+                    "ComparisonOperator": x.comparison_operator().map(|v| v.as_str()), "TreatMissingData": x.treat_missing_data(),
+                    "ActionsEnabled": x.actions_enabled(), "AlarmActions": x.alarm_actions(),
+                    // Alarms on metric math have no single MetricName.
+                    "Metrics": x.metrics().iter().filter_map(|m| m.expression().map(|e| json!({"Id": m.id(), "Expression": e}))).collect::<Vec<_>>(),
+                })));
+                composite.extend(r.composite_alarms().iter().map(|x| json!({
+                    "AlarmName": x.alarm_name(), "AlarmArn": x.alarm_arn(), "AlarmDescription": x.alarm_description(),
+                    "StateValue": x.state_value().map(|v| v.as_str()), "StateReason": x.state_reason(),
+                    "StateUpdatedTimestamp": ts(x.state_updated_timestamp()), "StateTransitionedTimestamp": ts(x.state_transitioned_timestamp()),
+                    "AlarmRule": x.alarm_rule(), "ActionsEnabled": x.actions_enabled(), "AlarmActions": x.alarm_actions(),
+                })));
+                token = r.next_token().map(String::from);
+                if token.is_none() {
+                    break;
+                }
+            }
+            json!({"MetricAlarms": metric, "CompositeAlarms": composite})
+        }
+
+        // ---------- CloudTrail ----------
+        ("cloudtrail", "lookup-events") => {
+            use aws_sdk_cloudtrail::types::{LookupAttribute, LookupAttributeKey};
+            // The CLI's form: AttributeKey=ReadOnly,AttributeValue=false
+            let attrs: Vec<LookupAttribute> = a
+                .all("--lookup-attributes")
+                .iter()
+                .filter_map(|x| {
+                    let kv: HashMap<&str, &str> = x.split(',').filter_map(|p| p.split_once('=')).collect();
+                    LookupAttribute::builder()
+                        .attribute_key(LookupAttributeKey::from(*kv.get("AttributeKey")?))
+                        .attribute_value(*kv.get("AttributeValue")?)
+                        .build()
+                        .ok()
+                })
+                .collect();
+            let start = a.one("--start-time").map(|s| secs(&s));
+            let c = aws_sdk_cloudtrail::Client::new(&cfg);
+            listed("Events", pages(max, |t| {
+                let (c, attrs) = (c.clone(), attrs.clone());
+                async move {
+                    let r = c
+                        .lookup_events()
+                        .set_lookup_attributes(Some(attrs).filter(|x| !x.is_empty()))
+                        .set_start_time(start)
+                        .max_results(50)
+                        .set_next_token(t)
+                        .send()
+                        .await
+                        .map_err(e!())?;
+                    let x = r
+                        .events()
+                        .iter()
+                        .map(|x| json!({
+                            "EventId": x.event_id(), "EventName": x.event_name(), "ReadOnly": x.read_only(), "EventTime": ts(x.event_time()),
+                            "EventSource": x.event_source(), "Username": x.username(),
+                            "Resources": x.resources().iter().map(|r| json!({"ResourceType": r.resource_type(), "ResourceName": r.resource_name()})).collect::<Vec<_>>(),
+                            "CloudTrailEvent": x.cloud_trail_event(),
+                        }))
+                        .collect();
+                    Ok((x, r.next_token().map(String::from)))
+                }
+            }).await?)
+        }
+
         // ---------- Lambda ----------
         ("lambda", "list-functions") => {
             let c = aws_sdk_lambda::Client::new(&cfg);

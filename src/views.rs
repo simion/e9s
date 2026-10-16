@@ -170,6 +170,9 @@ pub enum MetricTarget {
     Service { cluster: String, service: String },
     Lb { arn: String },
     Tg { arn: String, lb: Option<String> },
+    /// RDS: kind is "instance" or "cluster".
+    Rds { kind: String, id: String },
+    Lambda { name: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -205,6 +208,14 @@ pub enum View {
     Sqs,
     Rds,
     Lambda,
+    /// CloudWatch alarms, firing first.
+    Alarms,
+    /// CloudTrail write events: the account's last 24h, or one resource's last 7 days.
+    Trail { resource: Option<String> },
+    /// Everything not healthy in one list: alarms, ECS services, RDS, Lambda.
+    Pulse,
+    /// Which reads this profile may make, tried one by one.
+    Access,
     /// `live`: an RDS ("instance" or "cluster", id) or ("lambda", name) page fetched again on every refresh, to follow a change as it applies.
     Detail { title: String, lines: Vec<String>, live: Option<(String, String)> },
 }
@@ -259,6 +270,8 @@ impl View {
             View::Metrics { target } => match target {
                 MetricTarget::Service { service, .. } => format!("metrics({service})"),
                 MetricTarget::Lb { arn } | MetricTarget::Tg { arn, .. } => format!("metrics({})", lb_name(arn)),
+                MetricTarget::Rds { id, .. } => format!("metrics({id})"),
+                MetricTarget::Lambda { name } => format!("metrics({name})"),
             },
             View::Ec2 => "ec2".into(),
             View::EcrRepos => "ecr".into(),
@@ -266,6 +279,11 @@ impl View {
             View::Sqs => "sqs".into(),
             View::Rds => "rds".into(),
             View::Lambda => "lambda".into(),
+            View::Alarms => "alarms".into(),
+            View::Trail { resource: None } => "trail".into(),
+            View::Trail { resource: Some(r) } => format!("trail({r})"),
+            View::Pulse => "pulse".into(),
+            View::Access => "access".into(),
             View::Detail { title, .. } => title.clone(),
         }
     }
@@ -300,8 +318,26 @@ impl View {
             },
             View::ScalableTargets { ns } => View::ScalingActivities { ns: ns.clone(), resource: Some(r.id.clone()) },
             View::EcrRepos => View::EcrImages { repo: r.id.clone() },
+            View::Alarms => return alarm_target(j),
+            View::Pulse => match s(j, "/kind").as_str() {
+                "alarm" => alarm_target(j).unwrap_or(View::Alarms),
+                "rds" => View::Rds,
+                "lambda" => View::Lambda,
+                "service" => View::Rollout { cluster: s(j, "/cluster"), service: s(j, "/service") },
+                _ => return None,
+            },
             _ => return None,
         })
+    }
+
+    /// Where `T` goes: the CloudTrail name of the selected resource.
+    pub fn trail_name(&self, r: &Row) -> Option<String> {
+        match self {
+            View::Rds => Some(r.cells[1].clone()),
+            View::Lambda | View::Ec2 => Some(r.id.clone()),
+            View::Detail { live: Some((_, id)), .. } => Some(id.clone()),
+            _ => None,
+        }
     }
 
     /// Where `l` goes.
@@ -335,6 +371,10 @@ impl View {
                 Some(MetricTarget::Tg { arn: r.id.clone(), lb: strs(&r.json, "/LoadBalancerArns").into_iter().next() })
             }
             (View::Targets { arn, lb, .. }, _) => Some(MetricTarget::Tg { arn: arn.clone(), lb: lb.clone() }),
+            (View::Rds, Some(r)) => Some(MetricTarget::Rds { kind: r.cells[0].clone(), id: r.cells[1].clone() }),
+            (View::Lambda, Some(r)) => Some(MetricTarget::Lambda { name: r.id.clone() }),
+            (View::Detail { live: Some((kind, id)), .. }, _) if kind == "lambda" => Some(MetricTarget::Lambda { name: id.clone() }),
+            (View::Detail { live: Some((kind, id)), .. }, _) => Some(MetricTarget::Rds { kind: kind.clone(), id: id.clone() }),
             _ => None,
         }
     }
@@ -436,6 +476,10 @@ impl View {
             View::Sqs => sqs(aws),
             View::Rds => rds(aws),
             View::Lambda => lambda(aws),
+            View::Alarms => alarms(aws),
+            View::Trail { resource } => trail(aws, resource.as_deref()),
+            View::Pulse => pulse(aws),
+            View::Access => access(aws),
         }
     }
 }
@@ -1778,6 +1822,32 @@ fn metrics(aws: &Aws, target: &MetricTarget) -> Result<Table, AwsError> {
                 q("UnHealthyHostCount", "AWS/ApplicationELB", "UnHealthyHostCount", &d, "Maximum"),
             ]
         }
+        MetricTarget::Rds { kind, id } => {
+            let d = [(if kind == "cluster" { "DBClusterIdentifier" } else { "DBInstanceIdentifier" }, id.clone())];
+            let mut v = vec![
+                q("CPUUtilization %", "AWS/RDS", "CPUUtilization", &d, "Average"),
+                q("CPUUtilization %", "AWS/RDS", "CPUUtilization", &d, "Maximum"),
+                q("DatabaseConnections", "AWS/RDS", "DatabaseConnections", &d, "Maximum"),
+                q("FreeableMemory (bytes)", "AWS/RDS", "FreeableMemory", &d, "Minimum"),
+                q("ReadLatency (s)", "AWS/RDS", "ReadLatency", &d, "Average"),
+                q("WriteLatency (s)", "AWS/RDS", "WriteLatency", &d, "Average"),
+            ];
+            // Aurora storage grows by itself; only instances have a disk that fills.
+            if kind != "cluster" {
+                v.insert(3, q("FreeStorageSpace (bytes)", "AWS/RDS", "FreeStorageSpace", &d, "Minimum"));
+            }
+            v
+        }
+        MetricTarget::Lambda { name } => {
+            let d = [("FunctionName", name.clone())];
+            vec![
+                q("Invocations", "AWS/Lambda", "Invocations", &d, "Sum"),
+                q("Errors", "AWS/Lambda", "Errors", &d, "Sum"),
+                q("Throttles", "AWS/Lambda", "Throttles", &d, "Sum"),
+                q("Duration (ms)", "AWS/Lambda", "Duration", &d, "p95"),
+                q("ConcurrentExecutions", "AWS/Lambda", "ConcurrentExecutions", &d, "Maximum"),
+            ]
+        }
     };
     let data = metric_data(aws, &qs, METRIC_MINUTES, 300)?;
     for (x, pts) in qs.iter().zip(data) {
@@ -1965,7 +2035,8 @@ pub fn pending(v: &Value) -> Vec<String> {
     out
 }
 
-/// `d` on an RDS row: this one instance or cluster and its last day of events, fetched on every refresh.
+/// `d` on an RDS row: this one instance or cluster, its last day of events, pending maintenance and who changed it,
+/// fetched on every refresh.
 fn rds_detail(aws: &Aws, kind: &str, id: &str) -> Result<Table, AwsError> {
     let (op, flag, key, src) = match kind {
         "cluster" => ("describe-db-clusters", "--db-cluster-identifier", "/DBClusters/0", "db-cluster"),
@@ -1973,14 +2044,384 @@ fn rds_detail(aws: &Aws, kind: &str, id: &str) -> Result<Table, AwsError> {
     };
     let v = aws.call("rds", op, &[flag.into(), id.into()])?;
     let Some(item) = v.pointer(key) else { return Err(AwsError::Api(format!("{kind} {id} not found"))) };
-    let args = ["--source-type", src, "--source-identifier", id, "--duration", "1440"].map(String::from);
-    let (events, err) = match aws.call("rds", "describe-events", &args) {
-        Ok(e) => (arr(&e, "/Events").to_vec(), None),
-        Err(e) => (vec![], Some(e)),
+    let arn = if kind == "cluster" { s(item, "/DBClusterArn") } else { s(item, "/DBInstanceArn") };
+    let (events, maint, changes) = std::thread::scope(|sc| {
+        let ev = sc.spawn(|| aws.call("rds", "describe-events", &args!["--source-type", src, "--source-identifier", id, "--duration", 1440]));
+        let mt = sc.spawn(|| aws.call("rds", "describe-pending-maintenance-actions", &args!["--resource-identifier", arn]));
+        let ch = sc.spawn(|| recent_changes(aws, id));
+        (ev.join().expect("events"), mt.join().expect("maintenance"), ch.join().expect("changes"))
+    });
+    let mut notes = vec![];
+    let events = events.map(|e| arr(&e, "/Events").to_vec()).unwrap_or_else(|e| {
+        notes.push(format!("events not loaded: {e}"));
+        vec![]
+    });
+    let maint: Vec<Value> = maint
+        .map(|m| arr(&m, "/PendingMaintenanceActions").iter().flat_map(|r| arr(r, "/PendingMaintenanceActionDetails").to_vec()).collect())
+        .unwrap_or_else(|e| {
+            notes.push(format!("pending maintenance not loaded: {e}"));
+            vec![]
+        });
+    let mut lines = crate::describe::rds(item, &events, &maint);
+    insert_before_footer(&mut lines, crate::describe::changes(&changes));
+    let mut t = Table::text(lines);
+    for n in notes {
+        t.bad(n);
+    }
+    Ok(t)
+}
+
+/// Describe pages end with a blank line and a "(y shows ...)" hint; extra sections go above them.
+fn insert_before_footer(lines: &mut Vec<String>, extra: Vec<String>) {
+    let at = lines.len().saturating_sub(2);
+    lines.splice(at..at, extra);
+}
+
+/// One resource's CloudTrail write events of the last 7 days, oldest first. Cached a minute per resource:
+/// LookupEvents allows 2 calls a second per account and region, and live pages refresh every few seconds.
+pub fn recent_changes(aws: &Aws, name: &str) -> Result<Vec<Value>, String> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Cache = Mutex<HashMap<String, (Instant, Result<Vec<Value>, String>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let key = format!("{}/{}/{name}", aws.ctx.profile, aws.ctx.region);
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((at, v)) = cache.lock().unwrap().get(&key) {
+        if at.elapsed() < Duration::from_secs(60) {
+            return v.clone();
+        }
+    }
+    let r = trail_events(aws, Some(name), 50).map(|(ev, _)| ev).map_err(|e| e.to_string());
+    cache.lock().unwrap().insert(key, (Instant::now(), r.clone()));
+    r
+}
+
+/// CloudTrail write events, newest first as AWS returns them, each with its CloudTrailEvent parsed and redacted
+/// (under "detail"). `resource`: that resource's last 7 days; else the account's last 24h.
+/// Returns the events and whether the list was cut at `max`.
+fn trail_events(aws: &Aws, resource: Option<&str>, max: usize) -> Result<(Vec<Value>, bool), AwsError> {
+    let (attr, since) = match resource {
+        Some(r) => (format!("AttributeKey=ResourceName,AttributeValue={r}"), chrono::Duration::days(7)),
+        None => ("AttributeKey=ReadOnly,AttributeValue=false".into(), chrono::Duration::hours(24)),
     };
-    let mut t = Table::text(crate::describe::rds(item, &events));
-    if let Some(e) = err {
-        t.bad(format!("events not loaded: {e}"));
+    let start = (Utc::now() - since).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let v = aws.call("cloudtrail", "lookup-events", &args!["--lookup-attributes", attr, "--start-time", start, "--max-items", max])?;
+    let cut = truncated(&v);
+    let events = arr(&v, "/Events")
+        .iter()
+        // A resource lookup returns reads too (every Describe); only changes matter here.
+        .filter(|e| s(e, "/ReadOnly") != "true")
+        .map(|e| {
+            let mut e = e.clone();
+            let mut detail: Value = e["CloudTrailEvent"].as_str().and_then(|x| serde_json::from_str(x).ok()).unwrap_or(Value::Null);
+            redact(&mut detail);
+            e["detail"] = detail;
+            e.as_object_mut().map(|m| m.remove("CloudTrailEvent"));
+            e
+        })
+        .collect();
+    Ok((events, cut))
+}
+
+/// Who made a CloudTrail call: role/session for assumed roles, the user, or the AWS service that acted.
+pub fn trail_who(e: &Value) -> String {
+    let id = &e["detail"]["userIdentity"];
+    let role = s(id, "/sessionContext/sessionIssuer/userName");
+    match s(id, "/type").as_str() {
+        "AssumedRole" if !role.is_empty() => {
+            let session = s(id, "/arn").rsplit('/').next().unwrap_or_default().to_string();
+            format!("{role}/{session}")
+        }
+        "AWSService" => s(id, "/invokedBy"),
+        _ => [s(id, "/userName"), s(e, "/Username"), s(id, "/invokedBy")].into_iter().find(|x| !x.is_empty()).unwrap_or_default(),
+    }
+}
+
+/// The CloudTrail error of a call, "" when it succeeded.
+pub fn trail_error(e: &Value) -> String {
+    let code = s(&e["detail"], "/errorCode");
+    if code.is_empty() { code } else { format!("{code}: {}", s(&e["detail"], "/errorMessage")).trim_end_matches(": ").to_string() }
+}
+
+fn trail(aws: &Aws, resource: Option<&str>) -> Result<Table, AwsError> {
+    let mut t = Table::new(&["AGE", "WHO", "EVENT", "SERVICE", "RESOURCE", "REASON"]);
+    match resource {
+        Some(r) => t.info(format!("changes to {r} in the last 7 days (CloudTrail, management events) · d details")),
+        None => t.info("changes in this account and region in the last 24h (CloudTrail write events) · :trail <name> for one resource · d details"),
+    }
+    let (events, cut) = match trail_events(aws, resource, 300) {
+        Ok(x) => x,
+        Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+        Err(e) => {
+            t.bad(format!("CloudTrail not readable with this profile (needs cloudtrail:LookupEvents): {e}"));
+            t.empty = Some("no events shown: see the note above".into());
+            return Ok(t);
+        }
+    };
+    if cut {
+        t.bad("showing the newest 300 events only");
+    }
+    for e in events {
+        let err = trail_error(&e);
+        let res: Vec<String> = arr(&e, "/Resources").iter().map(|r| short(&s(r, "/ResourceName")).to_string()).collect();
+        t.row(s(&e, "/EventId"), if err.is_empty() { Health::None } else { Health::Bad }, e["detail"].clone(), vec![
+            age_at(&e, "/EventTime"),
+            trail_who(&e),
+            s(&e, "/EventName"),
+            s(&e, "/EventSource").trim_end_matches(".amazonaws.com").to_string(),
+            res.join(", "),
+            err,
+        ]);
+    }
+    t.empty = Some(match resource {
+        Some(r) => format!("no changes to {r} in the last 7 days"),
+        None => "no write events in the last 24h".into(),
+    });
+    Ok(t)
+}
+
+fn alarms(aws: &Aws) -> Result<Table, AwsError> {
+    let v = aws.call("cloudwatch", "describe-alarms", &[])?;
+    let mut t = Table::new(&["NAME", "STATE", "SINCE", "METRIC", "ON", "CONDITION", "ACTIONS", "REASON"]);
+    t.info("firing first · Enter opens the resource it watches · d the whole alarm");
+    // Target-tracking scaling owns its alarms, and one of each pair is in ALARM most of the time by design
+    // (traffic below target: scale in). They are not problems, so they sort last and dim.
+    let scaling = |a: &Value| s(a, "/AlarmName").starts_with("TargetTracking-");
+    let order = |a: &Value| match (scaling(a), s(a, "/StateValue").as_str()) {
+        (true, _) => 3,
+        (_, "ALARM") => 0,
+        (_, "INSUFFICIENT_DATA") => 1,
+        _ => 2,
+    };
+    let mut all: Vec<Value> = arr(&v, "/MetricAlarms").iter().chain(arr(&v, "/CompositeAlarms")).cloned().collect();
+    all.sort_by_key(|a| (order(a), s(a, "/AlarmName")));
+    let managed = all.iter().filter(|a| scaling(a)).count();
+    if managed > 0 {
+        t.info(format!("{managed} target-tracking scaling alarm(s) are dimmed at the bottom: they drive autoscaling, their ALARM is not a fault"));
+    }
+    for a in all {
+        let st = s(&a, "/StateValue");
+        let health = match st.as_str() {
+            _ if scaling(&a) => Health::Dim,
+            "ALARM" => Health::Bad,
+            "INSUFFICIENT_DATA" => Health::Warn,
+            _ => Health::Ok,
+        };
+        let (metric, on, cond) = if a.get("AlarmRule").is_some() {
+            ("composite".to_string(), String::new(), s(&a, "/AlarmRule"))
+        } else {
+            let stat = [s(&a, "/Statistic"), s(&a, "/ExtendedStatistic")].into_iter().find(|x| !x.is_empty()).unwrap_or_default();
+            let metric = if s(&a, "/MetricName").is_empty() {
+                arr(&a, "/Metrics").iter().map(|m| s(m, "/Expression")).collect::<Vec<_>>().join("; ")
+            } else {
+                format!("{} {}", s(&a, "/Namespace").trim_start_matches("AWS/"), s(&a, "/MetricName"))
+            };
+            let on: Vec<String> = arr(&a, "/Dimensions").iter().map(|d| dim_label(&s(d, "/Value"))).collect();
+            let op = match s(&a, "/ComparisonOperator").as_str() {
+                "GreaterThanThreshold" => ">",
+                "GreaterThanOrEqualToThreshold" => ">=",
+                "LessThanThreshold" => "<",
+                "LessThanOrEqualToThreshold" => "<=",
+                o => o,
+            }
+            .to_string();
+            // "2/3": 2 of the last 3 periods breaching fire it; without DatapointsToAlarm all of them must.
+            let need = if a.get("DatapointsToAlarm").is_some() { n(&a, "/DatapointsToAlarm") } else { n(&a, "/EvaluationPeriods") };
+            let periods = format!("{need}/{}", n(&a, "/EvaluationPeriods"));
+            (metric, on.join(","), format!("{stat} {op} {} for {periods} x {}s", a["Threshold"].as_f64().map(fmt_num).unwrap_or_default(), s(&a, "/Period")))
+        };
+        let actions = if a["ActionsEnabled"].as_bool() == Some(false) {
+            "disabled".into()
+        } else {
+            arr(&a, "/AlarmActions").iter().filter_map(Value::as_str).map(action_label).collect::<Vec<_>>().join(",")
+        };
+        // The reason only for alarms that are not OK: under every row it buries the ones that matter.
+        let reason = if matches!(health, Health::Bad | Health::Warn) { s(&a, "/StateReason") } else { String::new() };
+        t.row(s(&a, "/AlarmName"), health, a.clone(), vec![s(&a, "/AlarmName"), st, age_at(&a, "/StateUpdatedTimestamp"), metric, on, cond, actions, reason]);
+    }
+    t.empty = Some("no CloudWatch alarms in this region".into());
+    Ok(t)
+}
+
+/// A dimension value people recognise: "app/web-alb/50dc6c" and "targetgroup/api/73e2" are named by their middle part.
+fn dim_label(v: &str) -> String {
+    let parts: Vec<&str> = v.split('/').collect();
+    if parts.len() >= 3 && !v.starts_with("arn:") { parts[parts.len() - 2].to_string() } else { short(v).to_string() }
+}
+
+/// An alarm action by name: the SNS topic, the scaling policy, or the EC2 action.
+fn action_label(arn: &str) -> String {
+    if let Some((_, p)) = arn.split_once(":policyName/") {
+        return format!("scaling:{p}");
+    }
+    // arn:aws:swf:...:action/actions/AWS_EC2.InstanceId.Reboot/1.0
+    match arn.split('/').find_map(|p| p.strip_prefix("AWS_EC2.InstanceId.")) {
+        Some(a) => format!("ec2:{}", a.to_lowercase()),
+        None => short(arn).to_string(),
+    }
+}
+
+/// The view an alarm's dimensions point at.
+fn alarm_target(a: &Value) -> Option<View> {
+    let dim = |k: &str| arr(a, "/Dimensions").iter().find(|d| s(d, "/Name") == k).map(|d| s(d, "/Value"));
+    if let (Some(cluster), Some(service)) = (dim("ClusterName"), dim("ServiceName")) {
+        return Some(View::Events { cluster, service });
+    }
+    if let Some(cluster) = dim("ClusterName") {
+        return Some(View::Services { cluster });
+    }
+    if dim("DBInstanceIdentifier").or(dim("DBClusterIdentifier")).is_some() {
+        return Some(View::Rds);
+    }
+    if dim("FunctionName").is_some() {
+        return Some(View::Lambda);
+    }
+    if dim("TargetGroup").is_some() {
+        return Some(View::TargetGroups { lb: None });
+    }
+    if dim("LoadBalancer").is_some() {
+        return Some(View::LoadBalancers);
+    }
+    if dim("QueueName").is_some() {
+        return Some(View::Sqs);
+    }
+    if dim("InstanceId").is_some() {
+        return Some(View::Ec2);
+    }
+    None
+}
+
+/// Every row that is not healthy across alarms, ECS services (every cluster), RDS and Lambda, read in parallel.
+fn pulse(aws: &Aws) -> Result<Table, AwsError> {
+    enum Src {
+        Alarms,
+        Rds,
+        Lambda,
+        Services(String),
+    }
+    let mut t = Table::new(&["KIND", "NAME", "WHERE", "PROBLEM"]);
+    t.info("what is not healthy right now: alarms, ECS services, RDS, Lambda · Enter opens it · r refresh");
+    let mut srcs = vec![Src::Alarms, Src::Rds, Src::Lambda];
+    match aws.call("ecs", "list-clusters", &[]) {
+        Ok(v) => srcs.extend(strs(&v, "/clusterArns").iter().map(|a| Src::Services(short(a).to_string()))),
+        Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+        Err(e) => t.bad(format!("ECS: clusters not loaded: {e}")),
+    }
+    let tables = par_map_n(&srcs, 8, |src| match src {
+        Src::Alarms => alarms(aws),
+        Src::Rds => rds(aws),
+        Src::Lambda => lambda(aws),
+        Src::Services(c) => services(aws, c),
+    });
+    // The columns that say what is wrong, by the name each view gives them.
+    const SAY: &[&str] = &["STATE", "STATUS", "PENDING", "DESIRED", "RUN(ALL)", "ROLLOUT", "FAILED 1H", "ERRORS 1H", "THROTTLES 1H", "REASON"];
+    for (src, tb) in srcs.iter().zip(tables) {
+        let (kind, place) = match src {
+            Src::Alarms => ("alarm", String::new()),
+            Src::Rds => ("rds", String::new()),
+            Src::Lambda => ("lambda", String::new()),
+            Src::Services(c) => ("service", c.clone()),
+        };
+        let tb = match tb {
+            Ok(tb) => tb,
+            Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+            Err(e) => {
+                t.bad(format!("{kind} {place}: not loaded: {e}").replace("  ", " "));
+                continue;
+            }
+        };
+        for note in tb.notes.iter().filter(|n| n.health == Health::Bad) {
+            t.bad(format!("{kind} {place}: {}", note.text).replace("  ", " "));
+        }
+        for r in tb.rows.iter().filter(|r| matches!(r.health, Health::Bad | Health::Warn)) {
+            let name = if kind == "rds" { r.cells[1].clone() } else { r.cells[0].clone() };
+            let problem: Vec<String> = tb
+                .headers
+                .iter()
+                .zip(&r.cells)
+                // Only what is off: no "pending 0", no "status ACTIVE".
+                .filter(|(h, c)| SAY.contains(&h.as_str()) && !c.is_empty() && *c != "0" && *c != "-")
+                .filter(|(h, c)| !matches!(h.as_str(), "STATE" | "STATUS") || health_of(c) != Health::Ok)
+                .map(|(h, c)| if h == "REASON" { c.clone() } else { format!("{} {c}", h.to_lowercase()) })
+                .collect();
+            let json = json!({"kind": kind, "cluster": place, "service": r.id, "name": name, "Dimensions": r.json["Dimensions"]});
+            t.row(format!("{kind}/{place}/{}", r.id), r.health, json, vec![kind.into(), name, place.clone(), problem.join(" · ")]);
+        }
+    }
+    // Red before yellow.
+    t.rows.sort_by_key(|r| r.health != Health::Bad);
+    t.empty = Some("nothing unhealthy: no alarm firing, every service steady, every database available, no function failing".into());
+    Ok(t)
+}
+
+/// One cheap call per read e9s makes, in parallel, to show what this profile may see.
+fn access(aws: &Aws) -> Result<Table, AwsError> {
+    let mut t = Table::new(&["SERVICE", "CALL", "USED BY", "RESULT"]);
+    t.info("each read e9s makes, tried once with this profile · denied ones explain empty or red sections elsewhere");
+    let five_min_ago = (Utc::now() - chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let first = |svc: &str, op: &str, args: Vec<String>, ptr: &str, field: &str| {
+        aws.call(svc, op, &args).ok().and_then(|v| arr(&v, ptr).first().map(|x| s(x, field))).filter(|x| !x.is_empty())
+    };
+    // Some reads need a name; take the first one there is.
+    let (group, function, cluster) = std::thread::scope(|sc| {
+        let g = sc.spawn(|| first("logs", "describe-log-groups", args!["--max-items", 1], "/logGroups", "/logGroupName"));
+        let f = sc.spawn(|| first("lambda", "list-functions", args!["--max-items", 1], "/Functions", "/FunctionName"));
+        let c = sc.spawn(|| aws.call("ecs", "list-clusters", &[]).ok().and_then(|v| strs(&v, "/clusterArns").first().cloned()));
+        (g.join().expect("group"), f.join().expect("function"), c.join().expect("cluster"))
+    });
+    let mut probes: Vec<(&str, &str, Vec<String>, &str)> = vec![
+        ("sts", "get-caller-identity", vec![], "header (account, role)"),
+        ("ecs", "list-clusters", vec![], "clusters"),
+        ("ec2", "describe-regions", vec![], "region scan"),
+        ("logs", "describe-log-groups", args!["--max-items", 1], "log groups"),
+        ("elbv2", "describe-load-balancers", vec![], "load balancers"),
+        ("elbv2", "describe-target-groups", vec![], "target groups"),
+        ("application-autoscaling", "describe-scalable-targets", args!["--service-namespace", "ecs"], "scaling"),
+        ("ec2", "describe-instances", vec![], "ec2"),
+        ("ecr", "describe-repositories", vec![], "ecr"),
+        ("sqs", "list-queues", vec![], "sqs"),
+        ("rds", "describe-db-instances", vec![], "rds"),
+        ("rds", "describe-db-clusters", vec![], "rds"),
+        ("rds", "describe-events", args!["--duration", 60], "rds d: events"),
+        ("rds", "describe-pending-maintenance-actions", vec![], "rds d: maintenance"),
+        ("lambda", "list-functions", args!["--max-items", 1], "lambda"),
+        ("cloudwatch", "describe-alarms", vec![], "alarms, pulse"),
+        ("cloudtrail", "lookup-events", args!["--max-items", 1, "--start-time", five_min_ago], "trail, recent changes in d"),
+    ];
+    if let Some(c) = &cluster {
+        probes.push(("ecs", "list-services", args!["--cluster", c], "services, tasks, rollout"));
+    }
+    if let Some(g) = &group {
+        probes.push(("logs", "filter-log-events", args!["--log-group-name", g, "--start-time", Utc::now().timestamp_millis() - 60_000, "--max-items", 1], "logs, live tail"));
+    }
+    if let Some(f) = &function {
+        probes.push(("lambda", "get-function-configuration", args!["--function-name", f], "lambda STATUS and d"));
+    }
+    let results = par_map_n(&probes, 8, |(svc, op, args, _)| aws.call(svc, op, args));
+    let metrics = metric_data(aws, &[q("probe", "AWS/EC2", "CPUUtilization", &[], "Average")], 5, 300);
+    let mut denied = 0;
+    let rows = probes.iter().map(|(svc, op, _, by)| (*svc, *op, *by)).zip(results).chain([(("cloudwatch", "get-metric-data", "metrics (m), lambda errors"), metrics.map(|_| Value::Null))]);
+    for ((svc, op, by), r) in rows {
+        let (health, result) = match r {
+            Ok(_) => (Health::Ok, "allowed".to_string()),
+            Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+            Err(e) => {
+                let m = e.to_string();
+                if m.contains("AccessDenied") || m.contains("not authorized") || m.contains("UnauthorizedOperation") {
+                    denied += 1;
+                    (Health::Bad, "denied".into())
+                } else {
+                    (Health::Warn, m.chars().take(160).collect())
+                }
+            }
+        };
+        t.row(format!("{svc} {op}"), health, Value::Null, vec![svc.into(), op.into(), by.into(), result]);
+    }
+    if denied > 0 {
+        t.bad(format!("{denied} read(s) denied for this profile: those views or sections stay empty and say so"));
+    }
+    if cluster.is_none() || group.is_none() || function.is_none() {
+        t.info("calls that need a cluster, log group or function were skipped where none exists (or could not be listed)");
     }
     Ok(t)
 }
@@ -1988,23 +2429,58 @@ fn rds_detail(aws: &Aws, kind: &str, id: &str) -> Result<Table, AwsError> {
 fn lambda(aws: &Aws) -> Result<Table, AwsError> {
     let mut v = aws.call("lambda", "list-functions", &[])?;
     redact(&mut v);
-    let mut t = Table::new(&["NAME", "RUNTIME", "MEM", "TIMEOUT", "ARCH", "CODE MB", "STATUS", "MODIFIED"]);
-    for f in arr(&v, "/Functions") {
+    let mut t = Table::new(&["NAME", "RUNTIME", "MEM", "TIMEOUT", "ARCH", "CODE MB", "STATUS", "ERRORS 1H", "THROTTLES 1H", "MODIFIED"]);
+    t.info("l logs · m metrics · T who changed it · d live describe");
+    let fns = arr(&v, "/Functions");
+    // Errors and throttles of the last hour: one GetMetricData per 250 functions (500 queries is the API limit).
+    let mut health: HashMap<String, (f64, f64)> = HashMap::new();
+    for chunk in fns.chunks(250) {
+        let qs: Vec<Q> = chunk
+            .iter()
+            .flat_map(|f| {
+                let d = [("FunctionName", s(f, "/FunctionName"))];
+                [q("e", "AWS/Lambda", "Errors", &d, "Sum"), q("t", "AWS/Lambda", "Throttles", &d, "Sum")]
+            })
+            .collect();
+        match metric_data(aws, &qs, 60, 3600) {
+            Ok(data) => {
+                let sums: Vec<f64> = data.iter().map(|pts| pts.iter().map(|p| p.1).sum()).collect();
+                for (f, pair) in chunk.iter().zip(sums.chunks(2)) {
+                    health.insert(s(f, "/FunctionName"), (pair[0], pair[1]));
+                }
+            }
+            Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+            Err(e) => {
+                t.bad(format!("ERRORS and THROTTLES not loaded: {e}"));
+                break;
+            }
+        }
+    }
+    for f in fns {
         let name = s(f, "/FunctionName");
         // list-functions leaves out State and LastUpdateStatus, so only functions changed in the last 15m are asked:
         // an update settles in seconds to minutes, and asking all of them would be one call per function per refresh.
         let recent = f.pointer("/LastModified").and_then(parse_ts).is_some_and(|m| Utc::now() - m < chrono::Duration::minutes(15));
-        let (health, status) = match recent.then(|| aws.call("lambda", "get-function-configuration", &["--function-name".into(), name.clone()])) {
+        let (mut row_health, status) = match recent.then(|| aws.call("lambda", "get-function-configuration", &["--function-name".into(), name.clone()])) {
             Some(Ok(c)) => lambda_status(&c),
             Some(Err(e)) => {
-                if t.notes.is_empty() {
+                if !t.notes.iter().any(|n| n.text.starts_with("STATUS")) {
                     t.bad(format!("STATUS ? : get-function-configuration failed: {e}"));
                 }
                 (Health::Bad, "?".into())
             }
             None => (Health::None, String::new()),
         };
-        t.row(name.clone(), health, f.clone(), vec![
+        let (errs, throttles) = match health.get(&name) {
+            Some(&(e, th)) => {
+                if (e > 0.0 || th > 0.0) && row_health != Health::Bad {
+                    row_health = Health::Warn;
+                }
+                (fmt_num(e), fmt_num(th))
+            }
+            None => (String::new(), String::new()),
+        };
+        t.row(name.clone(), row_health, f.clone(), vec![
             name,
             s(f, "/Runtime"),
             s(f, "/MemorySize"),
@@ -2012,6 +2488,8 @@ fn lambda(aws: &Aws) -> Result<Table, AwsError> {
             strs(f, "/Architectures").join(","),
             format!("{:.1}", n(f, "/CodeSize") as f64 / 1e6),
             status,
+            errs,
+            throttles,
             age_at(f, "/LastModified"),
         ]);
     }
@@ -2031,21 +2509,27 @@ pub fn lambda_status(c: &Value) -> (Health, String) {
     }
 }
 
-/// `d` on a function: its configuration and update state, fetched on every refresh.
-/// `listed` is the page from the list-functions row, shown when this call is denied (it has no state).
+/// `d` on a function: its configuration, update state and who changed it, fetched on every refresh.
+/// `listed` is the page from the list-functions row, shown when get-function-configuration is denied (it has no state).
 fn lambda_detail(aws: &Aws, name: &str, listed: &[String]) -> Result<Table, AwsError> {
-    match aws.call("lambda", "get-function-configuration", &["--function-name".into(), name.into()]) {
+    let (conf, changes) = std::thread::scope(|sc| {
+        let ch = sc.spawn(|| recent_changes(aws, name));
+        (aws.call("lambda", "get-function-configuration", &["--function-name".into(), name.into()]), ch.join().expect("changes"))
+    });
+    let (mut lines, err) = match conf {
         Ok(mut c) => {
             redact(&mut c);
-            Ok(Table::text(crate::describe::lambda(&c)))
+            (crate::describe::lambda(&c), None)
         }
-        Err(e @ AwsError::SsoExpired(_)) => Err(e),
-        Err(e) => {
-            let mut t = Table::text(listed.to_vec());
-            t.bad(format!("status not loaded, showing the list's fields: {e}"));
-            Ok(t)
-        }
+        Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+        Err(e) => (listed.to_vec(), Some(e)),
+    };
+    insert_before_footer(&mut lines, crate::describe::changes(&changes));
+    let mut t = Table::text(lines);
+    if let Some(e) = err {
+        t.bad(format!("status not loaded, showing the list's fields: {e}"));
     }
+    Ok(t)
 }
 
 #[cfg(test)]
@@ -2218,9 +2702,9 @@ mod tests {
             "PendingModifiedValues": {"DBInstanceClass": "db.t4g.small", "AllocatedStorage": 50, "Iops": 3000, "MasterUserPassword": "(changing)"}});
         assert_eq!(pending(&i), ["MasterUserPassword (changing)", "class db.t4g.micro -> db.t4g.small", "storage GiB 20 -> 50"]);
         let e = |m: &str| json!({"Message": m, "Date": "2026-10-16T06:05:23.686Z"});
-        let page = crate::describe::rds(&i, &[e("Applying modification to database instance class")]).join("\n");
+        let page = crate::describe::rds(&i, &[e("Applying modification to database instance class")], &[]).join("\n");
         assert!(page.contains("Applying since:") && page.contains("being applied now"), "{page}");
-        let done = crate::describe::rds(&i, &[e("Applying modification to database instance class"), e("Finished applying modification to DB instance class")]);
+        let done = crate::describe::rds(&i, &[e("Applying modification to database instance class"), e("Finished applying modification to DB instance class")], &[]);
         assert!(!done.join("\n").contains("Applying since:"));
     }
 
@@ -2231,6 +2715,23 @@ mod tests {
         assert_eq!(st("Active", "Failed"), (Health::Bad, "update failed".into()));
         assert_eq!(st("Failed", "Successful"), (Health::Bad, "failed".into()));
         assert_eq!(st("Active", "Successful"), (Health::Ok, "ready".into()));
+    }
+
+    #[test]
+    fn trail_names_who_and_alarms_find_their_resource() {
+        let role = json!({"Username": "s", "detail": {"userIdentity": {"type": "AssumedRole",
+            "arn": "arn:aws:sts::1:assumed-role/Dev/alice", "sessionContext": {"sessionIssuer": {"userName": "Dev"}}}}});
+        assert_eq!(trail_who(&role), "Dev/alice");
+        let svc = json!({"detail": {"userIdentity": {"type": "AWSService", "invokedBy": "rds.amazonaws.com"}}});
+        assert_eq!(trail_who(&svc), "rds.amazonaws.com");
+        assert_eq!(trail_error(&json!({"detail": {"errorCode": "AccessDenied", "errorMessage": "no"}})), "AccessDenied: no");
+        assert_eq!(trail_error(&json!({"detail": {}})), "");
+
+        let dims = |d: Value| json!({"Dimensions": d});
+        let svc = dims(json!([{"Name": "ClusterName", "Value": "prod"}, {"Name": "ServiceName", "Value": "api"}]));
+        assert_eq!(alarm_target(&svc), Some(View::Events { cluster: "prod".into(), service: "api".into() }));
+        assert_eq!(alarm_target(&dims(json!([{"Name": "DBInstanceIdentifier", "Value": "db"}]))), Some(View::Rds));
+        assert_eq!(alarm_target(&json!({"AlarmRule": "ALARM(x)"})), None);
     }
 
     #[test]
@@ -2249,7 +2750,7 @@ mod tests {
         }
         let aws = Aws::with_runner(|_, _, _, _| panic!("runner reached"));
         assert!(aws.call("ecs", "update-service", &[]).is_err());
-        for (svc, op) in [("ecs", "describe-services"), ("logs", "filter-log-events"), ("sts", "get-caller-identity")] {
+        for (svc, op) in [("ecs", "describe-services"), ("logs", "filter-log-events"), ("sts", "get-caller-identity"), ("cloudtrail", "lookup-events")] {
             assert!(check_read_only(svc, op).is_ok());
         }
     }

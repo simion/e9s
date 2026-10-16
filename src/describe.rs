@@ -332,7 +332,7 @@ mod tests {
 
 /// RDS instance or cluster: what it is now, what is changing, and its events of the last day (newest last).
 /// RDS reports no percentage for a modification; its steps arrive as events, so those are the progress.
-pub fn rds(v: &Value, events: &[Value]) -> Vec<String> {
+pub fn rds(v: &Value, events: &[Value], maint: &[Value]) -> Vec<String> {
     let mut p = Page(vec![]);
     let cluster = v.get("DBClusterIdentifier").is_some() && v.get("DBInstanceIdentifier").is_none();
     let status = if cluster { s(v, "/Status") } else { s(v, "/DBInstanceStatus") };
@@ -388,6 +388,23 @@ pub fn rds(v: &Value, events: &[Value]) -> Vec<String> {
     let finished = started.is_some_and(|i| events[i + 1..].iter().any(|e| s(e, "/Message").starts_with("Finished applying")));
     if let (Some(i), false) = (started, finished) {
         p.kv(0, "Applying since", when(&events[i], "/Date"));
+    }
+
+    p.section("Pending maintenance");
+    if maint.is_empty() {
+        p.line(2, "none");
+    }
+    for m in maint {
+        let when = [("applies after", "/AutoAppliedAfterDate"), ("forced on", "/ForcedApplyDate"), ("scheduled for", "/CurrentApplyDate")]
+            .iter()
+            .filter_map(|(label, ptr)| m.pointer(ptr).and_then(parse_ts).map(|t| format!("{label} {}", t.with_timezone(&Local).format("%Y-%m-%d %H:%M"))))
+            .collect::<Vec<_>>()
+            .join(", ");
+        p.line(2, format!("{}: {}", s(m, "/Action"), s(m, "/Description")));
+        p.line(4, format!("{}{}", if when.is_empty() { "next maintenance window".into() } else { when }, match s(m, "/OptInStatus").as_str() {
+            "" => String::new(),
+            o => format!(" (opt-in: {o})"),
+        }));
     }
 
     p.section("Maintenance and backups");
@@ -479,5 +496,24 @@ pub fn lambda(c: &Value) -> Vec<String> {
     p.kv(0, "ARN", s(c, "/FunctionArn"));
     p.line(0, "");
     p.line(0, "(refreshes with the page; y shows these fields as YAML)");
+    p.0
+}
+
+/// "Recent changes" from CloudTrail, oldest first: when, who, what, and the error if the call failed.
+pub fn changes(r: &Result<Vec<Value>, String>) -> Vec<String> {
+    let mut p = Page(vec![]);
+    p.section("Recent changes, last 7 days (CloudTrail; T opens them)");
+    match r {
+        Err(e) if e.contains("AccessDenied") || e.contains("not authorized") => p.line(2, "not readable with this profile (needs cloudtrail:LookupEvents)"),
+        Err(e) => p.line(2, format!("not loaded: {e}")),
+        Ok(ev) if ev.is_empty() => p.line(2, "none"),
+        Ok(ev) => {
+            for e in ev.iter().rev() {
+                let at = e.pointer("/EventTime").and_then(parse_ts).map(|t| t.with_timezone(&Local).format("%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+                let err = crate::views::trail_error(e);
+                p.line(2, format!("{at}  {:>8}  {}  by {}{}", age_at(e, "/EventTime"), s(e, "/EventName"), crate::views::trail_who(e), if err.is_empty() { String::new() } else { format!("  FAILED {err}") }));
+            }
+        }
+    }
     p.0
 }

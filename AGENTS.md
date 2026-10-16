@@ -39,8 +39,8 @@ macOS has no `timeout`; run long checks in the background and kill them.
 
 ## Rules the code keeps
 
-- **Read-only.** Every call goes through `Aws::call`, which runs `check_read_only` first. Do not add a second path to the runner. `logs filter-log-events` is the only non-prefix read allowed.
-- **Never show secrets.** Environment variable and secret values are redacted from every response (`logic.rs`, tested).
+- **Read-only.** Every call goes through `Aws::call`, which runs `check_read_only` first. Do not add a second path to the runner. `logs filter-log-events` and `cloudtrail lookup-events` are the only non-prefix reads allowed.
+- **Never show secrets.** Environment variable and secret values are redacted from every response (`logic.rs`, tested), including CloudTrail request parameters (keys naming a password, secret or token).
 - **Failures are loud.** A failed or partial fetch shows a note; it never renders as an empty or healthy list.
 - **k9s parity.** Keys and screens follow k9s. When adding log or table behaviour, read the k9s source first (github.com/derailed/k9s, `internal/view/log.go`, `log_indicator.go`) and match its keys.
 - **Measure before claiming speed.** The log design came from timing real calls (see below); keep doing that.
@@ -76,6 +76,9 @@ Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an exp
 - The tail follows the tasks running when the view opened; tasks started mid-rollout do not appear until the view is reopened.
 - The services view lists STOPPED tasks for its `FAILED 1H` column, which costs a second or two per refresh.
 - The `H` command log shows the short display form of each command; long ones are cut at the window edge.
+- `:pulse` reads alarms, RDS, Lambda and the services of every cluster on each refresh (6.3 s measured on a real dev account, 2026-10-16).
+- Lambda STATUS is read only for functions changed in the last 15 minutes (list-functions has no state); ERRORS and THROTTLES cost one GetMetricData per 250 functions.
+- CloudTrail answers about 5 minutes after a call, allows 2 LookupEvents a second, and a `d` page caches its "Recent changes" for a minute.
 - When a table does not fit, wide columns narrow to 24 and wrap, then columns drop from the right (k9s drops without narrowing). The dropped ones are only in `d` and `y`.
 
 ## Release

@@ -128,6 +128,12 @@ pub fn split_deployments(svc: &Value) -> Split {
 
 pub const REDACTED: &str = "<redacted>";
 
+/// Keys whose string value is a secret wherever they appear (CloudTrail request parameters, mostly).
+fn is_secret_key(k: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    ["password", "secretstring", "secretbinary", "secretaccesskey", "sessiontoken", "privatekey"].iter().any(|s| k.contains(s))
+}
+
 /// Strip env var and secret values anywhere in a document. Names stay.
 pub fn redact(v: &mut Value) {
     match v {
@@ -143,13 +149,17 @@ pub fn redact(v: &mut Value) {
                             }
                         }
                     }
-                    ("Environment", Value::Object(env)) => {
-                        if let Some(Value::Object(vars)) = env.get_mut("Variables") {
-                            for x in vars.values_mut() {
-                                *x = Value::String(REDACTED.into());
+                    // CloudTrail request parameters spell it lowercase.
+                    ("Environment" | "environment", Value::Object(env)) => {
+                        for (k, vars) in env.iter_mut() {
+                            if let ("Variables" | "variables", Value::Object(vars)) = (k.as_str(), vars) {
+                                for x in vars.values_mut() {
+                                    *x = Value::String(REDACTED.into());
+                                }
                             }
                         }
                     }
+                    (k, Value::String(x)) if is_secret_key(k) => *x = REDACTED.into(),
                     _ => redact(child),
                 }
             }
@@ -361,11 +371,13 @@ mod tests {
                 "environment": [{"name": "DB_URL", "value": "postgres://u:p@h"}],
                 "secrets": [{"name": "API_KEY", "valueFrom": "arn:aws:secretsmanager:x"}]}],
             "overrides": {"containerOverrides": [{"environment": [{"name": "X", "value": "y"}]}]},
-            "Environment": {"Variables": {"TOKEN": "abc"}}
+            "Environment": {"Variables": {"TOKEN": "abc"}},
+            // CloudTrail request parameters.
+            "requestParameters": {"environment": {"variables": {"K": "lower"}}, "masterUserPassword": "hunter2", "secretString": "s3cr3t"}
         });
         redact(&mut td);
         let text = td.to_string();
-        for leaked in ["postgres://", "secretsmanager", "\"y\"", "abc"] {
+        for leaked in ["postgres://", "secretsmanager", "\"y\"", "abc", "lower", "hunter2", "s3cr3t"] {
             assert!(!text.contains(leaked), "{leaked} leaked: {text}");
         }
         assert_eq!(td.pointer("/containerDefinitions/0/environment/0/name").unwrap(), "DB_URL");

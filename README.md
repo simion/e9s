@@ -4,7 +4,7 @@ A read-only, k9s-style terminal UI for AWS.
 Browse ECS clusters, services, tasks and containers, read and live-tail their CloudWatch logs, and watch a deployment roll, with the same keys as k9s.
 
 It cannot change anything.
-Every AWS call goes through one function (`Aws::call` in `src/aws.rs`) that only lets through `describe-*`, `list-*` and `get-*` operations on an allowlist of services, plus `logs filter-log-events`.
+Every AWS call goes through one function (`Aws::call` in `src/aws.rs`) that only lets through `describe-*`, `list-*` and `get-*` operations on an allowlist of services, plus `logs filter-log-events` and `cloudtrail lookup-events`.
 Credential getters such as `ecr get-login-password` are refused too.
 Environment variable and secret values are stripped from every response before they are shown or saved, so only their names appear.
 
@@ -121,7 +121,7 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `g` `G` / `Home` `End` | Top / bottom |
 | `ctrl-f` `ctrl-b` / `PgDn` `PgUp` (also `ctrl-u`) | Page down / up |
 | `ctrl-d` `ctrl-k` | Delete and kill in k9s; here they only say e9s is read-only |
-| `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; an RDS instance or cluster gets a live page (refreshed like a table) with pending changes as old -> new, how long the current change has been applying, and the last 24h of RDS events, to follow a modification step by step; a Lambda function gets a live page too, with its state and last update (updating, failed and why); anything else shows as YAML, and a structured log line is parsed first |
+| `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; an RDS instance or cluster gets a live page (refreshed like a table) with pending changes as old -> new, how long the current change has been applying, pending maintenance, the last 24h of RDS events and the last 7 days of CloudTrail changes, to follow a modification step by step; a Lambda function gets a live page too, with its state, last update (updating, failed and why) and recent changes; anything else shows as YAML, and a structured log line is parsed first |
 | `y` | YAML of the selection: the fields e9s reads from AWS, under their API names |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
 | `s` | Logs: autoscroll (follow new lines) on / off, on by default. Elsewhere `s` (shell in k9s) says e9s is read-only |
@@ -136,7 +136,8 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `ctrl-s` | Save the current view (after filter and sort) to `~/Downloads`. Logs save as a `.log` with full timestamps and task ids, including every line tailed so far (the view keeps the last 50,000) |
 | `R` | Rollout watch for the selected service (see below) |
 | `e` | Events of the selected service, newest first, untruncated |
-| `m` | CloudWatch metrics for the selected service, load balancer or target group |
+| `m` | CloudWatch metrics for the selected service, load balancer, target group, RDS instance or cluster (CPU, connections, free storage and memory, latency) or Lambda function (invocations, errors, throttles, duration p95, concurrency) |
+| `T` | Who changed it: CloudTrail write events of the selected RDS, Lambda or EC2 resource, last 7 days. Also from their `d` page |
 | `r` / `ctrl-r` | Refresh now (also re-checks identity after an SSO login) |
 | `c` | Copy the command line that reopens this view (pbcopy, wl-copy or xclip). In logs `c` copies the lines instead, and in describe and YAML the page, as in k9s |
 | `+` | Auto-refresh interval: off, 5, 10, 15, 30, 60 seconds, then off again. The header shows the countdown |
@@ -171,7 +172,11 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `:ecr` | ECR repositories, then images |
 | `:sqs` | SQS queues with depth, in-flight, oldest message age and DLQ |
 | `:rds` | RDS clusters and instances, with writer / reader roles and a PENDING column (queued or applying changes, old -> new) |
-| `:lambda` `:fn` | Lambda functions, with STATUS (updating, ready, failed) for those changed in the last 15 minutes |
+| `:lambda` `:fn` | Lambda functions, with ERRORS 1H and THROTTLES 1H, and STATUS (updating, ready, failed) for those changed in the last 15 minutes |
+| `:pulse` `:pu` `:overview` | Everything not healthy on one screen: alarms firing, ECS services (every cluster) failing or rolling, RDS not available or changing, Lambda failing, updating or throttled. Enter opens it |
+| `:alarms` `:al` | CloudWatch alarms, firing first, with condition, actions and why. Target-tracking scaling alarms are dimmed at the bottom (their ALARM drives scale-in). Enter opens the resource the alarm watches |
+| `:trail` `:ct` `[name]` | CloudTrail write events of the last 24h: who, what, which resource, and the error if it failed; `d` shows the call with secrets redacted. With a name, that resource's last 7 days |
+| `:access` `:can` | Each read e9s makes, tried once with this profile: allowed or denied, and which view it feeds |
 | `:profile` `:ctx` `[name]` | Profile picker, or switch to a profile |
 | `:region` `:regions` `[name]` | Region scan, or switch to a region |
 | `:quit` `:q` | Quit |

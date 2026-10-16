@@ -195,6 +195,7 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
             v.extend([("<m>", "Mark"), ("<C>", "Clear"), ("<c>", "Copy"), ("<w>", "Wrap"), ("<t>", "Time"), ("<ctrl-s>", "Save")]);
             v
         }
+        View::Detail { live: Some(_), .. } => vec![("<m>", "Metrics"), ("<T>", "Changes"), ("</>", "Search"), ("<c>", "Copy"), ("<f>", "Fullscreen"), ("<w>", "Wrap")],
         View::Detail { .. } => vec![("</>", "Search"), ("<n N>", "Next/Prev"), ("<c>", "Copy"), ("<f>", "Fullscreen"), ("<w>", "Wrap"), ("<ctrl-s>", "Save")],
         View::TaskDefFamilies => vec![("<enter>", "Revisions")],
         View::TaskDefRevisions { .. } => vec![("<enter>", "Containers")],
@@ -205,7 +206,11 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
         View::Targets { .. } => vec![("<m>", "Metrics")],
         View::ScalableTargets { .. } => vec![("<enter>", "Activities"), ("<p>", "Policies")],
         View::EcrRepos => vec![("<enter>", "Images")],
-        View::Lambda => vec![("<l>", "Logs")],
+        View::Lambda => vec![("<l>", "Logs"), ("<m>", "Metrics"), ("<T>", "Changes")],
+        View::Rds => vec![("<m>", "Metrics"), ("<T>", "Changes")],
+        View::Ec2 => vec![("<T>", "Changes")],
+        View::Alarms => vec![("<enter>", "Resource")],
+        View::Pulse => vec![("<enter>", "Open")],
         _ => vec![],
     };
     if !matches!(view, View::Detail { .. }) {

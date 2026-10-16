@@ -124,6 +124,25 @@ pub fn about(view: &View) -> (&'static str, &'static [&'static str]) {
             "Lambda runs a function per event with no servers or pods to see. Kubernetes: Knative or another serverless layer.",
             "l opens its log group, /aws/lambda/<name> by default.",
         ]),
+        View::Alarms => ("CloudWatch alarms", &[
+            "An alarm watches one metric (or several, for a composite) and fires when it crosses a threshold. Kubernetes: a Prometheus alert rule.",
+            "CONDITION reads stat, operator, threshold, then how many of the last N periods must breach (2/3 = 2 of the last 3).",
+            "INSUFFICIENT_DATA = the metric has no recent points: often a resource that is gone or idle.",
+            "Enter opens what the alarm watches, read from its dimensions.",
+        ]),
+        View::Trail { .. } => ("CloudTrail", &[
+            "CloudTrail records every AWS API call: who, when, from where, with what parameters. Kubernetes: the audit log.",
+            "Only write calls are listed. LookupEvents covers 90 days of management events; e9s reads 24h for the account and 7 days for one resource.",
+            "Events arrive about 5 minutes after the call. Secrets in request parameters are redacted.",
+        ]),
+        View::Pulse => ("Pulse", &[
+            "Every row that is red or yellow in alarms, ECS services (all clusters), RDS and Lambda, on one screen. Kubernetes: k9s :pulses.",
+            "It reads all of those views each refresh, so it costs what they cost together.",
+        ]),
+        View::Access => ("Access", &[
+            "Each read e9s makes, tried once with this profile. Kubernetes: kubectl auth can-i.",
+            "A denied read leaves its view or section empty with a red note; this screen says which ones up front.",
+        ]),
         View::Detail { .. } => ("Describe", &[
             "The full object as AWS returned it. Kubernetes: kubectl get -o yaml / kubectl describe.",
         ]),

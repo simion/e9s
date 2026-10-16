@@ -28,10 +28,10 @@ impl std::fmt::Display for AwsError {
 }
 
 const SERVICES: &[&str] = &[
-    "ecs", "logs", "elbv2", "application-autoscaling", "ec2", "ecr", "sqs", "rds", "lambda", "cloudwatch", "sts",
+    "ecs", "logs", "elbv2", "application-autoscaling", "ec2", "ecr", "sqs", "rds", "lambda", "cloudwatch", "sts", "cloudtrail",
 ];
 const READ_PREFIXES: &[&str] = &["describe-", "list-", "get-"];
-const READ_EXACT: &[&str] = &["filter-log-events"];
+const READ_EXACT: &[&str] = &["filter-log-events", "lookup-events"];
 // Reads that hand out credentials. Not mutations, but nothing here needs them.
 const DENIED: &[&str] = &["get-login-password", "get-authorization-token", "get-session-token", "get-federation-token", "get-password-data"];
 

@@ -332,6 +332,71 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
             }})
         }
 
+        ("rds", "describe-pending-maintenance-actions") => {
+            let arn = a.one("--resource-identifier").unwrap_or_default();
+            json!({"PendingMaintenanceActions": if arn.ends_with(":db:analytics") {
+                vec![json!({"ResourceIdentifier": arn, "PendingMaintenanceActionDetails": [{
+                    "Action": "system-update", "Description": "New Operating System update is available",
+                    "AutoAppliedAfterDate": ago(Duration::days(-9)),
+                }]})]
+            } else {
+                vec![]
+            }})
+        }
+
+        ("cloudwatch", "describe-alarms") => {
+            let m = |name: &str, state: &str, since: Duration, ns: &str, metric: &str, dims: Value, stat: &str, op: &str, th: f64, reason: &str| json!({
+                "AlarmName": name, "AlarmArn": format!("arn:aws:cloudwatch:{r}:{ACCT}:alarm:{name}"), "StateValue": state, "StateReason": reason,
+                "StateUpdatedTimestamp": ago(since), "Namespace": ns, "MetricName": metric, "Dimensions": dims, "Statistic": stat,
+                "Period": 60, "EvaluationPeriods": 3, "DatapointsToAlarm": 2, "Threshold": th, "ComparisonOperator": op,
+                "ActionsEnabled": true, "AlarmActions": [format!("arn:aws:sns:{r}:{ACCT}:oncall-page")],
+            });
+            let svc = |s: &str| json!([{"Name": "ClusterName", "Value": CLUSTER}, {"Name": "ServiceName", "Value": s}]);
+            json!({"MetricAlarms": [
+                m("image-resizer-memory-high", "ALARM", Duration::minutes(14), "AWS/ECS", "MemoryUtilization", svc(CRASHING), "Maximum",
+                  "GreaterThanThreshold", 90.0, "Threshold Crossed: 2 out of the last 3 datapoints [99.8, 100.0] were greater than the threshold (90.0)."),
+                m("stripe-webhook-errors", "ALARM", Duration::minutes(6), "AWS/Lambda", "Errors", json!([{"Name": "FunctionName", "Value": "stripe-webhook"}]), "Sum",
+                  "GreaterThanOrEqualToThreshold", 5.0, "Threshold Crossed: 2 out of the last 3 datapoints [12.0, 9.0] were greater than or equal to the threshold (5.0)."),
+                m("analytics-free-storage-low", "INSUFFICIENT_DATA", Duration::minutes(5), "AWS/RDS", "FreeStorageSpace", json!([{"Name": "DBInstanceIdentifier", "Value": "analytics"}]), "Minimum",
+                  "LessThanThreshold", 10e9, "Insufficient Data: 1 datapoint was unknown."),
+                m("api-5xx", "OK", Duration::days(3), "AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", json!([{"Name": "LoadBalancer", "Value": "app/shop-public/50dc6c495c0c9188"}]), "Sum",
+                  "GreaterThanThreshold", 50.0, "Threshold Crossed: no datapoints were greater than the threshold (50.0)."),
+                m("orders-dlq-not-empty", "OK", Duration::days(11), "AWS/SQS", "ApproximateNumberOfMessagesVisible", json!([{"Name": "QueueName", "Value": "orders-dlq"}]), "Maximum",
+                  "GreaterThanThreshold", 0.0, "Threshold Crossed: no datapoints were greater than the threshold (0.0)."),
+            ], "CompositeAlarms": []})
+        }
+
+        ("cloudtrail", "lookup-events") => {
+            let attr = a.one("--lookup-attributes").unwrap_or_default();
+            let resource = attr.split_once("AttributeKey=ResourceName,AttributeValue=").map(|x| x.1.to_string());
+            let e = |mins: i64, who: &str, name: &str, src: &str, res: &str, params: Value, err: Option<&str>| {
+                let mut detail = json!({
+                    "eventName": name, "eventSource": format!("{src}.amazonaws.com"), "awsRegion": r, "sourceIPAddress": "203.0.113.7",
+                    "userIdentity": {"type": "AssumedRole", "arn": format!("arn:aws:sts::{ACCT}:assumed-role/PlatformAdmin/{who}"),
+                                     "sessionContext": {"sessionIssuer": {"userName": "PlatformAdmin"}}},
+                    "requestParameters": params,
+                });
+                if let Some(code) = err {
+                    detail["errorCode"] = json!(code);
+                    detail["errorMessage"] = json!("User is not authorized to perform this operation");
+                }
+                json!({"EventId": hex(&format!("{name}{mins}"), 32), "EventName": name, "ReadOnly": "false", "EventTime": ago(Duration::minutes(mins)),
+                       "EventSource": format!("{src}.amazonaws.com"), "Username": who,
+                       "Resources": [{"ResourceType": format!("AWS::{src}"), "ResourceName": res}], "CloudTrailEvent": detail.to_string()})
+            };
+            let all = vec![
+                e(6, "dana", "UpdateFunctionCode20150331v2", "lambda", "stripe-webhook", json!({"functionName": "stripe-webhook", "publish": true}), None),
+                e(9, "dana", "UpdateFunctionConfiguration20150331v2", "lambda", "stripe-webhook",
+                  json!({"functionName": "stripe-webhook", "environment": {"variables": {"STRIPE_KEY": "sk_live_demo"}}}), None),
+                e(11, "sam", "ModifyDBInstance", "rds", "analytics",
+                  json!({"dBInstanceIdentifier": "analytics", "dBInstanceClass": "db.t4g.xlarge", "allocatedStorage": 200, "applyImmediately": true}), None),
+                e(26, "ci-deploy", "UpdateService", "ecs", "api", json!({"cluster": CLUSTER, "service": "api", "taskDefinition": "api:43"}), None),
+                e(40, "intern", "DeleteDBInstance", "rds", "analytics", json!({"dBInstanceIdentifier": "analytics"}), Some("AccessDenied")),
+                e(300, "sam", "PutMetricAlarm", "monitoring", "image-resizer-memory-high", json!({"alarmName": "image-resizer-memory-high", "threshold": 90}), None),
+            ];
+            json!({"Events": all.into_iter().filter(|x| resource.as_ref().is_none_or(|r| x["Resources"][0]["ResourceName"] == json!(r))).collect::<Vec<_>>()})
+        }
+
         ("lambda", "list-functions") => json!({"Functions": functions(r)}),
         ("lambda", "get-function-configuration") => {
             let name = a.one("--function-name").unwrap_or_default();
@@ -642,6 +707,15 @@ fn metric_value(metric: &str, stat: &str, seed: u64, i: f64) -> f64 {
         "TargetResponseTime" => 0.09 + 0.07 * wave + 0.05 * noise,
         "HealthyHostCount" => 8.0,
         "UnHealthyHostCount" => 0.0,
+        // stripe-webhook is the one failing (its dimension hash is fixed, so pick by the seed of its name).
+        "Errors" => if seed == hash(&json!([{"Name": "FunctionName", "Value": "stripe-webhook"}]).to_string()) { (noise * 12.0).round() } else { 0.0 },
+        "Throttles" => 0.0,
+        "Invocations" => 400.0 + 300.0 * wave,
+        "Duration" => 80.0 + 60.0 * wave,
+        "FreeStorageSpace" => 6e9 + 2e9 * wave,
+        "FreeableMemory" => 2.1e9 + 3e8 * wave,
+        "DatabaseConnections" => (40.0 + 25.0 * wave).round(),
+        "ReadLatency" | "WriteLatency" => 0.0015 + 0.001 * noise,
         "ApproximateAgeOfOldestMessage" => if seed % 5 == 0 { 300.0 + 600.0 * wave } else { 2.0 + 20.0 * noise },
         _ => 10.0 * wave,
     };

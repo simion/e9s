@@ -334,13 +334,40 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
             "DBClusterIdentifier": "shop-db", "DBClusterArn": format!("arn:aws:rds:{r}:{ACCT}:cluster:shop-db"), "Engine": "aurora-postgresql",
             "EngineVersion": "16.4", "Status": "available", "MultiAZ": true, "ClusterCreateTime": ago(Duration::days(700)),
             "Endpoint": format!("shop-db.cluster-c0demo.{r}.rds.amazonaws.com"), "ReaderEndpoint": format!("shop-db.cluster-ro-c0demo.{r}.rds.amazonaws.com"),
+            "Port": 5432, "DatabaseName": "shop", "MasterUsername": "shop_admin", "IAMDatabaseAuthenticationEnabled": true,
             "DBClusterMembers": [{"DBInstanceIdentifier": "shop-db-1", "IsClusterWriter": true}, {"DBInstanceIdentifier": "shop-db-2", "IsClusterWriter": false}],
         }]}),
+        ("rds", "describe-db-cluster-endpoints") => {
+            let e = |id: &str, ty: &str, host: String| json!({"DBClusterEndpointIdentifier": id, "DBClusterIdentifier": "shop-db", "Endpoint": host, "Status": "available", "EndpointType": ty});
+            let mut reporting = e("reporting", "CUSTOM", format!("reporting.cluster-custom-c0demo.{r}.rds.amazonaws.com"));
+            reporting["CustomEndpointType"] = json!("READER");
+            json!({"DBClusterEndpoints": [
+                e("shop-db", "WRITER", format!("shop-db.cluster-c0demo.{r}.rds.amazonaws.com")),
+                e("shop-db", "READER", format!("shop-db.cluster-ro-c0demo.{r}.rds.amazonaws.com")),
+                reporting,
+            ]})
+        }
+        ("rds", "generate-db-auth-token") => json!({"Token": "demo-token-not-a-real-signature"}),
+        ("ssm", "describe-instance-information") => {
+            let i = |id: &str, host: &str, ip: &str, ping: &str| json!({
+                "InstanceId": id, "PingStatus": ping, "LastPingDateTime": ago(Duration::seconds(40)), "AgentVersion": "3.3.1142.0",
+                "PlatformType": "Linux", "PlatformName": "Amazon Linux", "PlatformVersion": "2023", "ResourceType": "EC2Instance",
+                "IPAddress": ip, "ComputerName": host,
+            });
+            json!({"InstanceInformationList": [
+                i("i-0a1b2c3d4e5f60002", "ip-10-0-2-21.ec2.internal", "10.0.2.21", "Online"),
+                i("i-0a1b2c3d4e5f60001", "ip-10-0-1-10.ec2.internal", "10.0.1.10", "Online"),
+                i("i-0a1b2c3d4e5f60004", "ip-10-0-1-11.ec2.internal", "10.0.1.11", "ConnectionLost"),
+            ]})
+        }
+        ("ssm", "start-session") => json!({"SessionId": format!("demo-{:x}", Utc::now().timestamp_millis()), "TokenValue": "demo", "StreamUrl": "wss://demo"}),
+        ("ssm", "terminate-session") => json!({"SessionId": a.one("--session-id")}),
         ("rds", "describe-db-instances") => {
             let i = |id: &str, class: &str, az: &str, cl: Option<&str>, engine: &str| json!({
                 "DBInstanceIdentifier": id, "DBInstanceArn": format!("arn:aws:rds:{r}:{ACCT}:db:{id}"), "Engine": engine, "EngineVersion": "16.4",
                 "DBInstanceClass": class, "DBInstanceStatus": "available", "AvailabilityZone": format!("{r}{az}"),
                 "InstanceCreateTime": ago(Duration::days(300)), "DBClusterIdentifier": cl, "MultiAZ": false,
+                "Endpoint": {"Address": format!("{id}.c0demo.{r}.rds.amazonaws.com"), "Port": 5432},
             });
             let mut analytics = i("analytics", "db.t4g.large", "c", None, "postgres");
             // A class and storage change being applied, for the PENDING column and its live `d` page.

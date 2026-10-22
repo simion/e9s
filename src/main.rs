@@ -5,6 +5,7 @@ mod app;
 mod aws;
 mod demo;
 mod describe;
+mod forward;
 mod learn;
 mod logic;
 mod sdk;
@@ -42,6 +43,8 @@ HOW
       --write, --rw      allow a few writes, each asked y/n: Secrets Manager values (x c e E), a service's
                          desired count and a scaling target's min/max, optionally for a while (s),
                          restarting a service (r, a new deployment)
+                         Port forwarding to a database through an SSM bastion (F on :endpoints,
+                         :pf) needs no flag: it changes no resource, as k9s port-forward
   -h, --help             this help
 
 Press c inside to copy the command that reopens the view you are on, and ? for every key.";
@@ -132,6 +135,13 @@ fn main() -> std::io::Result<()> {
                 ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All))?;
                 app.edited(sec, result);
             }
+            if let Some(p) = app.psql.take() {
+                ratatui::restore();
+                let result = run_psql(&p);
+                terminal = ratatui::init();
+                ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All))?;
+                app.psql_done(result);
+            }
             while let Ok(m) = rx.try_recv() {
                 app.on_msg(m);
             }
@@ -141,6 +151,7 @@ fn main() -> std::io::Result<()> {
     })();
     app.shutdown();
     ratatui::restore();
+    app.ended.iter().for_each(|l| println!("{l}"));
     if let (Some(v), Some(cmd)) = (upgrade::NEWER.get(), upgrade::command()) {
         println!("e9s {v} is out (this is {}). Upgrade with:\n  {cmd}", env!("CARGO_PKG_VERSION"));
     }
@@ -155,6 +166,16 @@ fn run_login(l: &app::Login) -> Result<(), String> {
         Ok(st) => Err(format!("exited with {st}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("the aws CLI is not installed; logging in needs it".into()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// psql through a port forward, on the real terminal. The IAM token travels in PGPASSWORD, not on the command line.
+fn run_psql(p: &app::Psql) -> Result<(), String> {
+    println!("e9s: {}  (e9s comes back when psql exits)\n", p.what);
+    match std::process::Command::new("psql").envs(p.env.iter().map(|(k, v)| (k, v))).status() {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err("psql is not installed (brew install libpq, or postgresql)".into()),
+        Err(e) => Err(format!("psql: {e}")),
     }
 }
 
@@ -254,9 +275,14 @@ fn run_script(app: &mut App, rx: &mpsc::Receiver<Msg>, script: &str) -> std::io:
         if let Some(sec) = app.editor.take() {
             println!("editor: {}", sec.name);
         }
+        if let Some(p) = app.psql.take() {
+            let keys: Vec<&str> = p.env.iter().map(|(k, _)| k.as_str()).collect();
+            println!("psql: {} (env {})", p.what, keys.join(" "));
+        }
         let _ = term.draw(|f| ui::draw(f, app));
     }
     app.shutdown();
+    app.ended.iter().for_each(|l| println!("{l}"));
     Ok(())
 }
 

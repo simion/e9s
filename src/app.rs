@@ -34,6 +34,25 @@ pub enum Mode {
     /// A write waiting for y.
     /// The bool: OK has focus (k9s starts on Cancel).
     Confirm(Pending, bool),
+    /// `F` on a database endpoint: the bastion and local port to forward through (k9s shift-f).
+    Forward(ForwardForm),
+}
+
+/// The port-forward dialog: ↑↓ pick the bastion, digits change the local port, Enter starts.
+pub struct ForwardForm {
+    pub target: crate::forward::Target,
+    /// Online SSM instances, likely bastions first: (instance id, name, likely bastion).
+    pub bastions: Vec<(String, String, bool)>,
+    pub pick: usize,
+    pub local: String,
+    /// The suggested port is still untouched: the first digit typed replaces it.
+    pub fresh: bool,
+}
+
+/// psql through a forward, on the real terminal: its environment (PGPASSWORD holds the IAM token, never an argument).
+pub struct Psql {
+    pub env: Vec<(String, String)>,
+    pub what: String,
 }
 
 /// What the value prompt is taking.
@@ -42,6 +61,8 @@ pub enum Editing {
     /// A scaling target's row: its JSON and the RESTORE cell.
     Range(Row),
     Desired { cluster: String, service: String, now: i64 },
+    /// `s` (psql) or `t` (copy an IAM token) on a port forward: the db user and database.
+    DbUser { session: String, copy: bool },
 }
 
 /// A write staged until y: what the dialog says, and what it does.
@@ -55,7 +76,19 @@ pub struct Pending {
     then: Option<View>,
 }
 
+impl Pending {
+    /// The dialog's frame title.
+    pub fn heading(&self) -> &'static str {
+        match self.write {
+            Write::StopForward(_) => " Port forward ",
+            _ => " Write to AWS ",
+        }
+    }
+}
+
 enum Write {
+    /// Not a write: ends a port forward this run started.
+    StopForward(String),
     Secret { read: Secret, text: String },
     /// Calls run in order, stopping at the first failure.
     Calls(Vec<(&'static str, &'static str, Vec<String>)>),
@@ -86,6 +119,9 @@ pub const COMMANDS: &[(&[&str], &str)] = &[
     (&["ecr"], "ECR repositories"),
     (&["sqs"], "SQS queues"),
     (&["rds"], "RDS clusters and instances"),
+    (&["endpoints", "ep", "db"], "RDS endpoints (writer, reader, custom, instance): F forwards one through a bastion"),
+    (&["ssm", "bastions", "bastion"], "SSM-managed instances, likely bastions first"),
+    (&["portforwards", "pf", "forwards"], "port forwards of this run (k9s :pf): stop, psql, IAM token"),
     (&["lambda", "fn"], "Lambda functions"),
     (&["pulse", "pu", "overview"], "everything not healthy: alarms, ECS services, RDS, Lambda"),
     (&["alarms", "alarm", "al"], "CloudWatch alarms, firing first"),
@@ -117,13 +153,14 @@ pub const KEYS: &[(&str, &str)] = &[
     ("d", "describe: full detail of the selection"),
     ("y", "YAML of the selection: the fields e9s reads, under their API names"),
     ("l", "logs for the selection"),
-    ("s", "logs: autoscroll (follow new lines) on / off · services: desired count · scaling: min and max, `4 20 for 2h` puts the old ones back after 2h (--write)"),
+    ("s", ":pf: psql through the selected forward (with an IAM token when the database has IAM auth) · logs: autoscroll (follow new lines) on / off · services: desired count · scaling: min and max, `4 20 for 2h` puts the old ones back after 2h (--write)"),
     ("f", "logs, describe: fullscreen"),
-    ("t", "logs: show or hide timestamps"),
+    ("t", "logs: show or hide timestamps · :pf: copy an RDS IAM auth token for the forward's database"),
     ("0-6", "logs: start from the tail, the head, or 1m 5m 15m 30m 1h back (elsewhere 0-9 are quick views)"),
     ("a", "service logs: all containers of each task, not just the main one"),
     ("m C c", "logs: draw a mark line, clear the screen, copy the lines shown"),
-    ("F", "failures of the last hour: failed tasks and problem events (service, or whole cluster)"),
+    ("F", "failures of the last hour: failed tasks and problem events (service, or whole cluster) · endpoints: port-forward through an SSM bastion (k9s shift-f)"),
+    ("ctrl-d", ":pf: stop the selected port forward"),
     ("p", "logs: filter pattern · scaling: policies"),
     ("w", "wrap lines (logs, describe)"),
     ("ctrl-s", "save the current view to ~/Downloads (logs: every line so far, as .log)"),
@@ -295,6 +332,10 @@ pub struct App {
     pub editor: Option<Secret>,
     /// What the value prompt (`Mode::Value`) is for.
     pub editing: Option<Editing>,
+    /// psql to run; the main loop hands the terminal over.
+    pub psql: Option<Psql>,
+    /// What `shutdown` did with the port forwards, printed once the screen is gone.
+    pub ended: Vec<String>,
     cluster: Option<String>,
     service: Option<String>,
     tx: Sender<Msg>,
@@ -316,7 +357,7 @@ impl App {
         let mut app = App {
             chrome: Default::default(), aws: Arc::new(Aws::new(Ctx { profile, region: home })), arn: None, account: None, ident_err: None, sso_expired: false,
             stack: vec![], mode: Mode::Normal, pick: None, history: vec![], hist_at: 0, hist_last: 0, interval: start.refresh.unwrap_or(10), next_refresh: Instant::now(), flash: None, page: 20,
-            quit: false, login: None, offered: false, expired_login: None, editor: None, editing: None, cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
+            quit: false, login: None, offered: false, expired_login: None, editor: None, editing: None, psql: None, ended: vec![], cluster: start.cluster.clone(), service: start.service.clone(), tx, seq: 0,
         };
         if pick_profile {
             app.replace_root(View::Profiles);
@@ -433,6 +474,7 @@ impl App {
         for f in &mut self.stack {
             f.stop_tail();
         }
+        self.ended = crate::forward::stop_all();
     }
 
     fn set_profile(&mut self, profile: String) {
@@ -538,7 +580,9 @@ impl App {
             self.flash = None;
         }
         let f = self.top();
-        if self.interval > 0 && Instant::now() >= self.next_refresh && f.view.auto_refresh() && !f.loading {
+        // :pf reads nothing from AWS, so its state and age follow every second.
+        let pf = matches!(f.view, View::Forwards) && f.load_started.elapsed() >= Duration::from_secs(1);
+        if (pf || self.interval > 0 && Instant::now() >= self.next_refresh && f.view.auto_refresh()) && !f.loading {
             self.load();
         }
     }
@@ -589,6 +633,7 @@ impl App {
                 _ => self.mode = Mode::Confirm(w, ok),
             },
             // Tab is text here, not completion.
+            Mode::Forward(form) => self.forward_key(form, k),
             Mode::Value(s) if k.code == KeyCode::Tab => self.mode = Mode::Value(s),
             Mode::Value(s) => self.mode = self.edit(s, k, Mode::Value, |app, s| app.submit(s)),
             Mode::Normal => self.normal_key(k),
@@ -697,6 +742,16 @@ impl App {
             KeyCode::Char('q') => {
                 if self.stack.len() > 1 { self.pop() } else { self.quit = true }
             }
+            KeyCode::Char('d') if ctrl && matches!(self.top().view, View::Forwards) => self.stage_stop_forward(),
+            KeyCode::Char('s') | KeyCode::Char('t') if !ctrl && matches!(self.top().view, View::Forwards) => self.ask_db_user(k.code == KeyCode::Char('t')),
+            KeyCode::Char('F') if matches!(self.top().view, View::Endpoints { .. }) => self.forward_form(),
+            KeyCode::Char('F') if matches!(self.top().view, View::Rds) => match self.top().selected().map(|r| r.cells[1].clone()) {
+                Some(id) => {
+                    self.push(View::Endpoints { of: Some(id) });
+                    self.flash("pick the endpoint to forward (writer, reader...), then F", false);
+                }
+                None => self.flash("select a cluster or instance", true),
+            },
             KeyCode::Char('d') | KeyCode::Char('k') if ctrl => self.flash("e9s is read-only: nothing to delete or kill", true),
             KeyCode::Char('a') if ctrl => self.push(View::Aliases),
             KeyCode::Char('e') if ctrl => self.chrome.headless = !self.chrome.headless,
@@ -877,6 +932,7 @@ impl App {
             }
             Some(Editing::Range(row)) => self.stage_range(&row, &input),
             Some(Editing::Desired { cluster, service, now }) => self.stage_desired(cluster, service, now, &input),
+            Some(Editing::DbUser { session, copy }) => self.db_login(&session, copy, &input),
             None => {}
         }
     }
@@ -993,10 +1049,162 @@ impl App {
         }, false);
     }
 
+    /// `F` on an endpoint: the dialog, with the online SSM instances (likely bastions first, the last one used
+    /// in this profile and region picked) and a free local port (the database's own when free).
+    fn forward_form(&mut self) {
+        let Some(row) = self.top().selected().cloned() else { return };
+        if std::env::var_os("E9S_DEMO").is_none() && crate::forward::plugin().is_none() {
+            return self.flash(crate::forward::PLUGIN_HELP, true);
+        }
+        let j = &row.json;
+        let g = |p: &str| crate::logic::s(j, p);
+        let port = crate::logic::n(j, "/Port") as u16;
+        let target = crate::forward::Target {
+            name: format!("{} {}", g("/Database"), g("/Endpoint")),
+            host: g("/Host"),
+            port,
+            db: g("/DatabaseName"),
+            user: g("/MasterUsername"),
+            iam: j["IAMDatabaseAuthenticationEnabled"].as_bool() == Some(true),
+        };
+        let table = match crate::views::bastions(&self.aws.on_screen(self.top().id)) {
+            Ok(t) => t,
+            Err(e) => return self.flash(format!("SSM instances not loaded: {e}"), true),
+        };
+        let bastions: Vec<(String, String, bool)> = table
+            .rows
+            .iter()
+            // Online, or unknown when the role cannot list SSM's instances.
+            .filter(|r| r.health != Health::Bad)
+            .map(|r| (r.id.clone(), r.cells[0].clone(), r.json["LikelyBastion"] == true))
+            .collect();
+        if bastions.is_empty() {
+            return self.flash("no online SSM-managed instance to forward through in this region (:ssm lists them, and why)", true);
+        }
+        let last = crate::forward::recall(&crate::forward::bastion_key(&self.aws.ctx));
+        let pick = last.and_then(|l| bastions.iter().position(|b| b.0 == l)).unwrap_or(0);
+        let local = crate::forward::free_port(port).to_string();
+        self.mode = Mode::Forward(ForwardForm { target, bastions, pick, local, fresh: true });
+    }
+
+    fn forward_key(&mut self, mut form: ForwardForm, k: KeyEvent) {
+        let n = form.bastions.len();
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => return self.flash("no forward started", false),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => form.pick = (form.pick + 1) % n,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => form.pick = (form.pick + n - 1) % n,
+            KeyCode::Char(c) if c.is_ascii_digit() && (form.fresh || form.local.len() < 5) => {
+                if std::mem::take(&mut form.fresh) {
+                    form.local.clear();
+                }
+                form.local.push(c)
+            }
+            KeyCode::Backspace => {
+                form.fresh = false;
+                form.local.pop();
+            }
+            KeyCode::Enter => return self.start_forward(form),
+            _ => {}
+        }
+        self.mode = Mode::Forward(form);
+    }
+
+    fn start_forward(&mut self, form: ForwardForm) {
+        let Some(local) = form.local.parse::<u16>().ok().filter(|p| *p > 0) else {
+            self.flash("type a local port, like 15432", true);
+            self.mode = Mode::Forward(form);
+            return;
+        };
+        let (id, name, _) = form.bastions[form.pick].clone();
+        let aws = self.aws.on_screen(self.top().id);
+        match crate::forward::start(&aws, (id.clone(), name.clone()), form.target.clone(), local) {
+            Ok(_) => {
+                crate::forward::remember(&crate::forward::bastion_key(&self.aws.ctx), &id);
+                self.flash(format!("forwarding localhost:{local} -> {}:{} via {name}", form.target.host, form.target.port), false);
+                self.push(View::Forwards);
+            }
+            Err(e) => {
+                self.flash(e, true);
+                self.mode = Mode::Forward(form);
+            }
+        }
+    }
+
+    /// ctrl-d on `:pf`, k9s delete: asks first, Cancel focused.
+    fn stage_stop_forward(&mut self) {
+        let Some(r) = self.top().selected().cloned() else { return };
+        let g = |p: &str| crate::logic::s(&r.json, p);
+        self.mode = Mode::Confirm(Pending {
+            title: format!("Stop the port forward on localhost:{}?", g("/LocalPort")),
+            changes: vec![format!("localhost:{} -> {}:{} via {}", g("/LocalPort"), g("/Host"), g("/Port"), g("/BastionName"))],
+            note: "Ends its Session Manager session (ssm terminate-session); open connections through it close.".into(),
+            write: Write::StopForward(r.id.clone()),
+            then: None,
+        }, false);
+    }
+
+    /// `s` / `t` on `:pf`: ask for the db user and database, the last ones used for that host first.
+    fn ask_db_user(&mut self, copy: bool) {
+        let Some(r) = self.top().selected().cloned() else { return };
+        let Some((_, t, _)) = crate::forward::get(&r.id) else { return self.flash("that forward is gone", true) };
+        if copy && !t.iam {
+            return self.flash("IAM database authentication is off for this database: there is no token to make", true);
+        }
+        let last = crate::forward::recall(&format!("dbuser {}", t.host));
+        self.editing = Some(Editing::DbUser { session: r.id.clone(), copy });
+        self.mode = Mode::Value(last.unwrap_or_else(|| format!("{} {}", t.user, t.db).trim().to_string()));
+    }
+
+    /// The token is a local signature (`rds generate-db-auth-token`, in `H`), good for 15 minutes; psql gets it as PGPASSWORD.
+    fn db_login(&mut self, session: &str, copy: bool, input: &str) {
+        let Some((ctx, t, local)) = crate::forward::get(session) else { return self.flash("that forward is gone", true) };
+        let mut w = input.split_whitespace();
+        let Some(user) = w.next().map(String::from) else { return self.flash("type a database user, and optionally a database name", true) };
+        let db = w.next().map(String::from);
+        crate::forward::remember(&format!("dbuser {}", t.host), input.trim());
+        let token = if t.iam {
+            let args = ["--hostname", &t.host, "--port", &t.port.to_string(), "--username", &user].map(String::from);
+            match Aws::new(ctx).on_screen(self.top().id).call("rds", "generate-db-auth-token", &args) {
+                Ok(v) => v["Token"].as_str().map(String::from),
+                Err(e) => return self.flash(e.to_string(), true),
+            }
+        } else {
+            None
+        };
+        if copy {
+            return match copy_to_clipboard(&token.unwrap_or_default()) {
+                Ok(()) => self.flash(format!("copied an IAM auth token for {user} (valid 15 minutes): psql -h localhost -p {local} -U {user} sslmode=require"), false),
+                Err(e) => self.flash(e, true),
+            };
+        }
+        let mut env = vec![("PGHOST".to_string(), "localhost".to_string()), ("PGPORT".into(), local.to_string()), ("PGUSER".into(), user.clone())];
+        if let Some(db) = &db {
+            env.push(("PGDATABASE".into(), db.clone()));
+        }
+        if let Some(tok) = token {
+            // IAM auth needs TLS; the certificate names the RDS host, not localhost, so it is not verified.
+            env.extend([("PGPASSWORD".into(), tok), ("PGSSLMODE".into(), "require".into())]);
+        }
+        self.psql = Some(Psql { env, what: format!("psql -h localhost -p {local} -U {user}{}", db.map(|d| format!(" -d {d}")).unwrap_or_default()) });
+    }
+
+    /// After psql exits.
+    pub fn psql_done(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.flash("psql exited", false),
+            Err(e) => self.flash(e, true),
+        }
+    }
+
     /// y: do the staged write. A secret is read again first and left alone if it changed since.
     fn apply(&mut self, p: Pending) {
         let aws = self.aws.on_screen(self.top().id);
+        let verb = if matches!(p.write, Write::StopForward(_)) { "stopped" } else { "done" };
         let r = match p.write {
+            Write::StopForward(session) => {
+                let ctx = crate::forward::get(&session).map_or(self.aws.ctx.clone(), |f| f.0);
+                crate::forward::stop(&Aws::new(ctx).on_screen(self.top().id), &session).map_err(AwsError::Api)
+            }
             Write::Secret { read, text } => read_secret(&aws, &read.name).and_then(|now| {
                 if now.version != read.version {
                     return Err(AwsError::Api(format!("{} changed since e9s read it: nothing written, r reads it again", read.name)));
@@ -1013,7 +1221,7 @@ impl App {
         };
         match r {
             Ok(()) => {
-                self.flash(format!("done: {}", p.changes.join(", ")), false);
+                self.flash(format!("{verb}: {}", p.changes.join(", ")), false);
                 match p.then {
                     Some(v) => self.push(v),
                     None => self.load(),
@@ -1118,6 +1326,8 @@ impl App {
                 View::EcrRepos => (None, None, Some("ecr".into())),
                 View::Sqs => (None, None, Some("sqs".into())),
                 View::Rds => (None, None, Some("rds".into())),
+                View::Endpoints { of } => (None, None, Some(format!("endpoints {}", of.as_deref().unwrap_or_default()).trim_end().to_string())),
+                View::Bastions => (None, None, Some("ssm".into())),
                 View::Lambda => (None, None, Some("lambda".into())),
                 View::Pulse => (None, None, Some("pulse".into())),
                 View::Alarms => (None, None, Some("alarms".into())),
@@ -1450,6 +1660,9 @@ impl App {
             Some("ecr") => self.replace_root(View::EcrRepos),
             Some("sqs") => self.replace_root(View::Sqs),
             Some("rds") => self.replace_root(View::Rds),
+            Some("endpoints") => self.replace_root(View::Endpoints { of: arg }),
+            Some("ssm") => self.replace_root(View::Bastions),
+            Some("portforwards") => self.replace_root(View::Forwards),
             Some("lambda") => self.replace_root(View::Lambda),
             Some("pulse") => self.replace_root(View::Pulse),
             Some("alarms") => self.replace_root(View::Alarms),

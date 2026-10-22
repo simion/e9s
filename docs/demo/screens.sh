@@ -17,5 +17,7 @@ shot logs -p prod -r us-east-1 --cluster shop-prod --script "$S l @wait @sleep @
 shot metrics -p prod -r us-east-1 --cluster shop-prod --script "$S m @wait @shot=$T/metrics"
 shot failures -p prod -r us-east-1 --cluster shop-prod --script "$S /image <Enter> F @wait @shot=$T/failures"
 shot tasks -p prod -r us-east-1 --cluster shop-prod -s api --script "$S @shot=$T/tasks"
+shot portforward -p prod -r us-east-1 --script "$S :rds <Enter> @wait <Enter> @wait j F @shot=$T/portforward"
+shot forwards -p prod -r us-east-1 --script "$S :ep <Enter> @wait j F 15432 <Enter> @wait @shot=$T/forwards"
 rm -r "$T"
 ls docs/screens

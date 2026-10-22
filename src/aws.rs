@@ -1,5 +1,6 @@
 //! The only door to AWS. Every API call goes through `Aws::call`, which refuses
-//! anything that is not a read on an allowlisted service, except the secret reads and writes `--write` opens.
+//! anything that is not a read on an allowlisted service, except the secret reads and writes `--write` opens
+//! and the port forwarding (`FORWARD`) allowed without it.
 
 use serde_json::Value;
 
@@ -28,12 +29,20 @@ impl std::fmt::Display for AwsError {
 }
 
 const SERVICES: &[&str] = &[
-    "ecs", "logs", "elbv2", "application-autoscaling", "ec2", "ecr", "sqs", "rds", "lambda", "cloudwatch", "sts", "cloudtrail", "secretsmanager",
+    "ecs", "logs", "elbv2", "application-autoscaling", "ec2", "ecr", "sqs", "rds", "lambda", "cloudwatch", "sts", "cloudtrail", "secretsmanager", "ssm",
 ];
 const READ_PREFIXES: &[&str] = &["describe-", "list-", "get-"];
 const READ_EXACT: &[&str] = &["filter-log-events", "lookup-events"];
 // Reads that hand out credentials. Not mutations, but nothing here needs them.
-const DENIED: &[&str] = &["get-login-password", "get-authorization-token", "get-session-token", "get-federation-token", "get-password-data", "get-secret-value"];
+const DENIED: &[&str] = &["get-login-password", "get-authorization-token", "get-session-token", "get-federation-token", "get-password-data", "get-secret-value",
+    // SSM parameters can hold SecureStrings.
+    "get-parameter", "get-parameters", "get-parameters-by-path", "get-parameter-history"];
+/// The one exception allowed without `--write`, as k9s allows port-forward under --readonly: a Session Manager
+/// tunnel to a database through a bastion. It changes no resource. Only the port-forwarding document starts,
+/// only sessions this run started can be ended, and the RDS IAM token is a local signature, not an API call.
+pub const FORWARD_DOC: &str = "AWS-StartPortForwardingSessionToRemoteHost";
+/// Session ids `ssm start-session` returned in this run: the only ones `terminate-session` may end.
+static SESSIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// What `--write` opens, and nothing else: secret values, a service's desired count or a restart (sdk.rs sends
 /// only `--desired-count` or `--force-new-deployment` with update-service), a scaling range, and the scheduled action that restores it.
 const WRITES: &[(&str, &str)] = &[
@@ -46,7 +55,17 @@ const WRITES: &[(&str, &str)] = &[
 /// Set once by `--write`, before the first call.
 pub static WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn check(service: &str, op: &str, write: bool) -> Result<(), AwsError> {
+pub fn check(service: &str, op: &str, args: &[String], write: bool) -> Result<(), AwsError> {
+    let after = |flag: &str| args.iter().skip_while(|a| *a != flag).nth(1).cloned().unwrap_or_default();
+    let refuse = |why: &str| Err(AwsError::Api(format!("refused by read-only guard: aws {service} {op} {why}")));
+    match (service, op) {
+        ("ssm", "start-session") if after("--document-name") == FORWARD_DOC => return Ok(()),
+        ("ssm", "start-session") => return refuse(&format!("is allowed only with --document-name {FORWARD_DOC}")),
+        ("ssm", "terminate-session") if SESSIONS.lock().unwrap().contains(&after("--session-id")) => return Ok(()),
+        ("ssm", "terminate-session") => return refuse("is allowed only for a session e9s started"),
+        ("rds", "generate-db-auth-token") => return Ok(()),
+        _ => {}
+    }
     match (WRITES.contains(&(service, op)), write) {
         (true, true) => Ok(()),
         (true, false) => Err(AwsError::Api(format!("refused by read-only guard: aws {service} {op} needs e9s started with --write"))),
@@ -93,10 +112,15 @@ impl Aws {
     }
 
     pub fn call(&self, service: &str, op: &str, args: &[String]) -> Result<Value, AwsError> {
-        check(service, op, WRITE.load(std::sync::atomic::Ordering::Relaxed))?;
+        check(service, op, args, WRITE.load(std::sync::atomic::Ordering::Relaxed))?;
         let mut shown = Call::start(self.screen, display_cmd(&self.ctx.region, service, op, args));
         let r = (self.runner)(&self.ctx, service, op, args);
         shown.ok = r.is_ok();
+        if let (("ssm", "start-session"), Ok(v)) = ((service, op), &r) {
+            if let Some(id) = v["SessionId"].as_str() {
+                SESSIONS.lock().unwrap().push(id.to_string());
+            }
+        }
         r
     }
 }
@@ -480,13 +504,36 @@ mod tests {
     #[test]
     fn write_opens_only_its_list() {
         for (svc, op) in WRITES {
-            assert!(check(svc, op, false).is_err(), "{svc} {op} without --write");
-            assert!(check(svc, op, true).is_ok(), "{svc} {op} with --write");
+            assert!(check(svc, op, &[], false).is_err(), "{svc} {op} without --write");
+            assert!(check(svc, op, &[], true).is_ok(), "{svc} {op} with --write");
         }
         for (svc, op) in [("secretsmanager", "delete-secret"), ("secretsmanager", "update-secret"), ("ecs", "delete-service"), ("ecs", "stop-task"),
             ("application-autoscaling", "delete-scheduled-action"), ("application-autoscaling", "deregister-scalable-target")] {
-            assert!(check(svc, op, true).is_err(), "{svc} {op} allowed by --write");
+            assert!(check(svc, op, &[], true).is_err(), "{svc} {op} allowed by --write");
         }
-        assert!(check("secretsmanager", "list-secrets", false).is_ok());
+        assert!(check("secretsmanager", "list-secrets", &[], false).is_ok());
+    }
+
+    #[test]
+    fn port_forwarding_is_the_one_narrow_exception() {
+        let a = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let fwd = a(&["--target", "i-1", "--document-name", FORWARD_DOC, "--parameters", "host=db,portNumber=5432,localPortNumber=15432"]);
+        assert!(check("ssm", "start-session", &fwd, false).is_ok());
+        // A shell, another document, or no document at all is refused, with or without --write.
+        for bad in [a(&["--target", "i-1"]), a(&["--target", "i-1", "--document-name", "AWS-StartInteractiveCommand"]), a(&["--document-name", "AWS-StartSSHSession"])] {
+            assert!(check("ssm", "start-session", &bad, true).is_err(), "{bad:?}");
+        }
+        // Only sessions this run started can be ended; Aws::call records them as they start.
+        let aws = Aws::with_runner(|_, _, op, _| Ok(if op == "start-session" { serde_json::json!({"SessionId": "me-0abc"}) } else { Value::Null }));
+        assert!(check("ssm", "terminate-session", &a(&["--session-id", "me-0abc"]), true).is_err());
+        aws.call("ssm", "start-session", &fwd).unwrap();
+        assert!(aws.call("ssm", "terminate-session", &a(&["--session-id", "me-0abc"])).is_ok());
+        assert!(aws.call("ssm", "terminate-session", &a(&["--session-id", "someone-else-0def"])).is_err());
+        assert!(check("rds", "generate-db-auth-token", &[], false).is_ok());
+        // SSM is listed for its reads, but parameters can hold secrets and the rest of SSM changes things.
+        for op in ["get-parameter", "get-parameters", "get-parameters-by-path", "send-command", "start-automation-execution", "resume-session", "put-parameter"] {
+            assert!(check("ssm", op, &[], true).is_err(), "ssm {op}");
+        }
+        assert!(check("ssm", "describe-instance-information", &[], false).is_ok());
     }
 }

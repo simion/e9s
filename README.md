@@ -1,11 +1,12 @@
 # e9s
 
 A k9s-style terminal UI for AWS, read-only unless started with `--write`.
-Browse ECS clusters, services, tasks and containers, read and live-tail their CloudWatch logs, and watch a deployment roll, with the same keys as k9s.
+Browse ECS clusters, services, tasks and containers, read and live-tail their CloudWatch logs, watch a deployment roll, and port-forward to a database through a bastion, with the same keys as k9s.
 
 By default it cannot change anything.
 Every AWS call goes through one function (`Aws::call` in `src/aws.rs`) that only lets through `describe-*`, `list-*` and `get-*` operations on an allowlist of services, plus `logs filter-log-events` and `cloudtrail lookup-events`.
 Credential getters such as `ecr get-login-password` are refused too.
+The one exception, allowed without `--write` as k9s allows port-forward under `--readonly`, is port forwarding to a database through an SSM bastion: `ssm start-session` with the `AWS-StartPortForwardingSessionToRemoteHost` document only (no shell, no other document), `ssm terminate-session` only for sessions e9s started in this run, and `rds generate-db-auth-token`, a local signature that sends nothing. It opens a tunnel and changes no resource.
 Environment variable and secret values are stripped from every response before they are shown or saved, so only their names appear.
 
 `--write` (or `--rw`) opens five more calls and nothing else:
@@ -25,11 +26,14 @@ The recording and these screens come from `E9S_DEMO=1`, a made-up account (see D
 | ![Live tail of every task of a service](docs/screens/logs.png) | ![CPU and memory, last 3 hours](docs/screens/metrics.png) |
 | **Failures (`F`)** | **Tasks** |
 | ![Crashed tasks and problem events](docs/screens/failures.png) | ![Tasks of both generations](docs/screens/tasks.png) |
+| **Port forward (`F` on an endpoint)** | **Port forwards (`:pf`)** |
+| ![Forwarding an RDS reader endpoint through a bastion](docs/screens/portforward.png) | ![A running forward](docs/screens/forwards.png) |
 
 ## Requirements
 
 - AWS credentials as the AWS CLI uses them: e9s calls AWS through the official AWS SDK for Rust, which reads `~/.aws/config` and `~/.aws/credentials`, so SSO profiles, roles, credential processes and environment variables work as they do for the CLI. A profile you already logged in with `aws sso login` just works.
 - The AWS CLI v2, only to log in from inside e9s (`L` runs `aws sso login`).
+- AWS's [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html), only for port forwards (`brew install --cask session-manager-plugin`), and `psql` to open a database through one.
 - A Rust toolchain, only to build from source.
 
 ## Install
@@ -130,12 +134,13 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `d` | Describe, like `kubectl describe`: clusters, services (settings, rollout config, network, load balancers, deployments, events), tasks (stop reason, timeline, every container), containers and target groups (health check, every attribute) get a readable page; an RDS instance or cluster gets a live page (refreshed like a table) with pending changes as old -> new, how long the current change has been applying, pending maintenance, the last 24h of RDS events and the last 7 days of CloudTrail changes, to follow a modification step by step; a Lambda function gets a live page too, with its state, last update (updating, failed and why) and recent changes; anything else shows as YAML, and a structured log line is parsed first |
 | `y` | YAML of the selection: the fields e9s reads from AWS, under their API names |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
-| `s` | Logs: autoscroll (follow new lines) on / off, on by default. With `--write`, on a service: set its desired count (the dialog says whether autoscaling will move it back); on a scaling target (`:scaling`): set min and max, as `4 20`, or `4 20 for 2h` to go back to the old range after 2h (`m`, `h`, `d`). The way back is an Application Auto Scaling scheduled action named `e9s-restore`, so it happens even if e9s is closed, and the RESTORE column shows it. Elsewhere `s` (shell in k9s) says e9s is read-only |
+| `s` | In `:pf`: open `psql` through the selected forward (asks for the db user and database; with an IAM auth token as the password when the database has IAM auth). Logs: autoscroll (follow new lines) on / off, on by default. With `--write`, on a service: set its desired count (the dialog says whether autoscaling will move it back); on a scaling target (`:scaling`): set min and max, as `4 20`, or `4 20 for 2h` to go back to the old range after 2h (`m`, `h`, `d`). The way back is an Application Auto Scaling scheduled action named `e9s-restore`, so it happens even if e9s is closed, and the RESTORE column shows it. Elsewhere `s` (shell in k9s) says e9s is read-only |
 | `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs |
-| `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected |
+| `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected. On an RDS endpoint: port-forward it through a bastion (k9s `shift-f`, see below); on an RDS cluster or instance it lists its endpoints first |
+| `ctrl-d` | In `:pf`: stop the selected port forward (asks first) |
 | `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
 | `w` | Wrap long lines in logs and describe on or off (on by default) |
-| `t` | Logs: show or hide timestamps |
+| `t` | Logs: show or hide timestamps. In `:pf`: copy an RDS IAM auth token for the forward's database (asks for the db user) |
 | `0` `1` `2`-`6` | Logs, as in k9s: start from the newest lines (tail, the default), from the first lines (head, not followed), or 1m, 5m, 15m, 30m, 1h back. A window reads up to 5000 lines per 100 streams and says when it was cut |
 | `a` | Service logs: every container of each task that logs to the same group, tagged `container/task` |
 | `m` / `C` / `c` | Logs: draw a mark line across the view / clear the screen (following continues) / copy the lines shown (after the filter) |
@@ -178,7 +183,10 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `:ec2` `:no` `:nodes` | EC2 instances |
 | `:ecr` | ECR repositories, then images |
 | `:sqs` | SQS queues with depth, in-flight, oldest message age and DLQ |
-| `:rds` | RDS clusters and instances, with writer / reader roles and a PENDING column (queued or applying changes, old -> new) |
+| `:rds` | RDS clusters and instances, with writer / reader roles and a PENDING column (queued or applying changes, old -> new). Enter lists its endpoints |
+| `:endpoints` `:ep` `:db` `[name]` | RDS endpoints: each cluster's writer, reader and custom endpoints, then each instance's own, with host, port, engine, IAM auth and the local port forwarded to it. `F` forwards one |
+| `:ssm` `:bastions` | Instances that report to Session Manager (SSM agent online), named from their EC2 tags, likely bastions first (a name or tag with bastion, jump, tunnel or proxy) |
+| `:pf` `:portforwards` | Port forwards of this run (k9s `:pf`): local port, target, bastion, state, connections, age |
 | `:lambda` `:fn` | Lambda functions, with ERRORS 1H and THROTTLES 1H, and STATUS (updating, ready, failed) for those changed in the last 15 minutes |
 | `:pulse` `:pu` `:overview` | Everything not healthy on one screen: alarms firing, ECS services (every cluster) failing or rolling, RDS not available or changing, Lambda failing, updating or throttled. Enter opens it |
 | `:alarms` `:al` | CloudWatch alarms, firing first, with condition, actions and why. Target-tracking scaling alarms are dimmed at the bottom (their ALARM drives scale-in). Enter opens the resource the alarm watches |
@@ -205,6 +213,23 @@ The k9s path from deployments to pods to containers to logs maps to:
 
 Colours follow k9s: green steady, yellow transitioning, red failed, grey finished normally.
 A stopped task is classified by why it stopped. An old-generation task drained by the scheduler ("Scaling activity initiated by deployment ...") is a normal drain and is grey, even with exit code 137 or 143. A failed ELB health check, a failed start, or a non-zero exit outside a drain is red.
+
+## Port forwarding (databases through a bastion)
+
+Databases usually sit in private subnets; from a laptop you reach them through an SSM-managed instance in the VPC (a bastion), the way `aws ssm start-session --document-name AWS-StartPortForwardingSessionToRemoteHost` does by hand.
+In e9s:
+
+1. `L` logs in if needed.
+2. `:rds`, Enter on a cluster (or `:endpoints`): its writer, reader and custom endpoints, and each instance's own.
+3. `F` on the endpoint: a dialog picks the bastion (online SSM instances, likely bastions first, the last one used in this profile and region preselected) and the local port (the database's own port when it is free, else the next free one). Enter starts it and opens `:pf`.
+4. In `:pf`, `s` opens `psql` through the forward, `t` copies an IAM auth token, `ctrl-d` stops it.
+
+A role that may start sessions but not list SSM's instances (`ssm:DescribeInstanceInformation` denied) still works: the list says so and falls back to running EC2 instances, likely bastions first.
+The session starts through the SDK like every other call (it shows in `H`), and AWS's session-manager-plugin carries the traffic, as it does for the CLI.
+`STATE` reads `starting` until the plugin listens, then `listening`; `CONNS` counts the connections it accepted; an ended session says why.
+With IAM database authentication on, the token is a 15-minute signature made from your credentials (`rds generate-db-auth-token`, no request sent), handed to psql as `PGPASSWORD` with `sslmode=require`, never on its command line. The db user typed is remembered per host.
+Forwards end when e9s exits: each plugin is stopped and its session terminated.
+The last bastion and db user are kept in `~/.config/e9s/remembered`.
 
 ## Rollout watch (`R`)
 

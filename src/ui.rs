@@ -99,6 +99,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Mode::Confirm(w, ok) = &app.mode {
         confirm_write(f, w, *ok);
     }
+    if let Mode::Forward(form) = &app.mode {
+        forward_form(f, form);
+    }
     if let Mode::Calls(off) = app.mode {
         let max = calls(f, app.top().id, off);
         if off > max {
@@ -210,7 +213,9 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
         View::ScalableTargets { .. } => vec![("<enter>", "Activities"), ("<p>", "Policies")],
         View::EcrRepos => vec![("<enter>", "Images")],
         View::Lambda => vec![("<l>", "Logs"), ("<m>", "Metrics"), ("<T>", "Changes")],
-        View::Rds => vec![("<m>", "Metrics"), ("<T>", "Changes")],
+        View::Rds => vec![("<enter>", "Endpoints"), ("<F>", "Port-forward"), ("<m>", "Metrics"), ("<T>", "Changes")],
+        View::Endpoints { .. } => vec![("<F>", "Port-forward")],
+        View::Forwards => vec![("<ctrl-d>", "Stop"), ("<s>", "psql"), ("<t>", "IAM token")],
         View::Ec2 => vec![("<T>", "Changes")],
         View::Alarms => vec![("<enter>", "Resource")],
         View::Pulse => vec![("<enter>", "Open")],
@@ -794,9 +799,15 @@ fn prompt(f: &mut Frame, app: &App, area: Rect) {
             let label = match app.editing {
                 Some(crate::app::Editing::Range(_)) => "min max [for 2h]: ",
                 Some(crate::app::Editing::Desired { .. }) => "desired tasks: ",
+                Some(crate::app::Editing::DbUser { copy: false, .. }) => "db user [database]: ",
+                Some(crate::app::Editing::DbUser { copy: true, .. }) => "db user for the token: ",
                 _ => "new value: ",
             };
-            (label, s.clone(), "  (Enter, then y applies · Esc cancels)".into())
+            let hint = match app.editing {
+                Some(crate::app::Editing::DbUser { copy, .. }) => format!("  (Enter {} · Esc cancels)", if copy { "copies the token" } else { "opens psql" }),
+                _ => "  (Enter, then y applies · Esc cancels)".into(),
+            };
+            (label, s.clone(), hint)
         }
         _ => return,
     };
@@ -899,6 +910,7 @@ fn offer_login(f: &mut Frame, profile: &str, l: &crate::app::Login) {
 /// Before a write, k9s style (`internal/ui/dialog/confirm.go`): what changes (names and numbers, never a secret's value),
 /// what to expect, and Cancel / OK buttons with Cancel focused first.
 fn confirm_write(f: &mut Frame, w: &crate::app::Pending, ok: bool) {
+    let heading = w.heading();
     let mut lines = vec![Line::raw(""), Line::styled(format!("  {}", w.title), Style::new().fg(Color::White).bold()), Line::raw("")];
     lines.extend(w.changes.iter().map(|c| Line::styled(format!("    {c}"), Style::new().fg(ORANGE).bold())));
     lines.push(Line::raw(""));
@@ -915,7 +927,43 @@ fn confirm_write(f: &mut Frame, w: &crate::app::Pending, ok: bool) {
     let block = Block::new()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Indexed(160)))
-        .title(Line::styled(" Write to AWS ", Style::new().fg(Color::Indexed(160)).bold()).centered());
+        .title(Line::styled(heading, Style::new().fg(Color::Indexed(160)).bold()).centered());
+    f.render_widget(Clear, r);
+    f.render_widget(Paragraph::new(lines).block(block), r);
+}
+
+/// k9s shift-f: where the forward goes, which bastion carries it, which local port it opens.
+fn forward_form(f: &mut Frame, form: &crate::app::ForwardForm) {
+    let t = &form.target;
+    let label = |s: &str| Span::styled(format!("  {s:<12}"), Style::new().fg(GRAY));
+    let mut lines = vec![
+        Line::raw(""),
+        Line::styled(format!("  Forward {} through a bastion?", t.name), Style::new().fg(Color::White).bold()),
+        Line::raw(""),
+        Line::from(vec![label("to"), Span::styled(format!("{}:{}", t.host, t.port), Style::new().fg(ORANGE).bold())]),
+        Line::from(vec![label("local port"), Span::styled(format!("localhost:{}", form.local), Style::new().fg(ORANGE).bold()), Span::styled("█", Style::new().fg(AQUA))]),
+        Line::raw(""),
+        Line::from(vec![label("via"), Span::styled("SSM-managed instance (↑↓ picks)", Style::new().fg(GRAY))]),
+    ];
+    // A window of the list around the pick.
+    let start = form.pick.saturating_sub(7);
+    for (i, (id, name, likely)) in form.bastions.iter().enumerate().skip(start).take(8) {
+        let st = if i == form.pick { Style::new().fg(INK).bg(AQUA).bold() } else { Style::new().fg(Color::White) };
+        let mark = if *likely { "  bastion" } else { "" };
+        lines.push(Line::from(vec![Span::raw("    "), Span::styled(format!(" {name} ({id}) "), st), Span::styled(mark, Style::new().fg(GRAY))]));
+    }
+    if form.bastions.len() > 8 {
+        lines.push(Line::styled(format!("    {} of {}", form.pick + 1, form.bastions.len()), Style::new().fg(GRAY)));
+    }
+    lines.push(Line::raw(""));
+    lines.extend(wrap("ssm start-session with the port-forwarding document only: no shell, nothing on AWS changes. It ends with ctrl-d in :pf, or when e9s exits.", 76).into_iter().map(|l| Line::styled(format!("  {l}"), Style::new().fg(GRAY))));
+    let key = |k: &str, what: &str| vec![Span::styled(format!(" {k} "), Style::new().fg(DODGER).bold()), Span::styled(format!("{what}  "), Style::new().fg(GRAY))];
+    lines.extend([Line::raw(""), Line::from([key("enter", "start"), key("↑↓", "bastion"), key("0-9 ⌫", "local port"), key("esc", "cancel")].concat()).centered()]);
+    let area = f.area();
+    let w = (lines.iter().map(|l| l.width()).max().unwrap_or(40) as u16 + 4).min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let block = Block::new().borders(Borders::ALL).border_style(Style::new().fg(SKY)).title(Line::styled(" Port forward ", Style::new().fg(AQUA).bold()).centered());
     f.render_widget(Clear, r);
     f.render_widget(Paragraph::new(lines).block(block), r);
 }

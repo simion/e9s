@@ -207,6 +207,13 @@ pub enum View {
     EcrImages { repo: String },
     Sqs,
     Rds,
+    /// Every way into a database: cluster writer, reader and custom endpoints, and each instance's own.
+    /// `of`: one cluster or instance.
+    Endpoints { of: Option<String> },
+    /// SSM-managed instances, likely bastions first: what a port forward goes through.
+    Bastions,
+    /// k9s :pf: the port forwards of this run.
+    Forwards,
     Lambda,
     /// CloudWatch alarms, firing first.
     Alarms,
@@ -282,6 +289,10 @@ impl View {
             View::EcrImages { repo } => format!("images({repo})"),
             View::Sqs => "sqs".into(),
             View::Rds => "rds".into(),
+            View::Endpoints { of: None } => "endpoints".into(),
+            View::Endpoints { of: Some(x) } => format!("endpoints({x})"),
+            View::Bastions => "ssm".into(),
+            View::Forwards => "portforwards".into(),
             View::Lambda => "lambda".into(),
             View::Alarms => "alarms".into(),
             View::Trail { resource: None } => "trail".into(),
@@ -326,6 +337,7 @@ impl View {
             View::ScalableTargets { ns } => View::ScalingActivities { ns: ns.clone(), resource: Some(r.id.clone()) },
             View::EcrRepos => View::EcrImages { repo: r.id.clone() },
             View::Secrets => View::SecretValue { name: r.id.clone(), reveal: false },
+            View::Rds => View::Endpoints { of: Some(r.cells[1].clone()) },
             View::Alarms => return alarm_target(j),
             View::Pulse => match s(j, "/kind").as_str() {
                 "alarm" => alarm_target(j).unwrap_or(View::Alarms),
@@ -483,6 +495,9 @@ impl View {
             View::EcrImages { repo } => ecr_images(aws, repo),
             View::Sqs => sqs(aws),
             View::Rds => rds(aws),
+            View::Endpoints { of } => endpoints(aws, of.as_deref()),
+            View::Bastions => bastions(aws),
+            View::Forwards => Ok(forwards()),
             View::Lambda => lambda(aws),
             View::Alarms => alarms(aws),
             View::Trail { resource } => trail(aws, resource.as_deref()),
@@ -2205,6 +2220,153 @@ fn rds(aws: &Aws) -> Result<Table, AwsError> {
     Ok(t)
 }
 
+/// Writer, reader and custom endpoints of every cluster, then every instance's own endpoint. `F` forwards one.
+fn endpoints(aws: &Aws, of: Option<&str>) -> Result<Table, AwsError> {
+    let (clusters, custom, instances) = std::thread::scope(|sc| {
+        let c = sc.spawn(|| aws.call("rds", "describe-db-clusters", &[]));
+        let e = sc.spawn(|| aws.call("rds", "describe-db-cluster-endpoints", &[]));
+        let i = sc.spawn(|| aws.call("rds", "describe-db-instances", &[]));
+        (c.join().expect("clusters"), e.join().expect("endpoints"), i.join().expect("instances"))
+    });
+    let (clusters, instances) = (clusters?, instances?);
+    let mut t = Table::new(&["DATABASE", "ENDPOINT", "HOST", "PORT", "ENGINE", "STATUS", "IAM AUTH", "FORWARD"]);
+    t.info("F forwards the selected endpoint to a local port through an SSM bastion · :pf lists forwards");
+    let custom = t.soft(custom, "describe-db-cluster-endpoints (custom endpoints)")?;
+    let add = |t: &mut Table, db: &str, kind: &str, host: String, port: i64, engine: &str, status: &str, j: &Value, dbname: &str| {
+        if host.is_empty() || of.is_some_and(|o| o != db && o != s(j, "/DBClusterIdentifier")) {
+            return;
+        }
+        let iam = j["IAMDatabaseAuthenticationEnabled"].as_bool() == Some(true);
+        let fwd = crate::forward::local_for(&aws.ctx, &host).map(|l| format!("localhost:{l}")).unwrap_or_default();
+        let row = json!({
+            "Database": db, "Endpoint": kind, "Host": host, "Port": port, "Engine": engine, "Status": status,
+            "DatabaseName": dbname, "MasterUsername": s(j, "/MasterUsername"), "IAMDatabaseAuthenticationEnabled": iam,
+        });
+        t.row(host.clone(), health_of(status), row, vec![
+            db.to_string(), kind.to_string(), host, port.to_string(), engine.to_string(), status.to_string(), if iam { "on".into() } else { "off".into() }, fwd,
+        ]);
+    };
+    for c in arr(&clusters, "/DBClusters") {
+        let (id, port, engine, st, dbname) = (s(c, "/DBClusterIdentifier"), n(c, "/Port"), s(c, "/Engine"), s(c, "/Status"), s(c, "/DatabaseName"));
+        add(&mut t, &id, "writer", s(c, "/Endpoint"), port, &engine, &st, c, &dbname);
+        add(&mut t, &id, "reader", s(c, "/ReaderEndpoint"), port, &engine, &st, c, &dbname);
+        for e in custom.as_ref().map(|v| arr(v, "/DBClusterEndpoints").to_vec()).unwrap_or_default() {
+            if s(&e, "/EndpointType") == "CUSTOM" && s(&e, "/DBClusterIdentifier") == id {
+                let kind = format!("custom {} ({})", s(&e, "/DBClusterEndpointIdentifier"), s(&e, "/CustomEndpointType").to_lowercase());
+                add(&mut t, &id, &kind, s(&e, "/Endpoint"), port, &engine, &s(&e, "/Status"), c, &dbname);
+            }
+        }
+    }
+    let writers: HashMap<String, bool> = arr(&clusters, "/DBClusters")
+        .iter()
+        .flat_map(|c| arr(c, "/DBClusterMembers").iter().map(|m| (s(m, "/DBInstanceIdentifier"), m["IsClusterWriter"].as_bool().unwrap_or(false))))
+        .collect();
+    for i in arr(&instances, "/DBInstances") {
+        let id = s(i, "/DBInstanceIdentifier");
+        let kind = match writers.get(&id) {
+            Some(true) => "instance (writer)",
+            Some(false) => "instance (reader)",
+            None => "instance",
+        };
+        add(&mut t, &id, kind, s(i, "/Endpoint/Address"), n(i, "/Endpoint/Port"), &s(i, "/Engine"), &s(i, "/DBInstanceStatus"), i, &s(i, "/DBName"));
+    }
+    t.empty = Some("no RDS endpoints in this region".into());
+    Ok(t)
+}
+
+/// Instances Session Manager can reach (online first, likely bastions first), named from their EC2 tags.
+pub fn bastions(aws: &Aws) -> Result<Table, AwsError> {
+    let (ssm, ec2) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| aws.call("ssm", "describe-instance-information", &[]));
+        let b = sc.spawn(|| aws.call("ec2", "describe-instances", &[]));
+        (a.join().expect("ssm"), b.join().expect("ec2"))
+    });
+    let mut t = Table::new(&["NAME", "INSTANCE", "PING", "BASTION", "PLATFORM", "IP", "AGENT", "LAST PING"]);
+    t.info("instances the SSM agent reports from: a port forward (F on :endpoints) goes through one · BASTION: name or tags read as one");
+    // Some roles may start sessions but not list SSM's instances: fall back to running EC2 instances, said loudly.
+    let ssm = match ssm {
+        Ok(v) => v,
+        Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+        Err(e) => {
+            t.bad(format!("ssm describe-instance-information: {e}"));
+            t.note(Health::Warn, "listing running EC2 instances instead: PING is unknown, a forward works through one whose SSM agent is online");
+            let ec2 = ec2?;
+            let list: Vec<Value> = arr(&ec2, "/Reservations")
+                .iter()
+                .flat_map(|r| arr(r, "/Instances").to_vec())
+                .filter(|i| s(i, "/State/Name") == "running")
+                .map(|i| json!({"InstanceId": s(&i, "/InstanceId"), "PingStatus": "unknown", "IPAddress": s(&i, "/PrivateIpAddress")}))
+                .collect();
+            return Ok(bastion_rows(t, &json!({"InstanceInformationList": list}), Some(ec2)));
+        }
+    };
+    let ec2 = t.soft(ec2, "ec2 describe-instances (names)")?;
+    Ok(bastion_rows(t, &ssm, ec2))
+}
+
+fn bastion_rows(mut t: Table, ssm: &Value, ec2: Option<Value>) -> Table {
+    let tags: HashMap<String, Vec<(String, String)>> = ec2
+        .as_ref()
+        .map(|v| arr(v, "/Reservations").iter().flat_map(|r| arr(r, "/Instances").to_vec()).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .iter()
+        .map(|i| (s(i, "/InstanceId"), arr(i, "/Tags").iter().map(|x| (s(x, "/Key"), s(x, "/Value"))).collect()))
+        .collect();
+    let mut rows: Vec<(bool, bool, String, Value, Vec<String>)> = arr(ssm, "/InstanceInformationList")
+        .iter()
+        .map(|i| {
+            let id = s(i, "/InstanceId");
+            let kv = tags.get(&id).cloned().unwrap_or_default();
+            let name = kv.iter().find(|(k, _)| k == "Name").map(|(_, v)| v.clone()).unwrap_or_else(|| s(i, "/ComputerName"));
+            let words: Vec<String> = std::iter::once(name.clone()).chain(kv.iter().map(|(k, v)| format!("{k}={v}"))).collect();
+            let likely = crate::forward::likely_bastion(&words);
+            let ping = s(i, "/PingStatus");
+            let mut j = i.clone();
+            j["Name"] = json!(name);
+            j["LikelyBastion"] = json!(likely);
+            let cells = vec![
+                name, id, ping.clone(), if likely { "likely".into() } else { String::new() },
+                format!("{} {}", s(i, "/PlatformName"), s(i, "/PlatformVersion")).trim().to_string(),
+                s(i, "/IPAddress"), s(i, "/AgentVersion"), age_at(i, "/LastPingDateTime"),
+            ];
+            (ping == "Online", likely, cells[0].clone(), j, cells)
+        })
+        .collect();
+    rows.sort_by(|a, b| (!a.0, !a.1, &a.2).cmp(&(!b.0, !b.1, &b.2)));
+    for (online, _, _, j, cells) in rows {
+        let h = match cells[2].as_str() {
+            _ if online => Health::Ok,
+            "unknown" => Health::None,
+            _ => Health::Bad,
+        };
+        t.row(cells[1].clone(), h, j, cells);
+    }
+    t.trunc(ssm, "describe-instance-information");
+    t.empty = Some("no instances report to Session Manager in this region: a bastion needs the SSM agent and an instance role allowing it".into());
+    t
+}
+
+/// k9s :pf: this run's forwards. They end when e9s exits.
+fn forwards() -> Table {
+    let mut t = Table::new(&["LOCAL", "TARGET", "HOST", "VIA", "STATE", "CONNS", "AGE"]);
+    t.info("ctrl-d stops the selected forward · s opens psql through it · t copies an IAM auth token · forwards end when e9s exits");
+    for f in crate::forward::list() {
+        let st = s(&f, "/State");
+        let h = match st.as_str() {
+            "listening" => Health::Ok,
+            "starting" => Health::Warn,
+            _ => Health::Bad,
+        };
+        let via = format!("{} ({})", s(&f, "/BastionName"), s(&f, "/Bastion"));
+        t.row(s(&f, "/SessionId"), h, f.clone(), vec![
+            format!("localhost:{}", s(&f, "/LocalPort")), s(&f, "/Target"), format!("{}:{}", s(&f, "/Host"), s(&f, "/Port")), via, st,
+            s(&f, "/Connections"), age_at(&f, "/Started"),
+        ]);
+    }
+    t.empty = Some("no port forwards: F on an endpoint (:endpoints, or Enter on an RDS cluster) starts one".into());
+    t
+}
+
 /// Queued or applying changes, "class db.t4g.micro -> db.t4g.small": AWS lists only the new value, the current one is beside it.
 pub fn pending(v: &Value) -> Vec<String> {
     let Some(p) = v["PendingModifiedValues"].as_object() else { return vec![] };
@@ -2584,6 +2746,8 @@ fn access(aws: &Aws) -> Result<Table, AwsError> {
         ("rds", "describe-db-clusters", vec![], "rds"),
         ("rds", "describe-events", args!["--duration", 60], "rds d: events"),
         ("rds", "describe-pending-maintenance-actions", vec![], "rds d: maintenance"),
+        ("rds", "describe-db-cluster-endpoints", vec![], "endpoints (custom)"),
+        ("ssm", "describe-instance-information", vec![], "ssm, port-forward bastions"),
         ("lambda", "list-functions", args!["--max-items", 1], "lambda"),
         ("secretsmanager", "list-secrets", vec![], "secrets (names only)"),
         ("cloudwatch", "describe-alarms", vec![], "alarms, pulse"),
@@ -2976,6 +3140,55 @@ mod tests {
     fn sso_expiry_aborts_the_view() {
         let aws = Aws::with_runner(|_, _, _, _| Err(AwsError::SsoExpired("test".into())));
         assert!(matches!(View::Services { cluster: "c".into() }.fetch(&aws), Err(AwsError::SsoExpired(_))));
+    }
+
+    #[test]
+    fn endpoints_list_writer_reader_custom_then_instances() {
+        let aws = Aws::with_runner(|_, _, op, _| Ok(match op {
+            "describe-db-clusters" => json!({"DBClusters": [{
+                "DBClusterIdentifier": "app", "Endpoint": "app.cluster-x", "ReaderEndpoint": "app.cluster-ro-x", "Port": 5432, "Status": "available",
+                "IAMDatabaseAuthenticationEnabled": true, "DatabaseName": "app",
+                "DBClusterMembers": [{"DBInstanceIdentifier": "app-1", "IsClusterWriter": true}, {"DBInstanceIdentifier": "app-2", "IsClusterWriter": false}],
+            }]}),
+            "describe-db-cluster-endpoints" => json!({"DBClusterEndpoints": [
+                {"DBClusterIdentifier": "app", "EndpointType": "WRITER", "Endpoint": "app.cluster-x"},
+                {"DBClusterIdentifier": "app", "EndpointType": "CUSTOM", "DBClusterEndpointIdentifier": "bi", "CustomEndpointType": "READER", "Endpoint": "bi.cluster-custom-x", "Status": "available"},
+            ]}),
+            _ => json!({"DBInstances": [
+                {"DBInstanceIdentifier": "app-1", "DBClusterIdentifier": "app", "DBInstanceStatus": "available", "Endpoint": {"Address": "app-1.x", "Port": 5432}},
+                {"DBInstanceIdentifier": "app-2", "DBClusterIdentifier": "app", "DBInstanceStatus": "available", "Endpoint": {"Address": "app-2.x", "Port": 5432}},
+                {"DBInstanceIdentifier": "solo", "DBInstanceStatus": "available", "Endpoint": {"Address": "solo.x", "Port": 3306}},
+            ]}),
+        }));
+        let kinds = |of: Option<&str>| -> Vec<String> { endpoints(&aws, of).unwrap().rows.iter().map(|r| format!("{} {}", r.cells[0], r.cells[1])).collect() };
+        assert_eq!(kinds(None), ["app writer", "app reader", "app custom bi (reader)", "app-1 instance (writer)", "app-2 instance (reader)", "solo instance"]);
+        // Enter on a cluster: its endpoints and its members'; on an instance: only its own.
+        assert_eq!(kinds(Some("app")).len(), 5);
+        assert_eq!(kinds(Some("solo")), ["solo instance"]);
+        let t = endpoints(&aws, Some("app")).unwrap();
+        assert_eq!((t.rows[1].json["Port"].clone(), t.rows[1].json["IAMDatabaseAuthenticationEnabled"].clone()), (json!(5432), json!(true)));
+    }
+
+    #[test]
+    fn bastions_come_first_and_a_denied_ssm_list_falls_back_to_ec2_loudly() {
+        let ec2 = json!({"Reservations": [{"Instances": [
+            {"InstanceId": "i-1", "State": {"Name": "running"}, "Tags": [{"Key": "Name", "Value": "ci"}]},
+            {"InstanceId": "i-2", "State": {"Name": "running"}, "Tags": [{"Key": "Name", "Value": "bastion-a"}]},
+            {"InstanceId": "i-3", "State": {"Name": "stopped"}, "Tags": [{"Key": "Name", "Value": "jump-old"}]},
+        ]}]});
+        let e = ec2.clone();
+        let ok = Aws::with_runner(move |_, svc, _, _| Ok(if svc == "ec2" { e.clone() } else { json!({"InstanceInformationList": [
+            {"InstanceId": "i-1", "PingStatus": "Online"}, {"InstanceId": "i-3", "PingStatus": "ConnectionLost"}, {"InstanceId": "i-2", "PingStatus": "Online"},
+        ]}) }));
+        let t = bastions(&ok).unwrap();
+        let ids: Vec<&str> = t.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["i-2", "i-1", "i-3"]);
+        assert!(matches!(t.rows[2].health, Health::Bad));
+        let denied = Aws::with_runner(move |_, svc, _, _| if svc == "ec2" { Ok(ec2.clone()) } else { Err(AwsError::Api("AccessDeniedException".into())) });
+        let t = bastions(&denied).unwrap();
+        assert!(t.notes.iter().any(|n| matches!(n.health, Health::Bad) && n.text.contains("AccessDenied")));
+        let ids: Vec<&str> = t.rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["i-2", "i-1"], "running instances only, bastions first");
     }
 
     #[test]

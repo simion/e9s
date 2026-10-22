@@ -120,6 +120,23 @@ pub fn about(view: &View) -> (&'static str, &'static [&'static str]) {
             "Relational Database Service runs Postgres or MySQL for you. Kubernetes: a database StatefulSet plus an operator.",
             "Aurora clusters have one writer instance and reader replicas.",
         ]),
+        View::Endpoints { .. } => ("RDS endpoints", &[
+            "An endpoint is a DNS name to connect to. Kubernetes: a Service in front of database pods.",
+            "An Aurora cluster has a writer endpoint (follows the writer through failover), a reader endpoint (spreads connections over",
+            "the readers) and optional custom ones; each instance has its own too. Databases sit in private subnets, so from a laptop",
+            "you reach them through a bastion: F starts a port forward, as k9s shift-f does to a pod.",
+            "IAM AUTH on means a short-lived token from your AWS credentials works as the password (t in :pf copies one).",
+        ]),
+        View::Bastions => ("SSM-managed instances", &[
+            "EC2 instances whose SSM agent reports to Systems Manager, so Session Manager can open sessions on them without SSH keys or open ports.",
+            "A bastion (jump host) is one of them kept in the VPC to reach private things such as databases. Kubernetes: kubectl port-forward",
+            "goes through the API server; here the tunnel goes through the bastion. BASTION marks names or tags that read as one.",
+        ]),
+        View::Forwards => ("Port forwards", &[
+            "Tunnels this run opened: localhost:LOCAL reaches HOST through the bastion (an SSM session, port-forwarding document only).",
+            "Kubernetes: k9s :pf. They close when e9s exits. ctrl-d stops one, s opens psql through it, t copies an IAM auth token.",
+            "STATE: starting until the session-manager-plugin listens, then listening; CONNS counts clients it accepted.",
+        ]),
         View::Lambda => ("Lambda", &[
             "Lambda runs a function per event with no servers or pods to see. Kubernetes: Knative or another serverless layer.",
             "l opens its log group, /aws/lambda/<name> by default.",

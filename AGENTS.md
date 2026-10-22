@@ -8,7 +8,7 @@ The README is the user guide; this file is for whoever changes the code.
 ```sh
 make                          # list the targets
 make run ARGS="-p <profile>"  # build and launch
-make test                     # 33 tests, no AWS access needed
+make test                     # tests, no AWS access needed
 make install                  # ./install.sh: a `e9s` launcher in ~/.local/bin that rebuilds when src/ changes
 e9s -p <profile> -r <region> --cluster <name> --script "@wait @snap"
 ```
@@ -29,6 +29,7 @@ macOS has no `timeout`; run long checks in the background and kill them.
 | `src/aws.rs` | The read-only guard (`check_read_only`: service allowlist, `describe-`/`list-`/`get-` prefixes, `READ_EXACT`, `DENIED`), the per-screen command log (`Call`, `screen_log`, `inflight`), `display_cmd`, profiles and the SSO login state (`sso_login`) |
 | `src/demo.rs` | `E9S_DEMO=1`: a made-up account for the README recording and screenshots: `make demo` runs `docs/demo/screens.sh` and `docs/demo/demo.tape` with `HOME=docs/demo/home` (made-up profiles and SSO login). A field a view starts reading needs adding here too, as in `sdk.rs` |
 | `src/upgrade.rs` | The k9s-style check for a newer release at startup (curl to the GitHub releases API, in the background, silent on failure), shown under the logo as `⚡ v0.1.1 available` with the upgrade command right-aligned on the header's last row (next to `Rev:` when the logo is hidden), and printed on quit, chosen by where the binary lives (brew `Cellar`, `cargo install` per `~/.cargo/.crates2.json`, else the shell installer). Skipped for builds from a checkout, in demo mode, and with `E9S_NO_UPGRADE_CHECK=1` |
+| `src/forward.rs` | Port forwards (k9s `shift-f`, `:pf`): `start` (StartSession through `Aws::call`, then the session-manager-plugin), the plugin's output read into a state, `stop`/`stop_all` (on exit), the free-port pick, the remembered bastion and db user (`~/.config/e9s/remembered`), `likely_bastion` |
 | `src/sdk.rs` | The transport: AWS SDK clients on one tokio runtime, credentials per profile shared across regions; `run` takes the CLI's service, operation and arguments and returns the CLI's JSON shape, so views never changed. Only the reads in `dispatch` exist |
 | `src/views.rs` | Every view: `View` enum, fetch, columns, health, drill-down, log resolution and live tail (`resolve`, `logs`, `filter_all`, `tail_poll`), failures |
 | `src/app.rs` | State (`App`, `Frame` stack), keys, commands, tail thread, save and copy |
@@ -40,6 +41,7 @@ macOS has no `timeout`; run long checks in the background and kill them.
 ## Rules the code keeps
 
 - **Read-only.** Every call goes through `Aws::call`, which runs `check` first. Do not add a second path to the runner. `logs filter-log-events` and `cloudtrail lookup-events` are the only non-prefix reads allowed.
+- **Port forwarding is the one exception without `--write`** (decided 2026-10-22, as k9s allows port-forward under `--readonly`): `ssm start-session` only with `FORWARD_DOC` (`AWS-StartPortForwardingSessionToRemoteHost`), `ssm terminate-session` only for session ids `Aws::call` recorded from this run's starts, and `rds generate-db-auth-token` (a local signature). SSM parameter getters are in `DENIED` (SecureStrings). Forwards end when e9s exits (`App::shutdown`).
 - **`--write` opens `WRITES` only** (`aws.rs`): secret values, `ecs update-service` (`sdk.rs` sends only `--desired-count` or `--force-new-deployment`, the `r` restart), `register-scalable-target` and `put-scheduled-action` (the `e9s-restore` action behind `s ... for 2h`). Every write is staged as `app::Pending` and runs from a k9s-style dialog (Cancel focused first; arrows or Tab move to OK, Enter presses, `y` is a shortcut). A secret write reads it again and refuses if its version moved; the dialog names keys, never values. `H` shows `--secret-string` as `<redacted>`.
 - **Never show secrets** (except Secrets Manager values under `--write`, masked until `x`). Environment variable and secret values are redacted from every response (`logic.rs`, tested), including CloudTrail request parameters (keys naming a password, secret or token).
 - **Failures are loud.** A failed or partial fetch shows a note; it never renders as an empty or healthy list.
@@ -81,6 +83,8 @@ Verified 2026-10-15: SSO, legacy SSO, `aws login`, role via SSO, role via an exp
 - `:pulse` reads alarms, RDS, Lambda and the services of every cluster on each refresh (6.3 s measured on a real dev account, 2026-10-16).
 - Lambda STATUS is read only for functions changed in the last 15 minutes (list-functions has no state); ERRORS and THROTTLES cost one GetMetricData per 250 functions.
 - CloudTrail answers about 5 minutes after a call, allows 2 LookupEvents a second, and a `d` page caches its "Recent changes" for a minute.
+- Port forwards end on a normal exit (`q`, `ctrl-c`, `:q`). If e9s is killed hard, the session-manager-plugin keeps running and its session lasts until Session Manager's idle timeout.
+- Some SSO roles may start sessions but not call `ssm:DescribeInstanceInformation` (seen on a real dev account, 2026-10-22); `:ssm` and the forward dialog then list running EC2 instances with PING unknown.
 - When a table does not fit, wide columns narrow to 24 and wrap, then columns drop from the right (k9s drops without narrowing). The dropped ones are only in `d` and `y`.
 
 ## Release

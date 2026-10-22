@@ -724,7 +724,9 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                             "DBClusterIdentifier": x.db_cluster_identifier(), "DBClusterArn": x.db_cluster_arn(), "Engine": x.engine(),
                             "EngineVersion": x.engine_version(), "DBClusterInstanceClass": x.db_cluster_instance_class(), "Status": x.status(),
                             "MultiAZ": x.multi_az(), "ClusterCreateTime": ts(x.cluster_create_time()), "Endpoint": x.endpoint(),
-                            "ReaderEndpoint": x.reader_endpoint(), "PreferredMaintenanceWindow": x.preferred_maintenance_window(),
+                            "ReaderEndpoint": x.reader_endpoint(), "Port": x.port(), "DatabaseName": x.database_name(),
+                            "MasterUsername": x.master_username(), "IAMDatabaseAuthenticationEnabled": x.iam_database_authentication_enabled(),
+                            "PreferredMaintenanceWindow": x.preferred_maintenance_window(),
                             "BackupRetentionPeriod": x.backup_retention_period(), "DeletionProtection": x.deletion_protection(),
                             "PendingModifiedValues": x.pending_modified_values().map(|p| json!({
                                 "DBClusterIdentifier": p.db_cluster_identifier(), "EngineVersion": p.engine_version(),
@@ -765,7 +767,8 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                             "BackupRetentionPeriod": x.backup_retention_period(), "LatestRestorableTime": ts(x.latest_restorable_time()),
                             "AutoMinorVersionUpgrade": x.auto_minor_version_upgrade(), "DeletionProtection": x.deletion_protection(),
                             "PubliclyAccessible": x.publicly_accessible(), "PerformanceInsightsEnabled": x.performance_insights_enabled(),
-                            "CACertificateIdentifier": x.ca_certificate_identifier(),
+                            "CACertificateIdentifier": x.ca_certificate_identifier(), "DBName": x.db_name(), "MasterUsername": x.master_username(),
+                            "IAMDatabaseAuthenticationEnabled": x.iam_database_authentication_enabled(),
                             "PendingModifiedValues": x.pending_modified_values().map(|p| json!({
                                 "DBInstanceClass": p.db_instance_class(), "AllocatedStorage": p.allocated_storage(), "Port": p.port(),
                                 "BackupRetentionPeriod": p.backup_retention_period(), "MultiAZ": p.multi_az(), "Engine": p.engine(),
@@ -782,6 +785,84 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                     Ok((x, r.marker().map(String::from)))
                 }
             }).await?)
+        }
+
+        ("rds", "describe-db-cluster-endpoints") => {
+            let c = aws_sdk_rds::Client::new(&cfg);
+            listed("DBClusterEndpoints", pages(max, |t| {
+                let c = c.clone();
+                async move {
+                    let r = c.describe_db_cluster_endpoints().set_marker(t).send().await.map_err(e!())?;
+                    let x = r
+                        .db_cluster_endpoints()
+                        .iter()
+                        .map(|x| json!({
+                            "DBClusterEndpointIdentifier": x.db_cluster_endpoint_identifier(), "DBClusterIdentifier": x.db_cluster_identifier(),
+                            "Endpoint": x.endpoint(), "Status": x.status(), "EndpointType": x.endpoint_type(), "CustomEndpointType": x.custom_endpoint_type(),
+                            "StaticMembers": x.static_members(), "ExcludedMembers": x.excluded_members(),
+                        }))
+                        .collect();
+                    Ok((x, r.marker().map(String::from)))
+                }
+            }).await?)
+        }
+        // A local signature over the profile's credentials (no request is sent), valid 15 minutes.
+        ("rds", "generate-db-auth-token") => {
+            use aws_sdk_rds::auth_token::{AuthTokenGenerator, Config};
+            let port = a.one("--port").and_then(|p| p.parse().ok()).unwrap_or(5432);
+            let gen_cfg = Config::builder()
+                .hostname(a.one("--hostname").unwrap_or_default())
+                .port(port)
+                .username(a.one("--username").unwrap_or_default())
+                .build()
+                .map_err(|e| AwsError::Api(format!("generate-db-auth-token: {e}")))?;
+            let token = AuthTokenGenerator::new(gen_cfg).auth_token(&cfg).await.map_err(|e| classify(&e.to_string(), &ctx.profile, service, op))?;
+            json!({"Token": token.as_str()})
+        }
+
+        // ---------- SSM ----------
+        ("ssm", "describe-instance-information") => {
+            let c = aws_sdk_ssm::Client::new(&cfg);
+            listed("InstanceInformationList", pages(max, |t| {
+                let c = c.clone();
+                async move {
+                    let r = c.describe_instance_information().set_next_token(t).send().await.map_err(e!())?;
+                    let x = r
+                        .instance_information_list()
+                        .iter()
+                        .map(|x| json!({
+                            "InstanceId": x.instance_id(), "PingStatus": x.ping_status().map(|p| p.as_str()),
+                            "LastPingDateTime": ts(x.last_ping_date_time()), "AgentVersion": x.agent_version(),
+                            "PlatformType": x.platform_type().map(|p| p.as_str()), "PlatformName": x.platform_name(), "PlatformVersion": x.platform_version(),
+                            "ResourceType": x.resource_type().map(|p| p.as_str()), "IPAddress": x.ip_address(), "ComputerName": x.computer_name(),
+                            "Name": x.name(),
+                        }))
+                        .collect();
+                    Ok((x, r.next_token().map(String::from)))
+                }
+            }).await?)
+        }
+        // Only the port-forwarding document (the guard checks it too): `--parameters host=H,portNumber=P,localPortNumber=L`.
+        ("ssm", "start-session") => {
+            let mut params: HashMap<String, Vec<String>> = HashMap::new();
+            for kv in a.one("--parameters").unwrap_or_default().split(',') {
+                if let Some((k, v)) = kv.split_once('=') {
+                    params.insert(k.to_string(), vec![v.to_string()]);
+                }
+            }
+            let r = aws_sdk_ssm::Client::new(&cfg)
+                .start_session()
+                .set_target(a.one("--target"))
+                .document_name(crate::aws::FORWARD_DOC)
+                .set_parameters(Some(params))
+                .send()
+                .await
+                .map_err(e!())?;
+            json!({"SessionId": r.session_id(), "TokenValue": r.token_value(), "StreamUrl": r.stream_url()})
+        }
+        ("ssm", "terminate-session") => {
+            let r = aws_sdk_ssm::Client::new(&cfg).terminate_session().set_session_id(a.one("--session-id")).send().await.map_err(e!())?;
+            json!({"SessionId": r.session_id()})
         }
 
         ("rds", "describe-events") => {

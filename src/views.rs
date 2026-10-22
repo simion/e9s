@@ -2230,7 +2230,7 @@ fn endpoints(aws: &Aws, of: Option<&str>) -> Result<Table, AwsError> {
     });
     let (clusters, instances) = (clusters?, instances?);
     let mut t = Table::new(&["DATABASE", "ENDPOINT", "HOST", "PORT", "ENGINE", "STATUS", "IAM AUTH", "FORWARD"]);
-    t.info("F forwards the selected endpoint to a local port through an SSM bastion · :pf lists forwards");
+    t.info("Shift-F forwards the selected endpoint to a local port through an SSM bastion · f shows its forward · :pf lists forwards");
     let custom = t.soft(custom, "describe-db-cluster-endpoints (custom endpoints)")?;
     let add = |t: &mut Table, db: &str, kind: &str, host: String, port: i64, engine: &str, status: &str, j: &Value, dbname: &str| {
         if host.is_empty() || of.is_some_and(|o| o != db && o != s(j, "/DBClusterIdentifier")) {

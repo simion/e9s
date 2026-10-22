@@ -135,8 +135,8 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `y` | YAML of the selection: the fields e9s reads from AWS, under their API names |
 | `l` | Logs for the selection (service, task, container, log group, stream, Lambda) |
 | `s` | In `:pf`: open `psql` through the selected forward (asks for the db user and database; with an IAM auth token as the password when the database has IAM auth). Logs: autoscroll (follow new lines) on / off, on by default. With `--write`, on a service: set its desired count (the dialog says whether autoscaling will move it back); on a scaling target (`:scaling`): set min and max, as `4 20`, or `4 20 for 2h` to go back to the old range after 2h (`m`, `h`, `d`). The way back is an Application Auto Scaling scheduled action named `e9s-restore`, so it happens even if e9s is closed, and the RESTORE column shows it. Elsewhere `s` (shell in k9s) says e9s is read-only |
-| `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs |
-| `F` | Failures of the last hour for the selected service, or the whole cluster where no service is selected. On an RDS endpoint: port-forward it through a bastion (k9s `shift-f`, see below); on an RDS cluster or instance it lists its endpoints first |
+| `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs. On an RDS endpoint: show its port forward in `:pf` (k9s "Show PortForward") |
+| `F` (Shift-F) | Failures of the last hour for the selected service, or the whole cluster where no service is selected. On an RDS endpoint: port-forward it through a bastion (k9s `shift-f`, see below); on an RDS cluster or instance it lists its endpoints first |
 | `ctrl-d` | In `:pf`: stop the selected port forward (asks first) |
 | `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
 | `w` | Wrap long lines in logs and describe on or off (on by default) |
@@ -221,7 +221,7 @@ In e9s:
 
 1. `L` logs in if needed.
 2. `:rds`, Enter on a cluster (or `:endpoints`): its writer, reader and custom endpoints, and each instance's own.
-3. `F` on the endpoint: a dialog picks the bastion (online SSM instances, likely bastions first, the last one used in this profile and region preselected) and the local port (the database's own port when it is free, else the next free one). Enter starts it and opens `:pf`.
+3. Shift-F (`F`) on the endpoint: a dialog picks the bastion (online SSM instances, likely bastions first, the last one used in this profile and region preselected) and the local port (the database's own port when it is free, else the next free one). Enter starts it and opens `:pf`.
 4. In `:pf`, `s` opens `psql` through the forward, `t` copies an IAM auth token, `ctrl-d` stops it.
 
 A role that may start sessions but not list SSM's instances (`ssm:DescribeInstanceInformation` denied) still works: the list says so and falls back to running EC2 instances, likely bastions first.

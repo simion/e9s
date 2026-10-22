@@ -154,12 +154,12 @@ pub const KEYS: &[(&str, &str)] = &[
     ("y", "YAML of the selection: the fields e9s reads, under their API names"),
     ("l", "logs for the selection"),
     ("s", ":pf: psql through the selected forward (with an IAM token when the database has IAM auth) · logs: autoscroll (follow new lines) on / off · services: desired count · scaling: min and max, `4 20 for 2h` puts the old ones back after 2h (--write)"),
-    ("f", "logs, describe: fullscreen"),
+    ("f", "logs, describe: fullscreen · endpoints: show its port forward (k9s f)"),
     ("t", "logs: show or hide timestamps · :pf: copy an RDS IAM auth token for the forward's database"),
     ("0-6", "logs: start from the tail, the head, or 1m 5m 15m 30m 1h back (elsewhere 0-9 are quick views)"),
     ("a", "service logs: all containers of each task, not just the main one"),
     ("m C c", "logs: draw a mark line, clear the screen, copy the lines shown"),
-    ("F", "failures of the last hour: failed tasks and problem events (service, or whole cluster) · endpoints: port-forward through an SSM bastion (k9s shift-f)"),
+    ("Shift-F", "failures of the last hour: failed tasks and problem events (service, or whole cluster) · endpoints: port-forward through an SSM bastion (k9s Shift-F)"),
     ("ctrl-d", ":pf: stop the selected port forward"),
     ("p", "logs: filter pattern · scaling: policies"),
     ("w", "wrap lines (logs, describe)"),
@@ -745,6 +745,7 @@ impl App {
             KeyCode::Char('d') if ctrl && matches!(self.top().view, View::Forwards) => self.stage_stop_forward(),
             KeyCode::Char('s') | KeyCode::Char('t') if !ctrl && matches!(self.top().view, View::Forwards) => self.ask_db_user(k.code == KeyCode::Char('t')),
             KeyCode::Char('F') if matches!(self.top().view, View::Endpoints { .. }) => self.forward_form(),
+            KeyCode::Char('f') if !ctrl && matches!(self.top().view, View::Endpoints { .. }) => self.show_forward(),
             KeyCode::Char('F') if matches!(self.top().view, View::Rds) => match self.top().selected().map(|r| r.cells[1].clone()) {
                 Some(id) => {
                     self.push(View::Endpoints { of: Some(id) });
@@ -1085,6 +1086,16 @@ impl App {
         let pick = last.and_then(|l| bastions.iter().position(|b| b.0 == l)).unwrap_or(0);
         let local = crate::forward::free_port(port).to_string();
         self.mode = Mode::Forward(ForwardForm { target, bastions, pick, local, fresh: true });
+    }
+
+    /// `f` on an endpoint, k9s "Show PortForward": `:pf` filtered to its forwards.
+    fn show_forward(&mut self) {
+        let Some(host) = self.top().selected().map(|r| crate::logic::s(&r.json, "/Host")) else { return };
+        if !crate::forward::list().iter().any(|f| f["Host"] == host.as_str()) {
+            return self.flash("no port-forward defined", true);
+        }
+        self.push(View::Forwards);
+        self.top_mut().filter = host;
     }
 
     fn forward_key(&mut self, mut form: ForwardForm, k: KeyEvent) {

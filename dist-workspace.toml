@@ -18,3 +18,7 @@ install-updater = false
 # Homebrew: Formula/e9s.rb in simion/homebrew-tap, pushed with the HOMEBREW_TAP_TOKEN secret
 tap = "simion/homebrew-tap"
 publish-jobs = ["homebrew"]
+
+# GitHub retired the macos-14 arm64 image dist picks by default (v0.6.0 failed on it)
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"

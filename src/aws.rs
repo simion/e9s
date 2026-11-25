@@ -512,6 +512,8 @@ mod tests {
             assert!(check(svc, op, &[], true).is_err(), "{svc} {op} allowed by --write");
         }
         assert!(check("secretsmanager", "list-secrets", &[], false).is_ok());
+        assert!(check("application-autoscaling", "get-predictive-scaling-forecast", &[], false).is_ok());
+        assert!(check("application-autoscaling", "put-scaling-policy", &[], true).is_err());
     }
 
     #[test]

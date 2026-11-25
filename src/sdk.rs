@@ -562,6 +562,29 @@ async fn dispatch(ctx: &Ctx, service: &str, op: &str, a: &Args<'_>) -> Result<Va
                 }
             }).await?)
         }
+        ("application-autoscaling", "get-predictive-scaling-forecast") => {
+            let t = |k: &str| a.one(k).map(|x| secs(&x));
+            let r = aws_sdk_applicationautoscaling::Client::new(&cfg)
+                .get_predictive_scaling_forecast()
+                .set_service_namespace(a.one("--service-namespace").map(|n| n.as_str().into()))
+                .set_resource_id(a.one("--resource-id"))
+                .set_scalable_dimension(a.one("--scalable-dimension").map(|d| d.as_str().into()))
+                .set_policy_name(a.one("--policy-name"))
+                .set_start_time(t("--start-time"))
+                .set_end_time(t("--end-time"))
+                .send()
+                .await
+                .map_err(e!())?;
+            let times = |x: &[aws_smithy_types::DateTime]| x.iter().map(|t| ts(Some(t))).collect::<Vec<_>>();
+            json!({
+                "LoadForecast": r.load_forecast().iter().map(|l| json!({
+                    "Timestamps": times(l.timestamps()), "Values": l.values(),
+                    "MetricSpecification": l.metric_specification().map(predictive_metric),
+                })).collect::<Vec<_>>(),
+                "CapacityForecast": r.capacity_forecast().map(|c| json!({"Timestamps": times(c.timestamps()), "Values": c.values()})),
+                "UpdateTime": ts(r.update_time()),
+            })
+        }
         ("application-autoscaling", "describe-scaling-activities") => {
             let c = aws_sdk_applicationautoscaling::Client::new(&cfg);
             let (ns, res) = (a.one("--service-namespace"), a.one("--resource-id"));
@@ -1216,6 +1239,34 @@ fn scaling_policy(p: &aws_sdk_applicationautoscaling::types::ScalingPolicy) -> V
             "PredefinedMetricSpecification": c.predefined_metric_specification().map(|m| json!({"PredefinedMetricType": m.predefined_metric_type().as_str()})),
             "CustomizedMetricSpecification": c.customized_metric_specification().map(|m| json!({"MetricName": m.metric_name()})),
         })),
+        "StepScalingPolicyConfiguration": p.step_scaling_policy_configuration().map(|c| json!({
+            "AdjustmentType": c.adjustment_type().map(|x| x.as_str()), "Cooldown": c.cooldown(),
+            "MetricAggregationType": c.metric_aggregation_type().map(|x| x.as_str()), "MinAdjustmentMagnitude": c.min_adjustment_magnitude(),
+            "StepAdjustments": c.step_adjustments().iter().map(|s| json!({
+                "MetricIntervalLowerBound": s.metric_interval_lower_bound(), "MetricIntervalUpperBound": s.metric_interval_upper_bound(),
+                "ScalingAdjustment": s.scaling_adjustment(),
+            })).collect::<Vec<_>>(),
+        })),
+        "PredictiveScalingPolicyConfiguration": p.predictive_scaling_policy_configuration().map(|c| json!({
+            "Mode": c.mode().map(|m| m.as_str()), "SchedulingBufferTime": c.scheduling_buffer_time(),
+            "MaxCapacityBreachBehavior": c.max_capacity_breach_behavior().map(|m| m.as_str()), "MaxCapacityBuffer": c.max_capacity_buffer(),
+            "MetricSpecifications": c.metric_specifications().iter().map(predictive_metric).collect::<Vec<_>>(),
+        })),
+        "Alarms": p.alarms().iter().map(|a| json!({"AlarmName": a.alarm_name()})).collect::<Vec<_>>(),
+        "CreationTime": ts(Some(p.creation_time())),
+    })
+}
+
+/// A predictive policy's metric specification; customized metrics keep only their presence (their queries are long).
+fn predictive_metric(m: &aws_sdk_applicationautoscaling::types::PredictiveScalingMetricSpecification) -> Value {
+    json!({
+        "TargetValue": m.target_value(),
+        "PredefinedMetricPairSpecification": m.predefined_metric_pair_specification().map(|x| json!({"PredefinedMetricType": x.predefined_metric_type()})),
+        "PredefinedScalingMetricSpecification": m.predefined_scaling_metric_specification().map(|x| json!({"PredefinedMetricType": x.predefined_metric_type()})),
+        "PredefinedLoadMetricSpecification": m.predefined_load_metric_specification().map(|x| json!({"PredefinedMetricType": x.predefined_metric_type()})),
+        "CustomizedScalingMetricSpecification": m.customized_scaling_metric_specification().map(|_| json!({})),
+        "CustomizedLoadMetricSpecification": m.customized_load_metric_specification().map(|_| json!({})),
+        "CustomizedCapacityMetricSpecification": m.customized_capacity_metric_specification().map(|_| json!({})),
     })
 }
 

@@ -58,6 +58,7 @@ pub fn describe(view: &View, row: &Row) -> Option<Vec<String>> {
         View::Containers { .. } => container(&mut p, j, 0),
         View::TargetGroups { .. } => target_group(&mut p, j),
         View::TaskDefContainers { .. } => container_definition(&mut p, j),
+        View::ScalingPolicies { .. } => scaling_policy(&mut p, j),
         _ => return None,
     }
     p.line(0, "");
@@ -269,6 +270,80 @@ fn container_definition(p: &mut Page, c: &Value) {
             p.line(2, e);
         }
     }
+}
+
+fn scaling_policy(p: &mut Page, x: &Value) {
+    use crate::views::{metric_words, policy_what, predictive_metric_name};
+    p.kv(0, "Name", s(x, "/PolicyName"));
+    p.kv(0, "Resource", s(x, "/ResourceId"));
+    p.kv(0, "Dimension", s(x, "/ScalableDimension"));
+    p.kv(0, "Type", s(x, "/PolicyType"));
+    p.kv(0, "Created", when(x, "/CreationTime"));
+    p.kv(0, "What it does", policy_what(x));
+    let tt = &x["TargetTrackingScalingPolicyConfiguration"];
+    if tt.is_object() {
+        p.section("Target tracking");
+        let m = [s(tt, "/PredefinedMetricSpecification/PredefinedMetricType"), s(tt, "/CustomizedMetricSpecification/MetricName")].concat();
+        p.kv(2, "Metric", format!("{m} ({})", metric_words(&m)));
+        p.kv(2, "Target", s(tt, "/TargetValue"));
+        p.kv(2, "Scale-out cooldown", format!("{}s", s(tt, "/ScaleOutCooldown")));
+        p.kv(2, "Scale-in cooldown", format!("{}s", s(tt, "/ScaleInCooldown")));
+        p.kv(2, "Scale-in disabled", s(tt, "/DisableScaleIn"));
+    }
+    let pr = &x["PredictiveScalingPolicyConfiguration"];
+    if pr.is_object() {
+        p.section("Predictive scaling (Enter on the row: the forecast)");
+        let mode = s(pr, "/Mode");
+        let mode = match mode.as_str() {
+            "ForecastOnly" => "ForecastOnly  (forecasts, never changes the count)".to_string(),
+            "ForecastAndScale" => "ForecastAndScale  (raises the minimum ahead of the forecast)".to_string(),
+            m => m.to_string(),
+        };
+        p.kv(2, "Mode", mode);
+        p.kv(2, "Scheduling buffer", pr["SchedulingBufferTime"].as_i64().map(|b| format!("{b}s (capacity starts this long before the forecast hour)")).unwrap_or_default());
+        p.kv(2, "At max capacity", match s(pr, "/MaxCapacityBreachBehavior").as_str() {
+            "IncreaseMaxCapacity" => format!("may raise max by {}% of the forecast", s(pr, "/MaxCapacityBuffer")),
+            "" => String::new(),
+            b => format!("{b} (never above max)"),
+        });
+        for (i, m) in arr(pr, "/MetricSpecifications").iter().enumerate() {
+            p.line(2, "");
+            p.kv(2, &format!("Metric {}", i + 1), {
+                let name = predictive_metric_name(m);
+                format!("{name} ({})", metric_words(&name))
+            });
+            p.kv(4, "Target", s(m, "/TargetValue"));
+            p.kv(4, "Load metric", crate::views::load_metric_name(m));
+            p.kv(4, "Scaling metric", s(m, "/PredefinedScalingMetricSpecification/PredefinedMetricType"));
+            let custom: Vec<&str> = [("CustomizedScalingMetricSpecification", "scaling"), ("CustomizedLoadMetricSpecification", "load"), ("CustomizedCapacityMetricSpecification", "capacity")]
+                .into_iter()
+                .filter(|(k, _)| m[*k].is_object())
+                .map(|(_, w)| w)
+                .collect();
+            p.kv(4, "Custom metrics", custom.join(", "));
+        }
+    }
+    let st = &x["StepScalingPolicyConfiguration"];
+    if st.is_object() {
+        p.section("Step scaling");
+        p.kv(2, "Adjustment", s(st, "/AdjustmentType"));
+        p.kv(2, "Cooldown", format!("{}s", s(st, "/Cooldown")));
+        p.kv(2, "Aggregation", s(st, "/MetricAggregationType"));
+        let rows = arr(st, "/StepAdjustments")
+            .iter()
+            .map(|a| vec![s(a, "/MetricIntervalLowerBound"), s(a, "/MetricIntervalUpperBound"), s(a, "/ScalingAdjustment")])
+            .collect();
+        table(p, 2, &["FROM", "TO", "CHANGE"], rows);
+    }
+    let alarms: Vec<String> = arr(x, "/Alarms").iter().map(|a| s(a, "/AlarmName")).collect();
+    if !alarms.is_empty() {
+        p.section("Alarms");
+        for a in alarms {
+            p.line(2, a);
+        }
+    }
+    p.line(0, "");
+    p.kv(0, "ARN", s(x, "/PolicyARN"));
 }
 
 fn target_group(p: &mut Page, tg: &Value) {

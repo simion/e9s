@@ -173,6 +173,8 @@ pub enum MetricTarget {
     /// RDS: kind is "instance" or "cluster".
     Rds { kind: String, id: String },
     Lambda { name: String },
+    /// A predictive scaling policy: its capacity and load forecasts next to the running task count.
+    Forecast { resource: String, dim: String, policy: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -283,6 +285,7 @@ impl View {
                 MetricTarget::Lb { arn } | MetricTarget::Tg { arn, .. } => format!("metrics({})", lb_name(arn)),
                 MetricTarget::Rds { id, .. } => format!("metrics({id})"),
                 MetricTarget::Lambda { name } => format!("metrics({name})"),
+                MetricTarget::Forecast { policy, .. } => format!("forecast({policy})"),
             },
             View::Ec2 => "ec2".into(),
             View::EcrRepos => "ecr".into(),
@@ -335,6 +338,9 @@ impl View {
                 lb: strs(j, "/LoadBalancerArns").into_iter().next(),
             },
             View::ScalableTargets { ns } => View::ScalingActivities { ns: ns.clone(), resource: Some(r.id.clone()) },
+            View::ScalingPolicies { .. } if s(j, "/PolicyType") == "PredictiveScaling" => View::Metrics {
+                target: MetricTarget::Forecast { resource: s(j, "/ResourceId"), dim: s(j, "/ScalableDimension"), policy: s(j, "/PolicyName") },
+            },
             View::EcrRepos => View::EcrImages { repo: r.id.clone() },
             View::Secrets => View::SecretValue { name: r.id.clone(), reveal: false },
             View::Rds => View::Endpoints { of: Some(r.cells[1].clone()) },
@@ -623,9 +629,15 @@ fn cached_service_arns(aws: &Aws, cluster: &str) -> Result<Vec<String>, AwsError
 
 fn services(aws: &Aws, cluster: &str) -> Result<Table, AwsError> {
     let arns = cached_service_arns(aws, cluster)?;
-    let mut t = Table::new(&["NAME", "STATUS", "DESIRED", "RUN(ALL)", "PENDING", "NEW", "OLD", "ROLLOUT", "DEPLOY AGE", "FAILED 1H", "TASKDEF"]);
-    t.info("Enter tasks · R rollout watch · e events · F failures · l logs · m metrics · runningCount (RUN(ALL)) sums both generations; NEW is new-running/desired");
-    let (mut svcs, stopped) = with_stopped(aws, cluster, None, &mut t, |t| describe_services(aws, cluster, &arns, t))?;
+    let mut t = Table::new(&["NAME", "STATUS", "DESIRED", "RUN(ALL)", "PENDING", "NEW", "OLD", "ROLLOUT", "DEPLOY AGE", "FAILED 1H", "AUTOSCALING", "TASKDEF"]);
+    t.info("Enter tasks · R rollout watch · e events · F failures · l logs · m metrics · p scaling policies · runningCount (RUN(ALL)) sums both generations; NEW is new-running/desired; AUTOSCALING is min-max nP");
+    // Two region-wide autoscaling reads, alongside the slower ECS ones so the first paint waits no longer.
+    let (r, scaling) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| scaling_summary(aws, cluster));
+        (with_stopped(aws, cluster, None, &mut t, |t| describe_services(aws, cluster, &arns, t)), h.join().expect("autoscaling thread"))
+    });
+    let (mut svcs, stopped) = r?;
+    let scaling = t.soft(scaling.map(|m| json!(m)), "autoscaling")?.unwrap_or_default();
     svcs.sort_by_key(|v| s(v, "/serviceName"));
     for v in svcs {
         let name = s(&v, "/serviceName");
@@ -651,6 +663,7 @@ fn services(aws: &Aws, cluster: &str) -> Result<Table, AwsError> {
             },
             _ => sp.health(&s(&v, "/status")),
         };
+        let auto = scaling.get(&name).and_then(Value::as_str).unwrap_or("-").to_string();
         t.row(name.clone(), health, v.clone(), vec![
             name,
             s(&v, "/status"),
@@ -662,10 +675,35 @@ fn services(aws: &Aws, cluster: &str) -> Result<Table, AwsError> {
             p.as_ref().map(|d| d.rollout.clone()).unwrap_or_default(),
             p.as_ref().map(|d| age(&Value::String(d.created.clone()))).unwrap_or_default(),
             failed,
+            auto,
             p.map(|d| d.taskdef).unwrap_or_default(),
         ]);
     }
     Ok(t)
+}
+
+/// Each autoscaled service of a cluster as "36-350 3P", with "fc-only" or "fc+scale" when a predictive policy exists.
+/// One paged read of targets and one of policies for the region's `ecs` namespace, never one per service.
+fn scaling_summary(aws: &Aws, cluster: &str) -> Result<serde_json::Map<String, Value>, AwsError> {
+    let ns = args!["--service-namespace", "ecs"];
+    let targets = aws.call("application-autoscaling", "describe-scalable-targets", &ns)?;
+    let policies = aws.call("application-autoscaling", "describe-scaling-policies", &ns)?;
+    let prefix = format!("service/{cluster}/");
+    let mut out = serde_json::Map::new();
+    for x in arr(&targets, "/ScalableTargets") {
+        let id = s(x, "/ResourceId");
+        let Some(name) = id.strip_prefix(&prefix) else { continue };
+        let mine: Vec<&Value> = arr(&policies, "/ScalingPolicies").iter().filter(|p| s(p, "/ResourceId") == id).collect();
+        let modes: Vec<&str> = mine
+            .iter()
+            .filter_map(|p| p["PredictiveScalingPolicyConfiguration"]["Mode"].as_str())
+            .map(|m| if m == "ForecastAndScale" { "fc+scale" } else { "fc-only" })
+            .collect();
+        // ForecastAndScale wins: it is the one that changes the count.
+        let mode = if modes.contains(&"fc+scale") { " fc+scale" } else if modes.is_empty() { "" } else { " fc-only" };
+        out.insert(name.to_string(), json!(format!("{}-{} {}P{mode}", s(x, "/MinCapacity"), s(x, "/MaxCapacity"), mine.len())));
+    }
+    Ok(out)
 }
 
 /// k9s pod colours: scheduler scale-in of an old task is normal (dim), crashes and failed health checks are red.
@@ -1772,39 +1810,137 @@ fn scaling_policies(aws: &Aws, ns: &str, resource: Option<&str>) -> Result<Table
         a.extend(args!["--resource-id", r]);
     }
     let v = aws.call("application-autoscaling", "describe-scaling-policies", &a)?;
-    let mut t = Table::new(&["NAME", "RESOURCE", "TYPE", "TARGET", "METRIC", "COOLDOWN IN/OUT", "WHAT IT DOES"]);
+    let mut t = Table::new(&["NAME", "RESOURCE", "TYPE", "MODE", "TARGET", "METRIC", "COOLDOWN IN/OUT", "WHAT IT DOES"]);
+    t.info("Enter on a predictive policy: its forecast · d: the whole policy");
     for p in arr(&v, "/ScalingPolicies") {
-        let c = &p["TargetTrackingScalingPolicyConfiguration"];
-        let metric = [s(c, "/PredefinedMetricSpecification/PredefinedMetricType"), s(c, "/CustomizedMetricSpecification/MetricName")].concat();
-        let human = match metric.as_str() {
-            "ECSServiceAverageCPUUtilization" => "average CPU %".to_string(),
-            "ECSServiceAverageMemoryUtilization" => "average memory %".to_string(),
-            "ALBRequestCountPerTarget" => "requests per target".to_string(),
-            m => m.to_string(),
-        };
-        let what = match s(p, "/PolicyType").as_str() {
-            "TargetTrackingScaling" => format!(
-                "keeps {human} near {}: adds tasks when above (at most every {}s), removes them when below (at most every {}s){}. Kubernetes: an HPA with that target",
-                s(c, "/TargetValue"),
-                s(c, "/ScaleOutCooldown"),
-                s(c, "/ScaleInCooldown"),
-                if c["DisableScaleIn"].as_bool() == Some(true) { "; scale-in is disabled" } else { "" },
-            ),
-            "StepScaling" => "changes the count in steps when its CloudWatch alarm fires".to_string(),
-            other => other.to_string(),
-        };
+        let (mode, target, metric, cooldown) = policy_cells(p);
         t.row(s(p, "/PolicyARN"), Health::None, p.clone(), vec![
             s(p, "/PolicyName"),
             s(p, "/ResourceId").trim_start_matches("service/").to_string(),
             s(p, "/PolicyType"),
-            s(c, "/TargetValue"),
+            mode,
+            target,
             metric,
-            format!("{}/{}", s(c, "/ScaleInCooldown"), s(c, "/ScaleOutCooldown")),
-            what,
+            cooldown,
+            policy_what(p),
         ]);
     }
     t.empty = Some("no scaling policies: the count only changes when someone sets it".into());
     Ok(t)
+}
+
+/// A predefined metric type in words.
+pub fn metric_words(m: &str) -> String {
+    match m {
+        "ECSServiceAverageCPUUtilization" | "ECSServiceCPUUtilization" => "average CPU %".into(),
+        "ECSServiceAverageMemoryUtilization" | "ECSServiceMemoryUtilization" => "average memory %".into(),
+        "ECSServiceTotalCPUUtilization" => "total CPU (sum over tasks)".into(),
+        "ECSServiceTotalMemoryUtilization" => "total memory (sum over tasks)".into(),
+        "ALBRequestCountPerTarget" => "requests per target".into(),
+        "ALBRequestCount" => "requests".into(),
+        m => m.into(),
+    }
+}
+
+/// A predictive metric specification's metric name: the pair, or the scaling metric, or "custom".
+pub fn predictive_metric_name(m: &Value) -> String {
+    let n = [
+        s(m, "/PredefinedMetricPairSpecification/PredefinedMetricType"),
+        s(m, "/PredefinedScalingMetricSpecification/PredefinedMetricType"),
+    ]
+    .concat();
+    if n.is_empty() { "custom".into() } else { n }
+}
+
+/// The metric a predictive policy forecasts (its load metric): a pair's scaling metric is an average, its load a total.
+pub fn load_metric_name(m: &Value) -> String {
+    let load = s(m, "/PredefinedLoadMetricSpecification/PredefinedMetricType");
+    if !load.is_empty() {
+        return load;
+    }
+    match s(m, "/PredefinedMetricPairSpecification/PredefinedMetricType").as_str() {
+        "ECSServiceCPUUtilization" => "ECSServiceTotalCPUUtilization".into(),
+        "ECSServiceMemoryUtilization" => "ECSServiceTotalMemoryUtilization".into(),
+        "" => "custom".into(),
+        x => x.into(),
+    }
+}
+
+/// MODE, TARGET, METRIC and COOLDOWN IN/OUT of a policy.
+fn policy_cells(p: &Value) -> (String, String, String, String) {
+    let tt = &p["TargetTrackingScalingPolicyConfiguration"];
+    let pr = &p["PredictiveScalingPolicyConfiguration"];
+    let st = &p["StepScalingPolicyConfiguration"];
+    match s(p, "/PolicyType").as_str() {
+        "PredictiveScaling" => {
+            let specs = arr(pr, "/MetricSpecifications");
+            let join = |f: &dyn Fn(&Value) -> String| specs.iter().map(f).collect::<Vec<_>>().join(",");
+            (s(pr, "/Mode"), join(&|m| s(m, "/TargetValue")), join(&predictive_metric_name), "-".into())
+        }
+        "StepScaling" => (
+            "-".into(),
+            "-".into(),
+            arr(p, "/Alarms").iter().map(|a| s(a, "/AlarmName")).collect::<Vec<_>>().join(","),
+            format!("{}", s(st, "/Cooldown")),
+        ),
+        _ => (
+            "-".into(),
+            s(tt, "/TargetValue"),
+            [s(tt, "/PredefinedMetricSpecification/PredefinedMetricType"), s(tt, "/CustomizedMetricSpecification/MetricName")].concat(),
+            format!("{}/{}", s(tt, "/ScaleInCooldown"), s(tt, "/ScaleOutCooldown")),
+        ),
+    }
+}
+
+/// What a policy does, in a sentence.
+pub fn policy_what(p: &Value) -> String {
+    let tt = &p["TargetTrackingScalingPolicyConfiguration"];
+    let pr = &p["PredictiveScalingPolicyConfiguration"];
+    let st = &p["StepScalingPolicyConfiguration"];
+    match s(p, "/PolicyType").as_str() {
+        "TargetTrackingScaling" => {
+            let m = [s(tt, "/PredefinedMetricSpecification/PredefinedMetricType"), s(tt, "/CustomizedMetricSpecification/MetricName")].concat();
+            format!(
+                "keeps {} near {}: adds tasks when above (at most every {}s), removes them when below (at most every {}s){}. Kubernetes: an HPA with that target",
+                metric_words(&m),
+                s(tt, "/TargetValue"),
+                s(tt, "/ScaleOutCooldown"),
+                s(tt, "/ScaleInCooldown"),
+                if tt["DisableScaleIn"].as_bool() == Some(true) { "; scale-in is disabled" } else { "" },
+            )
+        }
+        "PredictiveScaling" => {
+            let goals: Vec<String> = arr(pr, "/MetricSpecifications")
+                .iter()
+                .map(|m| format!("{} at {}", metric_words(&predictive_metric_name(m)), s(m, "/TargetValue")))
+                .collect();
+            let act = if s(pr, "/Mode") == "ForecastAndScale" {
+                let buf = pr["SchedulingBufferTime"].as_i64().map(|b| format!(" {b}s ahead")).unwrap_or_default();
+                format!("raises the minimum{buf} to the forecast capacity")
+            } else {
+                "only forecasts, changes nothing (ForecastOnly)".into()
+            };
+            format!("forecasts the next 48h from the last 14 days to keep {}; {act}. Kubernetes: none built in (KEDA cron is closest)", goals.join(" and "))
+        }
+        "StepScaling" => {
+            let (unit, exact) = match s(st, "/AdjustmentType").as_str() {
+                "PercentChangeInCapacity" => ("%", false),
+                "ExactCapacity" => ("", true),
+                _ => (" tasks", false),
+            };
+            let steps: Vec<String> = arr(st, "/StepAdjustments")
+                .iter()
+                .map(|x| {
+                    let b = |k: &str| x[k].as_f64().map(fmt_num).unwrap_or_else(|| "".into());
+                    let n = x["ScalingAdjustment"].as_i64().unwrap_or(0);
+                    let by = if exact { format!("set to {n}") } else { format!("{}{n}{unit}", if n > 0 { "+" } else { "" }) };
+                    format!("alarm metric {}..{} above threshold: {by}", b("MetricIntervalLowerBound"), b("MetricIntervalUpperBound"))
+                })
+                .collect();
+            format!("when its alarm fires, changes the count: {}", steps.join("; "))
+        }
+        other => other.to_string(),
+    }
 }
 
 fn scaling_activities(aws: &Aws, ns: &str, resource: Option<&str>) -> Result<Table, AwsError> {
@@ -1893,6 +2029,9 @@ fn fmt_num(f: f64) -> String {
 }
 
 fn metrics(aws: &Aws, target: &MetricTarget) -> Result<Table, AwsError> {
+    if let MetricTarget::Forecast { resource, dim, policy } = target {
+        return forecast(aws, resource, dim, policy);
+    }
     let mut t = Table::new(&["METRIC", "STAT", "LATEST", "MIN", "MAX", "LAST 3H (5m)"]);
     let dim = |arn: &str, key: &str| arn.split_once(key).map(|x| x.1.to_string()).unwrap_or_default();
     let qs = match target {
@@ -1948,6 +2087,7 @@ fn metrics(aws: &Aws, target: &MetricTarget) -> Result<Table, AwsError> {
             }
             v
         }
+        MetricTarget::Forecast { .. } => unreachable!("handled above"),
         MetricTarget::Lambda { name } => {
             let d = [("FunctionName", name.clone())];
             vec![
@@ -1969,6 +2109,68 @@ fn metrics(aws: &Aws, target: &MetricTarget) -> Result<Table, AwsError> {
             vec![x.label.clone(), x.stat.into(), fmt_num(*vals.last().unwrap()), fmt_num(lo), fmt_num(hi), sparkline(&vals)]
         };
         t.row(format!("{} {}", x.label, x.stat), Health::None, json!({"label": x.label, "stat": x.stat, "values": vals, "ago": pts.iter().map(|p| p.0).collect::<Vec<_>>()}), cells);
+    }
+    Ok(t)
+}
+
+/// How far back and ahead the forecast view reads, in minutes (AWS forecasts 48 hours ahead).
+pub const FORECAST_MINUTES: i64 = 24 * 60;
+
+/// A predictive policy's forecasts from 24h ago to 24h ahead, and the running task count for the past half.
+fn forecast(aws: &Aws, resource: &str, dim: &str, policy: &str) -> Result<Table, AwsError> {
+    let mut t = Table::new(&["METRIC", "SERIES", "NOW", "MIN", "MAX", "-24H .. +24H (1h)"]);
+    let now = Utc::now();
+    let span = chrono::Duration::minutes(FORECAST_MINUTES);
+    let (fc, actual) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            let mut parts = resource.split('/').skip(1);
+            let d = [("ClusterName", parts.next().unwrap_or_default().to_string()), ("ServiceName", parts.next().unwrap_or_default().to_string())];
+            metric_data(aws, &[q("tasks", "ECS/ContainerInsights", "RunningTaskCount", &d, "Average")], FORECAST_MINUTES, 300)
+        });
+        let fc = aws.call("application-autoscaling", "get-predictive-scaling-forecast", &args![
+            "--service-namespace", "ecs", "--resource-id", resource, "--scalable-dimension", dim, "--policy-name", policy,
+            "--start-time", (now - span).to_rfc3339(), "--end-time", (now + span).to_rfc3339(),
+        ]);
+        (fc, h.join().expect("metrics thread"))
+    });
+    let fc = fc?;
+    let actual = match actual {
+        Ok(mut d) => d.remove(0),
+        Err(e @ AwsError::SsoExpired(_)) => return Err(e),
+        Err(e) => {
+            t.bad(format!("running task count: {e}"));
+            vec![]
+        }
+    };
+    if actual.is_empty() {
+        t.info("no ECS/ContainerInsights RunningTaskCount for this service (Container Insights off?): the forecast shows alone");
+    }
+    match parse_ts(&fc["UpdateTime"]) {
+        Some(at) => t.info(format!("forecast updated {} ago; AWS refreshes it about every 6 hours", crate::logic::fmt_dur((now - at).num_seconds()))),
+        None => t.info("no forecast yet: AWS needs at least 24 hours of metric data first"),
+    }
+    // Running first so the forecast draws over it and stays one unbroken line.
+    let mut series = vec![("tasks".to_string(), "running", actual), ("tasks".into(), "forecast capacity", metric_points(&fc["CapacityForecast"], now))];
+    for l in arr(&fc, "/LoadForecast") {
+        let m = load_metric_name(&l["MetricSpecification"]);
+        series.push((format!("load: {}", metric_words(&m)), "forecast", metric_points(l, now)));
+    }
+    for (label, stat, pts) in series {
+        let vals: Vec<f64> = pts.iter().map(|p| p.1).collect();
+        let (lo, hi) = vals.iter().fold((f64::MAX, f64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+        // NOW: the last point at or before now (a forecast point is hourly).
+        let at_now = pts.iter().filter(|p| p.0 >= 0.0).last().map(|p| fmt_num(p.1)).unwrap_or_else(|| "-".into());
+        let cells = if vals.is_empty() {
+            vec![label.clone(), stat.into(), "no data".into(), "".into(), "".into(), "".into()]
+        } else {
+            vec![label.clone(), stat.into(), at_now, fmt_num(lo), fmt_num(hi), sparkline(&vals)]
+        };
+        t.row(
+            format!("{label} {stat}"),
+            Health::None,
+            json!({"label": label, "stat": stat, "values": vals, "ago": pts.iter().map(|p| p.0).collect::<Vec<_>>(), "back": FORECAST_MINUTES, "ahead": FORECAST_MINUTES}),
+            cells,
+        );
     }
     Ok(t)
 }
@@ -2900,12 +3102,38 @@ fn lambda_detail(aws: &Aws, name: &str, listed: &[String]) -> Result<Table, AwsE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn services_autoscaling_summary_marks_predictive_mode() {
+        let aws = Aws::with_runner(|_, _, op, _| {
+            let pol = |r: &str, t: &str, mode: Option<&str>| json!({"ResourceId": r, "PolicyType": t, "PredictiveScalingPolicyConfiguration": mode.map(|m| json!({"Mode": m}))});
+            Ok(match op {
+                "describe-scalable-targets" => json!({"ScalableTargets": [
+                    {"ResourceId": "service/c/a", "MinCapacity": 36, "MaxCapacity": 350},
+                    {"ResourceId": "service/c/b", "MinCapacity": 1, "MaxCapacity": 4},
+                    {"ResourceId": "service/other/a", "MinCapacity": 9, "MaxCapacity": 9},
+                ]}),
+                _ => json!({"ScalingPolicies": [
+                    pol("service/c/a", "TargetTrackingScaling", None),
+                    pol("service/c/a", "PredictiveScaling", Some("ForecastOnly")),
+                    pol("service/c/a", "PredictiveScaling", Some("ForecastAndScale")),
+                ]}),
+            })
+        });
+        let m = scaling_summary(&aws, "c").unwrap();
+        assert_eq!(m["a"], "36-350 3P fc+scale");
+        assert_eq!(m["b"], "1-4 0P");
+        assert_eq!(m.len(), 2, "another cluster's service leaks in: {m:?}");
+    }
     use std::sync::{Arc, Mutex};
 
     /// list-services returns `total` services; describe-services enforces the real 10-name limit
     /// and fails the chunk that contains `fail_name`.
     fn fake(total: usize, fail_name: Option<&'static str>, calls: Arc<Mutex<Vec<usize>>>) -> Aws {
         Aws::with_runner(move |_, svc, op, args| {
+            if svc == "application-autoscaling" {
+                return Ok(json!({"ScalableTargets": [], "ScalingPolicies": []}));
+            }
             assert_eq!(svc, "ecs");
             match op {
                 "list-services" => Ok(json!({"serviceArns": (0..total).map(|i| format!("svc-{i:02}")).collect::<Vec<_>>()})),

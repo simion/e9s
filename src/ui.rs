@@ -187,7 +187,7 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
         View::Profiles => vec![("<enter>", "Select"), ("<L>", "Login")],
         View::Regions | View::Aliases => vec![("<enter>", "Select")],
         View::Clusters => vec![("<enter>", "Services")],
-        View::Services { .. } => vec![("<enter>", "Tasks"), ("<R>", "Rollout"), ("<e>", "Events"), ("<F>", "Failures"), ("<l>", "Logs"), ("<m>", "Metrics")],
+        View::Services { .. } => vec![("<enter>", "Tasks"), ("<R>", "Rollout"), ("<e>", "Events"), ("<F>", "Failures"), ("<l>", "Logs"), ("<m>", "Metrics"), ("<p>", "Policies")],
         View::Failures { .. } => vec![("<enter>", "Containers/Events"), ("<l>", "Logs"), ("<R>", "Rollout"), ("<e>", "Events")],
         View::Tasks { .. } => vec![("<enter>", "Containers"), ("<l>", "Logs"), ("<R>", "Rollout"), ("<e>", "Events"), ("<F>", "Failures")],
         View::Rollout { .. } => vec![("<enter>", "Containers"), ("<l>", "Logs"), ("<e>", "Events"), ("<m>", "Metrics")],
@@ -211,6 +211,7 @@ fn actions(view: &View) -> Vec<(&'static str, &'static str)> {
         View::TargetGroups { .. } => vec![("<enter>", "Targets"), ("<m>", "Metrics")],
         View::Targets { .. } => vec![("<m>", "Metrics")],
         View::ScalableTargets { .. } => vec![("<enter>", "Activities"), ("<p>", "Policies")],
+        View::ScalingPolicies { .. } => vec![("<enter>", "Forecast")],
         View::EcrRepos => vec![("<enter>", "Images")],
         View::Lambda => vec![("<l>", "Logs"), ("<m>", "Metrics"), ("<T>", "Changes")],
         View::Rds => vec![("<enter>", "Endpoints"), ("<shift-f>", "Port-forward"), ("<m>", "Metrics"), ("<T>", "Changes")],
@@ -425,6 +426,10 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
             None => groups.push((label, vec![(stat, pts)])),
         }
     }
+    // A forecast reaches past now: its rows say how far back and ahead.
+    let first = &app.top().table.rows[0].json;
+    let back = first["back"].as_i64().unwrap_or(crate::views::METRIC_MINUTES) as f64;
+    let ahead = first["ahead"].as_i64().unwrap_or(0) as f64;
     let cols = if inner.width >= 120 && groups.len() > 1 { 2 } else { 1 };
     let nrows = groups.len().div_ceil(cols);
     let row_areas = Layout::vertical(vec![Constraint::Ratio(1, nrows as u32); nrows]).split(inner);
@@ -435,7 +440,7 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
             .iter()
             .enumerate()
             .flat_map(|(i, (stat, vals))| {
-                let v = vals.last().map(|x| fmt_metric(x.1)).unwrap_or_else(|| "no data".into());
+                let v = vals.iter().filter(|x| x.0 <= 0.0).last().or(vals.first()).map(|x| fmt_metric(x.1)).unwrap_or_else(|| "no data".into());
                 [Span::styled(format!(" {} ", stat.to_lowercase()), Style::new().fg(GRAY)), Span::styled(v, Style::new().fg(LINE_COLORS[i % 3]).bold())]
             })
             .collect();
@@ -445,7 +450,7 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
             .title(Line::styled(format!(" {label} "), Style::new().fg(Color::White).bold()))
             .title(Line::from(latest).right_aligned());
         if series.iter().all(|(_, v)| v.is_empty()) {
-            f.render_widget(Paragraph::new("  no datapoints in the last 3 hours").fg(GRAY).block(panel), cell);
+            f.render_widget(Paragraph::new("  no datapoints").fg(GRAY).block(panel), cell);
             continue;
         }
         let hi = series.iter().flat_map(|(_, v)| v.iter().map(|p| p.1)).fold(f64::MIN, f64::max);
@@ -457,12 +462,11 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
                 Dataset::default().name(stat.to_lowercase()).marker(Marker::Braille).graph_type(GraphType::Line).style(Style::new().fg(LINE_COLORS[i % 3])).data(pts)
             })
             .collect();
-        let span = crate::views::METRIC_MINUTES;
-        let x_labels = vec![
-            Span::styled(format!("-{}", crate::logic::fmt_dur(span * 60)), Style::new().fg(GRAY)),
-            Span::styled(format!("-{}", crate::logic::fmt_dur(span * 30)), Style::new().fg(GRAY)),
-            Span::styled("now", Style::new().fg(GRAY)),
-        ];
+        let at = |m: f64| {
+            let d = if m % 60.0 == 0.0 { format!("{}h", (m / 60.0).abs()) } else { crate::logic::fmt_dur((m.abs() * 60.0) as i64) };
+            if m == 0.0 { "now".to_string() } else { format!("{}{d}", if m < 0.0 { "-" } else { "+" }) }
+        };
+        let x_labels: Vec<Span> = [-back, (ahead - back) / 2.0, ahead].into_iter().map(|m| Span::styled(at(m), Style::new().fg(GRAY))).collect();
         let y_labels = vec![
             Span::styled(fmt_metric(y_lo), Style::new().fg(GRAY)),
             Span::styled(fmt_metric((y_lo + y_hi) / 2.0), Style::new().fg(GRAY)),
@@ -470,7 +474,7 @@ fn metrics_body(f: &mut Frame, app: &App, area: Rect) {
         ];
         let chart = Chart::new(datasets)
             .block(panel)
-            .x_axis(Axis::default().bounds([-(span as f64), 0.0]).labels(x_labels).style(Style::new().fg(Color::Indexed(240))))
+            .x_axis(Axis::default().bounds([-back, ahead]).labels(x_labels).style(Style::new().fg(Color::Indexed(240))))
             .y_axis(Axis::default().bounds([y_lo, y_hi]).labels(y_labels).style(Style::new().fg(Color::Indexed(240))))
             .legend_position(None);
         f.render_widget(chart, cell);

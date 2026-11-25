@@ -4,7 +4,7 @@
 
 use crate::aws::{AwsError, Ctx};
 use crate::logic::REDACTED;
-use chrono::{Duration, SecondsFormat, Utc};
+use chrono::{Duration, DurationRound, SecondsFormat, Utc};
 use serde_json::{json, Value};
 
 const ACCT: &str = "123456789012";
@@ -227,6 +227,13 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
                     "TargetTrackingScalingPolicyConfiguration": {"TargetValue": 60.0, "ScaleInCooldown": 300, "ScaleOutCooldown": 60, "DisableScaleIn": false,
                         "PredefinedMetricSpecification": {"PredefinedMetricType": "ECSServiceAverageCPUUtilization"}},
                 }))
+                .chain(scaled().filter(|(s, ..)| s.name == "api" && res.as_ref().is_none_or(|r| r.ends_with("/api"))).map(|(s, ..)| json!({
+                    "PolicyARN": format!("arn:aws:autoscaling:{r}:{ACCT}:scalingPolicy:demo:resource/ecs/service/{CLUSTER}/api:policyName/api-predictive"),
+                    "PolicyName": "api-predictive", "ResourceId": format!("service/{CLUSTER}/{}", s.name), "PolicyType": "PredictiveScaling",
+                    "ServiceNamespace": "ecs", "ScalableDimension": "ecs:service:DesiredCount", "CreationTime": ago(Duration::days(20)),
+                    "PredictiveScalingPolicyConfiguration": {"Mode": "ForecastOnly", "SchedulingBufferTime": 300, "MaxCapacityBreachBehavior": "HonorMaxCapacity",
+                        "MetricSpecifications": [{"TargetValue": 60.0, "PredefinedMetricPairSpecification": {"PredefinedMetricType": "ECSServiceCPUUtilization"}}]},
+                })))
                 .collect();
             json!({"ScalingPolicies": x})
         }
@@ -245,6 +252,26 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
             json!({"ScalingActivities": x})
         }
 
+        // Hourly, from the same daily curve as api's RunningTaskCount, a little ahead of it.
+        ("application-autoscaling", "get-predictive-scaling-forecast") => {
+            let parse = |k: &str| a.one(k).and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.with_timezone(&Utc));
+            let (start, end) = (parse("--start-time").unwrap_or(Utc::now() - Duration::hours(24)), parse("--end-time").unwrap_or(Utc::now() + Duration::hours(24)));
+            let mut t = start.duration_trunc(Duration::hours(1)).unwrap_or(start);
+            let (mut times, mut cap, mut load) = (vec![], vec![], vec![]);
+            while t <= end {
+                times.push(json!(t.to_rfc3339_opts(SecondsFormat::Millis, true)));
+                let n = demo_tasks(t + Duration::minutes(30)).ceil() + 1.0;
+                cap.push(json!(n));
+                load.push(json!((n * 58.0 * 10.0).round() / 10.0));
+                t += Duration::hours(1);
+            }
+            json!({
+                "CapacityForecast": {"Timestamps": times, "Values": cap},
+                "LoadForecast": [{"Timestamps": times, "Values": load,
+                    "MetricSpecification": {"TargetValue": 60.0, "PredefinedMetricPairSpecification": {"PredefinedMetricType": "ECSServiceCPUUtilization"}}}],
+                "UpdateTime": ago(Duration::minutes(130)),
+            })
+        }
         ("cloudwatch", "get-metric-data") => {
             let qs: Vec<Value> = a.one("--metric-data-queries").and_then(|q| serde_json::from_str(&q).ok()).unwrap_or_default();
             let parse = |k: &str| a.one(k).and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok()).map(|t| t.with_timezone(&Utc));
@@ -260,7 +287,8 @@ pub fn run(ctx: &Ctx, service: &str, op: &str, args: &[String]) -> Result<Value,
                     let (mut times, mut vals) = (vec![], vec![]);
                     while t <= end {
                         times.push(json!(t.to_rfc3339_opts(SecondsFormat::Millis, true)));
-                        vals.push(json!(metric_value(metric, stat, seed, (t - start).num_seconds() as f64 / period as f64)));
+                        let v = if metric == "RunningTaskCount" { demo_tasks(t).round() } else { metric_value(metric, stat, seed, (t - start).num_seconds() as f64 / period as f64) };
+                        vals.push(json!(v));
                         t += Duration::seconds(period);
                     }
                     json!({"Id": q["Id"], "Label": q["Label"], "StatusCode": "Complete", "Timestamps": times, "Values": vals})
@@ -749,6 +777,12 @@ fn target_group(r: &str, s: &Svc) -> Value {
 
 fn scaled() -> impl Iterator<Item = (&'static Svc, usize, usize)> {
     SVCS.iter().filter(|s| matches!(s.name, "web" | "api" | "checkout" | "payments-worker")).map(|s| (s, s.desired.div_ceil(2), s.desired * 3))
+}
+
+/// api's task count over a day: about 4 at night, 12 at the afternoon peak (UTC).
+fn demo_tasks(t: chrono::DateTime<Utc>) -> f64 {
+    let h = t.timestamp() as f64 / 3600.0;
+    4.0 + 8.0 * ((std::f64::consts::TAU * (h - 9.0) / 24.0).sin() + 1.0) / 2.0
 }
 
 /// A smooth daily-looking curve with some noise, per metric and dimension set.

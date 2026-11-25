@@ -97,6 +97,9 @@ pub fn about(view: &View) -> (&'static str, &'static [&'static str]) {
             "Application Auto Scaling changes a number (an ECS service's desired count, for example) between MIN and MAX.",
             "Kubernetes: a HorizontalPodAutoscaler with minReplicas and maxReplicas.",
             "Policies say when: target tracking keeps a metric near a value (like an HPA CPU target); step scaling reacts to alarms.",
+            "Predictive scaling learns a daily and weekly pattern from 14 days of metrics and forecasts the next 48 hours.",
+            "ForecastOnly just forecasts; ForecastAndScale raises the minimum ahead of each forecast hour. Enter on one shows its forecast.",
+            "Kubernetes has nothing built in for this (KEDA's cron scaler is the closest, but by hand).",
             "Activities are what it did and why. Kubernetes: the HPA's events. Suspended means scaling is paused.",
         ]),
         View::Metrics { .. } => ("CloudWatch metrics", &[

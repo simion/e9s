@@ -838,6 +838,10 @@ impl App {
                     let v = View::ScalingPolicies { ns: ns.clone(), resource: Some(r.id.clone()) };
                     self.push(v)
                 }
+                (View::Services { cluster }, Some(r)) => {
+                    let v = View::ScalingPolicies { ns: "ecs".into(), resource: Some(format!("service/{cluster}/{}", r.id)) };
+                    self.push(v)
+                }
                 _ => self.flash("p works in log and scaling views", true),
             },
             KeyCode::Char('F') => match self.service_of_view() {

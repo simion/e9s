@@ -28,6 +28,8 @@ The recording and these screens come from `E9S_DEMO=1`, a made-up account (see D
 | ![Crashed tasks and problem events](docs/screens/failures.png) | ![Tasks of both generations](docs/screens/tasks.png) |
 | **Port forward (`F` on an endpoint)** | **Port forwards (`:pf`)** |
 | ![Forwarding an RDS reader endpoint through a bastion](docs/screens/portforward.png) | ![A running forward](docs/screens/forwards.png) |
+| **Scaling forecast (Enter on a predictive policy)** | |
+| ![Forecast capacity next to the running task count, 24h back and ahead](docs/screens/forecast.png) | |
 
 ## Requirements
 
@@ -138,7 +140,7 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `f` | Logs, describe and YAML: fullscreen, hiding the header and breadcrumbs. On an RDS endpoint: show its port forward in `:pf` (k9s "Show PortForward") |
 | `F` (Shift-F) | Failures of the last hour for the selected service, or the whole cluster where no service is selected. On an RDS endpoint: port-forward it through a bastion (k9s `shift-f`, see below); on an RDS cluster or instance it lists its endpoints first |
 | `ctrl-d` | In `:pf`: stop the selected port forward (asks first) |
-| `p` | In a log view: set a CloudWatch filter pattern. In scaling targets: open the target's policies |
+| `p` | In a log view: set a CloudWatch filter pattern. On a service or a scaling target: open its scaling policies |
 | `w` | Wrap long lines in logs and describe on or off (on by default) |
 | `t` | Logs: show or hide timestamps. In `:pf`: copy an RDS IAM auth token for the forward's database (asks for the db user) |
 | `0` `1` `2`-`6` | Logs, as in k9s: start from the newest lines (tail, the default), from the first lines (head, not followed), or 1m, 5m, 15m, 30m, 1h back. A window reads up to 5000 lines per 100 streams and says when it was cut |
@@ -178,7 +180,7 @@ When credentials expire while e9s runs, it asks once whether to log in now (Ente
 | `:lb` `:alb` `:elb` `:ing` | Load balancers, then target groups, then targets |
 | `:tg` `:targetgroups` | All target groups |
 | `:scaling` `:as` `:hpa` `[namespace]` | Application Auto Scaling targets (default namespace `ecs`) |
-| `:policies` `:pol` `[namespace]` | Scaling policies |
+| `:policies` `:pol` `[namespace]` | Scaling policies: target tracking, step and predictive, with a predictive policy's mode (ForecastOnly or ForecastAndScale) and target. `d` describes one. Enter on a predictive policy opens its forecast: forecast capacity next to the running task count (Container Insights `RunningTaskCount`) and the forecast load, from 24h back to 24h ahead |
 | `:activities` `:act` `[namespace]` | Scaling activities |
 | `:ec2` `:no` `:nodes` | EC2 instances |
 | `:ecr` | ECR repositories, then images |
@@ -207,6 +209,7 @@ The k9s path from deployments to pods to containers to logs maps to:
 `regions` › `clusters` › `services` › `tasks` › `containers` › `l` logs
 
 - **Services** tag each service with `FAILED 1H`: its failed task stops (failed health check, failed start, crash) and problem service events of the last hour. It is red while its current deployment fails, and yellow with `before deploy` when every failure came before the latest deployment (a fix or restart that has not failed yet); `F` lists what failed in the same colours.
+- **Services** show `AUTOSCALING` as min-max and the number of scaling policies, like `36-350 3P`, with `fc-only` or `fc+scale` when one is a predictive policy (ForecastOnly or ForecastAndScale). It costs two reads per refresh for the whole region (`describe-scalable-targets` and `describe-scaling-policies`), made alongside the ECS reads. `p` opens the service's policies.
 - **Services** split each service by deployment generation. `NEW` is new-generation running tasks over the service's `desiredCount`; `OLD` is what the old generation still runs. `RUN(ALL)` is ECS's `runningCount`, the sum of both generations, so it is never rollout progress.
 - **Tasks** list RUNNING and STOPPED tasks together. Each shows its generation (`new` / `old`), task definition revision, AZ, reserved CPU/memory, start, stop and age, its target group state, and a `REASON` column built from the task's `stopCode` and `stoppedReason`, each container's exit code, reason and health, the target's health reason, and the matching "is unhealthy in target-group" service event.
 - ECS keeps stopped tasks for only about an hour; the view says so instead of showing an empty list as if nothing failed.

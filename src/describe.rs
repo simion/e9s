@@ -91,6 +91,7 @@ fn service(p: &mut Page, v: &Value) {
     p.kv(0, "Desired", sp.desired.to_string());
     p.kv(0, "Running", format!("{} (both generations: {} new, {} old)", sp.running_all, sp.new_running(), sp.old_running()));
     p.kv(0, "Pending", sp.pending_all.to_string());
+    p.kv(0, "Autoscaling", s(v, "/autoscaling").replace('P', " policies").replace("fc-only", "(predictive, ForecastOnly)").replace("fc+scale", "(predictive, ForecastAndScale)"));
     p.kv(0, "Scheduling", s(v, "/schedulingStrategy"));
 
     p.section("Rollout settings");

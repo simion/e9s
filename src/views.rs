@@ -43,6 +43,8 @@ pub struct Table {
     pub detail: Option<usize>,
     /// What an empty result means for this view, shown instead of a bare "no resources".
     pub empty: Option<String>,
+    /// The last column is extra: it is dropped, rather than any column wrapping, when the table does not fit.
+    pub extra_last: bool,
 }
 
 impl Table {
@@ -629,8 +631,9 @@ fn cached_service_arns(aws: &Aws, cluster: &str) -> Result<Vec<String>, AwsError
 
 fn services(aws: &Aws, cluster: &str) -> Result<Table, AwsError> {
     let arns = cached_service_arns(aws, cluster)?;
-    let mut t = Table::new(&["NAME", "STATUS", "DESIRED", "RUN(ALL)", "PENDING", "NEW", "OLD", "ROLLOUT", "DEPLOY AGE", "FAILED 1H", "AUTOSCALING", "TASKDEF"]);
-    t.info("Enter tasks · R rollout watch · e events · F failures · l logs · m metrics · p scaling policies · runningCount (RUN(ALL)) sums both generations; NEW is new-running/desired; AUTOSCALING is min-max nP");
+    let mut t = Table::new(&["NAME", "STATUS", "DESIRED", "RUN(ALL)", "PENDING", "NEW", "OLD", "ROLLOUT", "DEPLOY AGE", "FAILED 1H", "TASKDEF", "AUTOSCALING"]);
+    t.extra_last = true;
+    t.info("Enter tasks · R rollout watch · e events · F failures · l logs · m metrics · p policies · runningCount (RUN(ALL)) sums both generations; NEW is new-running/desired");
     // Two region-wide autoscaling reads, alongside the slower ECS ones so the first paint waits no longer.
     let (r, scaling) = std::thread::scope(|sc| {
         let h = sc.spawn(|| scaling_summary(aws, cluster));
@@ -664,6 +667,8 @@ fn services(aws: &Aws, cluster: &str) -> Result<Table, AwsError> {
             _ => sp.health(&s(&v, "/status")),
         };
         let auto = scaling.get(&name).and_then(Value::as_str).unwrap_or("-").to_string();
+        let mut v = v;
+        v["autoscaling"] = json!(auto);
         t.row(name.clone(), health, v.clone(), vec![
             name,
             s(&v, "/status"),
@@ -675,8 +680,8 @@ fn services(aws: &Aws, cluster: &str) -> Result<Table, AwsError> {
             p.as_ref().map(|d| d.rollout.clone()).unwrap_or_default(),
             p.as_ref().map(|d| age(&Value::String(d.created.clone()))).unwrap_or_default(),
             failed,
-            auto,
             p.map(|d| d.taskdef).unwrap_or_default(),
+            auto,
         ]);
     }
     Ok(t)

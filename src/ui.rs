@@ -519,6 +519,11 @@ fn table_body(f: &mut Frame, app: &mut App, area: Rect) {
         cols.pop();
         widths.pop();
     }
+    // An extra last column goes first when everything would not fit at its natural width.
+    if top.table.extra_last && cols.last() == Some(&(ncol - 1)) && cols.len() > 2 && widths.iter().map(|w| w + 1).sum::<usize>() > avail {
+        cols.pop();
+        widths.pop();
+    }
     // The last grid column takes what is left, keeping at least 20 columns. Narrow the widest
     // columns to fit; cells wrap, never cut.
     let n = cols.len();
